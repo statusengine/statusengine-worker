@@ -27,7 +27,7 @@ CREATE TABLE `statusengine_dbversion` (
   `id` int(11) NOT NULL,
   `dbversion` varchar(255) DEFAULT '3.0.0',
   PRIMARY KEY (`id`)
-) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_uca1400_ai_ci;
+) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_0900_ai_ci;
 /*!40101 SET character_set_client = @saved_cs_client */;
 
 --
@@ -51,7 +51,7 @@ CREATE TABLE `statusengine_host_acknowledgements` (
   PRIMARY KEY (`hostname`,`entry_time`,`entry_time_usec`),
   KEY `hostname` (`hostname`),
   KEY `entry_time` (`entry_time`)
-) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_uca1400_ai_ci;
+) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_0900_ai_ci;
 /*!40101 SET character_set_client = @saved_cs_client */;
 
 --
@@ -81,7 +81,7 @@ CREATE TABLE `statusengine_host_downtimehistory` (
   PRIMARY KEY (`hostname`,`node_name`,`scheduled_start_time`,`internal_downtime_id`),
   KEY `reports` (`hostname`,`entry_time`,`entry_time_usec`,`scheduled_start_time`,`scheduled_end_time`,`was_cancelled`),
   KEY `list` (`hostname`,`scheduled_start_time`,`scheduled_end_time`,`was_cancelled`)
-) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_uca1400_ai_ci;
+) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_0900_ai_ci;
 /*!40101 SET character_set_client = @saved_cs_client */;
 
 --
@@ -107,7 +107,7 @@ CREATE TABLE `statusengine_host_notifications` (
   PRIMARY KEY (`hostname`,`start_time`,`start_time_usec`),
   KEY `hostname` (`hostname`),
   KEY `start_time` (`start_time`)
-) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_uca1400_ai_ci
+) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_0900_ai_ci
  PARTITION BY RANGE (`start_time` DIV 86400)
 (PARTITION `p_2026_29` VALUES LESS THAN (20654) ENGINE = InnoDB,
  PARTITION `p_2026_30` VALUES LESS THAN (20661) ENGINE = InnoDB,
@@ -138,7 +138,7 @@ CREATE TABLE `statusengine_host_notifications_log` (
   PRIMARY KEY (`hostname`,`start_time`,`start_time_usec`),
   KEY `hostname` (`hostname`),
   KEY `filter` (`start_time`,`end_time`,`reason_type`,`state`)
-) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_uca1400_ai_ci
+) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_0900_ai_ci
  PARTITION BY RANGE (`start_time` DIV 86400)
 (PARTITION `p_2026_29` VALUES LESS THAN (20654) ENGINE = InnoDB,
  PARTITION `p_2026_30` VALUES LESS THAN (20661) ENGINE = InnoDB,
@@ -169,7 +169,7 @@ CREATE TABLE `statusengine_host_scheduleddowntimes` (
   `was_started` tinyint(1) DEFAULT 0,
   `actual_start_time` bigint(20) NOT NULL,
   PRIMARY KEY (`hostname`,`node_name`,`scheduled_start_time`,`internal_downtime_id`)
-) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_uca1400_ai_ci;
+) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_0900_ai_ci;
 /*!40101 SET character_set_client = @saved_cs_client */;
 
 --
@@ -194,7 +194,7 @@ CREATE TABLE `statusengine_host_statehistory` (
   `long_output` varchar(8192) DEFAULT NULL,
   PRIMARY KEY (`hostname`,`state_time`,`state_time_usec`),
   KEY `hostname_time` (`hostname`,`state_time`)
-) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_uca1400_ai_ci
+) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_0900_ai_ci
  PARTITION BY RANGE (`state_time` DIV 86400)
 (PARTITION `p_2025_30` VALUES LESS THAN (20297) ENGINE = InnoDB,
  PARTITION `p_2025_31` VALUES LESS THAN (20304) ENGINE = InnoDB,
@@ -281,7 +281,7 @@ CREATE TABLE `statusengine_hostchecks` (
   PRIMARY KEY (`hostname`,`start_time`,`start_time_usec`),
   KEY `hostname` (`hostname`,`start_time`),
   KEY `times` (`start_time`,`end_time`)
-) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_uca1400_ai_ci
+) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_0900_ai_ci
  PARTITION BY RANGE (`start_time` DIV 86400)
 (PARTITION `p_2026_29` VALUES LESS THAN (20654) ENGINE = InnoDB,
  PARTITION `p_2026_30` VALUES LESS THAN (20661) ENGINE = InnoDB,
@@ -342,7 +342,7 @@ CREATE TABLE `statusengine_hoststatus` (
   PRIMARY KEY (`hostname`),
   KEY `current_state_node` (`current_state`,`node_name`),
   KEY `issues` (`problem_has_been_acknowledged`,`scheduled_downtime_depth`,`current_state`)
-) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_uca1400_ai_ci;
+) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_0900_ai_ci;
 /*!40101 SET character_set_client = @saved_cs_client */;
 
 --
@@ -360,7 +360,7 @@ CREATE TABLE `statusengine_logentries` (
   `node_name` varchar(255) DEFAULT NULL,
   PRIMARY KEY (`id`,`entry_time`),
   KEY `logentries_se` (`entry_time`,`node_name`)
-) ENGINE=InnoDB AUTO_INCREMENT=47737 DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_uca1400_ai_ci
+) ENGINE=InnoDB AUTO_INCREMENT=47737 DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_0900_ai_ci
  PARTITION BY RANGE (`entry_time` DIV 86400)
 (PARTITION `p_2026_29` VALUES LESS THAN (20654) ENGINE = InnoDB,
  PARTITION `p_2026_30` VALUES LESS THAN (20661) ENGINE = InnoDB,
@@ -381,7 +381,7 @@ CREATE TABLE `statusengine_nodes` (
   `node_version` varchar(255) DEFAULT NULL,
   `node_start_time` bigint(20) NOT NULL,
   PRIMARY KEY (`node_name`)
-) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_uca1400_ai_ci;
+) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_0900_ai_ci;
 /*!40101 SET character_set_client = @saved_cs_client */;
 
 --
@@ -401,7 +401,7 @@ CREATE TABLE `statusengine_perfdata` (
   `unit` varchar(10) DEFAULT NULL,
   KEY `metric` (`hostname`,`service_description`,`label`,`timestamp_unix`),
   KEY `timestamp_unix` (`timestamp_unix`)
-) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_uca1400_ai_ci;
+) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_0900_ai_ci;
 /*!40101 SET character_set_client = @saved_cs_client */;
 
 --
@@ -427,7 +427,7 @@ CREATE TABLE `statusengine_service_acknowledgements` (
   KEY `servicename` (`hostname`,`service_description`),
   KEY `entry_time` (`entry_time`),
   KEY `servicedesc_time` (`service_description`,`entry_time`)
-) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_uca1400_ai_ci;
+) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_0900_ai_ci;
 /*!40101 SET character_set_client = @saved_cs_client */;
 
 --
@@ -458,7 +458,7 @@ CREATE TABLE `statusengine_service_downtimehistory` (
   PRIMARY KEY (`hostname`,`service_description`,`node_name`,`scheduled_start_time`,`internal_downtime_id`),
   KEY `reports` (`service_description`,`entry_time`,`entry_time_usec`,`scheduled_start_time`,`scheduled_end_time`,`was_cancelled`),
   KEY `report` (`service_description`,`scheduled_start_time`,`scheduled_end_time`,`was_cancelled`)
-) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_uca1400_ai_ci;
+) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_0900_ai_ci;
 /*!40101 SET character_set_client = @saved_cs_client */;
 
 --
@@ -485,7 +485,7 @@ CREATE TABLE `statusengine_service_notifications` (
   PRIMARY KEY (`service_description`,`start_time`,`start_time_usec`),
   KEY `start_time` (`start_time`),
   KEY `servicename` (`hostname`,`service_description`)
-) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_uca1400_ai_ci
+) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_0900_ai_ci
  PARTITION BY RANGE (`start_time` DIV 86400)
 (PARTITION `p_2026_29` VALUES LESS THAN (20654) ENGINE = InnoDB,
  PARTITION `p_2026_30` VALUES LESS THAN (20661) ENGINE = InnoDB,
@@ -517,7 +517,7 @@ CREATE TABLE `statusengine_service_notifications_log` (
   PRIMARY KEY (`hostname`,`service_description`,`start_time`,`start_time_usec`),
   KEY `servicename` (`hostname`,`service_description`),
   KEY `filter` (`start_time`,`end_time`,`reason_type`,`state`)
-) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_uca1400_ai_ci
+) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_0900_ai_ci
  PARTITION BY RANGE (`start_time` DIV 86400)
 (PARTITION `p_2026_29` VALUES LESS THAN (20654) ENGINE = InnoDB,
  PARTITION `p_2026_30` VALUES LESS THAN (20661) ENGINE = InnoDB,
@@ -549,7 +549,7 @@ CREATE TABLE `statusengine_service_scheduleddowntimes` (
   `was_started` tinyint(1) DEFAULT 0,
   `actual_start_time` bigint(20) NOT NULL,
   PRIMARY KEY (`hostname`,`service_description`,`node_name`,`scheduled_start_time`,`internal_downtime_id`)
-) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_uca1400_ai_ci;
+) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_0900_ai_ci;
 /*!40101 SET character_set_client = @saved_cs_client */;
 
 --
@@ -576,7 +576,7 @@ CREATE TABLE `statusengine_service_statehistory` (
   PRIMARY KEY (`service_description`,`state_time`,`state_time_usec`),
   KEY `host_servicename_time` (`hostname`,`service_description`,`state_time`),
   KEY `servicename_time` (`service_description`,`state_time`)
-) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_uca1400_ai_ci
+) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_0900_ai_ci
  PARTITION BY RANGE (`state_time` DIV 86400)
 (PARTITION `p_2025_30` VALUES LESS THAN (20297) ENGINE = InnoDB,
  PARTITION `p_2025_31` VALUES LESS THAN (20304) ENGINE = InnoDB,
@@ -663,7 +663,7 @@ CREATE TABLE `statusengine_servicechecks` (
   `long_output` varchar(8192) DEFAULT NULL,
   PRIMARY KEY (`service_description`,`start_time`,`start_time_usec`),
   KEY `servicename` (`hostname`,`service_description`,`start_time`)
-) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_uca1400_ai_ci
+) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_0900_ai_ci
  PARTITION BY RANGE (`start_time` DIV 86400)
 (PARTITION `p_2026_29` VALUES LESS THAN (20654) ENGINE = InnoDB,
  PARTITION `p_2026_30` VALUES LESS THAN (20661) ENGINE = InnoDB,
@@ -727,7 +727,7 @@ CREATE TABLE `statusengine_servicestatus` (
   KEY `service_description` (`service_description`),
   KEY `current_state_node` (`current_state`,`node_name`),
   KEY `issues` (`problem_has_been_acknowledged`,`scheduled_downtime_depth`,`current_state`)
-) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_uca1400_ai_ci;
+) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_0900_ai_ci;
 /*!40101 SET character_set_client = @saved_cs_client */;
 
 --
@@ -745,7 +745,7 @@ CREATE TABLE `statusengine_tasks` (
   `payload` varchar(8192) DEFAULT NULL,
   KEY `uuid` (`uuid`),
   KEY `node_name` (`node_name`)
-) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_uca1400_ai_ci;
+) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_0900_ai_ci;
 /*!40101 SET character_set_client = @saved_cs_client */;
 
 --
@@ -759,7 +759,7 @@ CREATE TABLE `statusengine_users` (
   `username` varchar(255) DEFAULT NULL,
   `password` varchar(255) DEFAULT NULL,
   KEY `username` (`username`,`password`)
-) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_uca1400_ai_ci;
+) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_0900_ai_ci;
 /*!40101 SET character_set_client = @saved_cs_client */;
 
 --
@@ -777,7 +777,7 @@ CREATE TABLE `statuspagegroup_categories` (
   `created` datetime NOT NULL,
   PRIMARY KEY (`id`),
   KEY `statuspagegroup_id` (`statuspagegroup_id`)
-) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_uca1400_ai_ci;
+) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_0900_ai_ci;
 /*!40101 SET character_set_client = @saved_cs_client */;
 
 --
@@ -796,7 +796,7 @@ CREATE TABLE `statuspagegroup_collections` (
   `created` datetime NOT NULL,
   PRIMARY KEY (`id`),
   KEY `statuspagegroup_id` (`statuspagegroup_id`)
-) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_uca1400_ai_ci;
+) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_0900_ai_ci;
 /*!40101 SET character_set_client = @saved_cs_client */;
 
 --
@@ -817,7 +817,7 @@ CREATE TABLE `statuspagegroups` (
   `modified` datetime NOT NULL,
   `created` datetime NOT NULL,
   PRIMARY KEY (`id`)
-) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_uca1400_ai_ci;
+) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_0900_ai_ci;
 /*!40101 SET character_set_client = @saved_cs_client */;
 
 --
@@ -845,7 +845,7 @@ CREATE TABLE `statuspages` (
   PRIMARY KEY (`id`),
   UNIQUE KEY `public_identifier` (`public_identifier`),
   KEY `uuid` (`uuid`)
-) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_uca1400_ai_ci;
+) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_0900_ai_ci;
 /*!40101 SET character_set_client = @saved_cs_client */;
 
 --
@@ -863,7 +863,7 @@ CREATE TABLE `statuspages_to_hostgroups` (
   PRIMARY KEY (`id`),
   KEY `statuspage_id` (`statuspage_id`),
   KEY `hostgroup_id` (`hostgroup_id`)
-) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_uca1400_ai_ci;
+) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_0900_ai_ci;
 /*!40101 SET character_set_client = @saved_cs_client */;
 
 --
@@ -881,7 +881,7 @@ CREATE TABLE `statuspages_to_hosts` (
   PRIMARY KEY (`id`),
   KEY `statuspage_id` (`statuspage_id`),
   KEY `host_id` (`host_id`)
-) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_uca1400_ai_ci;
+) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_0900_ai_ci;
 /*!40101 SET character_set_client = @saved_cs_client */;
 
 --
@@ -899,7 +899,7 @@ CREATE TABLE `statuspages_to_servicegroups` (
   PRIMARY KEY (`id`),
   KEY `statuspage_id` (`statuspage_id`),
   KEY `servicegroup_id` (`servicegroup_id`)
-) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_uca1400_ai_ci;
+) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_0900_ai_ci;
 /*!40101 SET character_set_client = @saved_cs_client */;
 
 --
@@ -917,7 +917,7 @@ CREATE TABLE `statuspages_to_services` (
   PRIMARY KEY (`id`),
   KEY `statuspage_id` (`statuspage_id`),
   KEY `service_id` (`service_id`)
-) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_uca1400_ai_ci;
+) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_0900_ai_ci;
 /*!40101 SET character_set_client = @saved_cs_client */;
 
 --
@@ -940,7 +940,7 @@ CREATE TABLE `statuspages_to_statuspagegroups` (
   KEY `collection_id` (`collection_id`),
   KEY `category_id` (`category_id`),
   KEY `statuspage_id` (`statuspage_id`)
-) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_uca1400_ai_ci;
+) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_0900_ai_ci;
 /*!40101 SET character_set_client = @saved_cs_client */;
 /*!40103 SET TIME_ZONE=@OLD_TIME_ZONE */;
 

@@ -1,0 +1,6 @@
+MySQL Server: localhost
+MySQL User: statusengine-dev
+MySQL Password: statusengine-dev
+Database: statusengine-dev
+
+Gearman Job Server: 127.0.0.1:4730
