@@ -11,6 +11,7 @@ A highly performant, concurrent Go-based event pipeline. It consumes bulk JSON m
 ## System Context & Specs
 - **Database Schema:** Read `/.claude/specs/mysql_schema.sql`
 - **Queue Payload Examples:** Read JSON dumps in `/.claude/specs/` (Note: Each queue delivers a specific type, but payloads arrive as a JSON bulk array).
+- **Queue Payload Bulk Exceptions:** The Queues `statusngin_acknowledgements`, `statusngin_contactnotificationmethod.json`, `statusngin_core_restart.json` and `statusngin_downtimes` do not use bulk payloads.
 
 ## Core Architecture Rules
 
@@ -30,11 +31,11 @@ A highly performant, concurrent Go-based event pipeline. It consumes bulk JSON m
 
 ### 4. WebSocket Pub/Sub Broadcaster
 - Implement a central WebSocket `Hub` using a publish/subscribe pattern.
-- Connected clients can subscribe to specific event types (e.g., only `statusengine_hoststatus`).
+- Connected clients can subscribe to specific event types (e.g., only `statusngin_hoststatus`).
 - Use non-blocking channel writes (`select { case hub.broadcast <- msg: default: }`) or a dropped-message strategy to prevent slow network clients from backpressuring the pipeline.
 
 ### 5. Conditional Perfdata Routing
-- Data coming from the `statusengine_service_perfdata` queue contains time-series metrics.
+- Data coming from the `statusngin_service_perfdata` queue contains time-series metrics.
 - Implement conditional routing via configuration toggles: write to **MySQL only**, **Graphite only**, or **both**.
 
 ### 6. Stability & Lifecycle
