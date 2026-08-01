@@ -17,6 +17,7 @@ import (
 
 	_ "github.com/go-sql-driver/mysql"
 
+	"statusengine-worker/internal/graphite"
 	"statusengine-worker/internal/queue"
 	"statusengine-worker/internal/websocket"
 )
@@ -30,6 +31,8 @@ type config struct {
 	rabbitMQURL     string
 	mysqlDSN        string
 	listenAddr      string
+	graphiteAddr    string
+	perfdataRoute   string // "mysql", "graphite" or "both"
 }
 
 func loadConfig() config {
@@ -45,6 +48,10 @@ func loadConfig() config {
 		"MySQL data source name")
 	flag.StringVar(&cfg.listenAddr, "listen-addr", envOrDefault("STATUSENGINE_LISTEN_ADDR", ":8080"),
 		"address the WebSocket HTTP server listens on")
+	flag.StringVar(&cfg.graphiteAddr, "graphite-addr", envOrDefault("STATUSENGINE_GRAPHITE_ADDR", "127.0.0.1:2003"),
+		"Graphite Carbon plaintext receiver address (host:port)")
+	flag.StringVar(&cfg.perfdataRoute, "perfdata-route", envOrDefault("STATUSENGINE_PERFDATA_ROUTE", "mysql"),
+		`where statusngin_service_perfdata metrics are written: "mysql", "graphite" or "both" (CLAUDE.md rule 5)`)
 	flag.Parse()
 
 	return cfg
@@ -59,6 +66,11 @@ func envOrDefault(key, def string) string {
 
 func main() {
 	cfg := loadConfig()
+
+	perfdataRoute, err := queue.ParsePerfdataRoute(cfg.perfdataRoute)
+	if err != nil {
+		log.Fatalf("%v", err)
+	}
 
 	// pipelineCtx governs every long-running loop (BulkInserters, the Hub,
 	// the consumer's internal ctx.Done() watcher). It is only cancelled
@@ -102,7 +114,13 @@ func main() {
 	}
 	cancelPing()
 
-	router, runners := queue.NewRouter(sqlDB, hub)
+	// The Graphite client's Run loop is started and Flushed alongside every
+	// BulkInserter below regardless of perfdataRoute; if perfdataRoute
+	// excludes Graphite, NewRouter simply never calls Enqueue on it, so no
+	// connection is ever dialed (CLAUDE.md rule 5).
+	gc := graphite.NewClient(cfg.graphiteAddr)
+
+	router, runners := queue.NewRouter(sqlDB, hub, gc, perfdataRoute)
 	for _, r := range runners {
 		wg.Add(1)
 		go func(r queue.Runner) {

@@ -6,6 +6,7 @@ import (
 	"fmt"
 
 	"statusengine-worker/internal/db"
+	"statusengine-worker/internal/graphite"
 	"statusengine-worker/internal/types"
 	"statusengine-worker/internal/websocket"
 )
@@ -143,14 +144,21 @@ func newAcknowledgementHandler(hub *websocket.Hub, topic string, hostIns, servic
 // tables. Queues without an unambiguous destination table - hoststatus and
 // servicestatus need legacy-specific fields (e.g. is_passive_check,
 // node_name) that aren't derivable from the sample payloads alone, see the
-// legacy reference in CLAUDE.md; service_perfdata's Graphite routing (rule
-// 5) isn't implemented yet; contactnotificationmethod and core_restart have
-// no matching table at all - are broadcast to WebSocket subscribers only.
+// legacy reference in CLAUDE.md; contactnotificationmethod and core_restart
+// have no matching table at all - are broadcast to WebSocket subscribers
+// only. service_perfdata gets its own handler (see processor.go), routing
+// each parsed metric to MySQL, Graphite, or both per perfdataRoute
+// (CLAUDE.md rule 5).
+//
+// gc's Run loop is started and Flushed by the caller alongside the
+// returned []Runner (see the runners slice below) even when perfdataRoute
+// excludes Graphite: Enqueue is then simply never called on it, so no
+// connection is ever dialed.
 //
 // The returned []Runner lets the caller start every BulkInserter's Run loop
 // and Flush them on graceful shutdown without needing to know each one's
 // concrete item type.
-func NewRouter(sqlDB *sql.DB, hub *websocket.Hub) (Router, []Runner) {
+func NewRouter(sqlDB *sql.DB, hub *websocket.Hub, gc *graphite.Client, perfdataRoute PerfdataRoute) (Router, []Runner) {
 	hostChecks := db.NewBulkInserter(sqlDB, "statusengine_hostchecks",
 		[]string{"hostname", "start_time", "state", "is_hardstate", "end_time", "output", "long_output",
 			"timeout", "early_timeout", "latency", "execution_time", "perfdata", "command",
@@ -187,16 +195,20 @@ func NewRouter(sqlDB *sql.DB, hub *websocket.Hub) (Router, []Runner) {
 			"acknowledgement_type", "is_sticky", "persistent_comment", "notify_contacts"},
 		serviceAcknowledgementRow)
 
+	perfdata := db.NewBulkInserter(sqlDB, "statusengine_perfdata",
+		[]string{"hostname", "service_description", "label", "timestamp", "timestamp_unix", "value", "unit"},
+		perfdataRow)
+
 	router := Router{
 		QueueHostChecks:       NewHandler(hub, QueueHostChecks, hostChecks, decodeHostCheck),
 		QueueServiceChecks:    NewHandler(hub, QueueServiceChecks, serviceChecks, decodeServiceCheck),
 		QueueLogEntries:       NewHandler(hub, QueueLogEntries, logEntries, decodeLogEntry),
 		QueueStateChanges:     newStateChangeHandler(hub, QueueStateChanges, hostStateHistory, serviceStateHistory),
 		QueueAcknowledgements: newAcknowledgementHandler(hub, QueueAcknowledgements, hostAcks, serviceAcks),
+		QueueServicePerfdata:  NewPerfdataHandler(hub, QueueServicePerfdata, perfdataRoute, perfdata, gc),
 
 		QueueHostStatus:                NewBroadcastHandler(hub, QueueHostStatus, decodeHostStatus),
 		QueueServiceStatus:             NewBroadcastHandler(hub, QueueServiceStatus, decodeServiceStatus),
-		QueueServicePerfdata:           NewBroadcastHandler(hub, QueueServicePerfdata, decodeServiceCheck),
 		QueueNotifications:             NewBroadcastHandler(hub, QueueNotifications, decodeNotification),
 		QueueContactNotificationMethod: NewBroadcastHandler(hub, QueueContactNotificationMethod, decodeContactNotificationMethod),
 		QueueDowntimes:                 NewBroadcastHandler(hub, QueueDowntimes, decodeDowntime),
@@ -207,6 +219,7 @@ func NewRouter(sqlDB *sql.DB, hub *websocket.Hub) (Router, []Runner) {
 		hostChecks, serviceChecks, logEntries,
 		hostStateHistory, serviceStateHistory,
 		hostAcks, serviceAcks,
+		perfdata, gc,
 	}
 
 	return router, runners

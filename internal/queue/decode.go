@@ -76,6 +76,27 @@ func decodeServiceCheck(payload []byte) ([]types.ServiceCheckPayload, error) {
 	return items, nil
 }
 
+// perfdataEvent augments types.ServiceCheckPayload with the timestamp of
+// the message that carried it: statusengine_perfdata needs a message
+// timestamp per metric point, distinct from the check's own start_time
+// (CLAUDE.md rule 5).
+type perfdataEvent struct {
+	Timestamp int64 `json:"timestamp"`
+	types.ServiceCheckPayload
+}
+
+func decodePerfdata(payload []byte) ([]perfdataEvent, error) {
+	var bulk types.ServiceCheckBulk
+	if err := json.Unmarshal(payload, &bulk); err != nil {
+		return nil, err
+	}
+	items := make([]perfdataEvent, len(bulk.Messages))
+	for i, m := range bulk.Messages {
+		items[i] = perfdataEvent{Timestamp: m.Timestamp, ServiceCheckPayload: m.ServiceCheck}
+	}
+	return items, nil
+}
+
 func decodeStateChange(payload []byte) ([]stateChangeEvent, error) {
 	var bulk types.StateChangeBulk
 	if err := json.Unmarshal(payload, &bulk); err != nil {

@@ -10,6 +10,7 @@ import (
 
 	_ "github.com/go-sql-driver/mysql"
 
+	"statusengine-worker/internal/graphite"
 	"statusengine-worker/internal/types"
 	"statusengine-worker/internal/websocket"
 )
@@ -37,7 +38,7 @@ func openTestDB(t *testing.T) *sql.DB {
 func TestNewRouterCoversAllQueues(t *testing.T) {
 	sqlDB := openTestDB(t)
 	hub := websocket.NewHub()
-	router, runners := NewRouter(sqlDB, hub)
+	router, runners := NewRouter(sqlDB, hub, graphite.NewClient("127.0.0.1:2003"), PerfdataRouteMySQL)
 
 	want := []string{
 		QueueHostStatus, QueueServiceStatus, QueueHostChecks, QueueServiceChecks,
@@ -52,9 +53,9 @@ func TestNewRouterCoversAllQueues(t *testing.T) {
 	if len(router) != len(want) {
 		t.Errorf("router has %d queues, want %d", len(router), len(want))
 	}
-	if len(runners) != 7 {
-		t.Errorf("expected 7 BulkInserter runners (hostchecks, servicechecks, logentries, "+
-			"host/service statehistory, host/service acknowledgements), got %d", len(runners))
+	if len(runners) != 9 {
+		t.Errorf("expected 9 runners (hostchecks, servicechecks, logentries, "+
+			"host/service statehistory, host/service acknowledgements, perfdata, graphite client), got %d", len(runners))
 	}
 }
 
@@ -81,7 +82,7 @@ func runAllAndFlush(t *testing.T, runners []Runner) context.Context {
 func TestHostCheckHandlerPersistsToMySQL(t *testing.T) {
 	sqlDB := openTestDB(t)
 	hub := websocket.NewHub()
-	router, runners := NewRouter(sqlDB, hub)
+	router, runners := NewRouter(sqlDB, hub, graphite.NewClient("127.0.0.1:2003"), PerfdataRouteMySQL)
 	ctx := runAllAndFlush(t, runners)
 	go hub.Run(ctx)
 
@@ -143,7 +144,7 @@ func TestHostCheckHandlerPersistsToMySQL(t *testing.T) {
 func TestAcknowledgementHandlerRoutesToHostAndServiceTables(t *testing.T) {
 	sqlDB := openTestDB(t)
 	hub := websocket.NewHub()
-	router, runners := NewRouter(sqlDB, hub)
+	router, runners := NewRouter(sqlDB, hub, graphite.NewClient("127.0.0.1:2003"), PerfdataRouteMySQL)
 	ctx := runAllAndFlush(t, runners)
 	go hub.Run(ctx)
 
