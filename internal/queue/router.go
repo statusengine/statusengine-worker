@@ -4,7 +4,7 @@ import (
 	"context"
 	"encoding/json"
 	"fmt"
-	"log"
+	"log/slog"
 
 	"statusengine-worker/internal/websocket"
 )
@@ -86,7 +86,7 @@ func NewBroadcastHandler[P any](hub *websocket.Hub, topic string, decode func([]
 func publish[P any](hub *websocket.Hub, topic string, item P) {
 	raw, err := json.Marshal(item)
 	if err != nil {
-		log.Printf("queue: failed to encode %s event for websocket: %v", topic, err)
+		slog.Error("queue: failed to encode event for websocket", "topic", topic, "error", err)
 		return
 	}
 	hub.Publish(topic, raw)

@@ -9,10 +9,11 @@ package graphite
 
 import (
 	"context"
-	"log"
+	"log/slog"
 	"net"
 	"strconv"
 	"strings"
+	"sync/atomic"
 	"time"
 )
 
@@ -53,6 +54,12 @@ type Client struct {
 
 	buffer []Metric
 	conn   net.Conn
+
+	// processed is the running total of metrics successfully written,
+	// reported on every flush log line. Only ever incremented from
+	// flushBuffer, which always runs inside Run's single goroutine -
+	// atomic only for safe reads from outside that goroutine.
+	processed atomic.Uint64
 }
 
 // NewClient creates a Client that writes to the Graphite Carbon receiver
@@ -172,13 +179,18 @@ func (c *Client) finalFlush() {
 // dropped rather than retried indefinitely, since retrying here would
 // either block the pipeline or grow the buffer unbounded; the next flush
 // will simply try to re-dial.
+//
+// Every flush is logged exactly once, at most every FlushInterval (or
+// MaxBatchSize metrics) - never per metric - so structured logging never
+// adds per-message overhead to the hot ingestion path (CLAUDE.md rule 2).
 func (c *Client) flushBuffer(ctx context.Context) error {
 	if len(c.buffer) == 0 {
 		return nil
 	}
+	metrics := len(c.buffer)
 
 	if err := c.ensureConn(ctx); err != nil {
-		log.Printf("graphite: dial %s failed (%d metrics dropped): %v", c.addr, len(c.buffer), err)
+		slog.Error("graphite: dial failed, metrics dropped", "addr", c.addr, "metrics", metrics, "error", err)
 		c.buffer = c.buffer[:0]
 		return err
 	}
@@ -193,11 +205,19 @@ func (c *Client) flushBuffer(ctx context.Context) error {
 		sb.WriteByte('\n')
 	}
 
+	start := time.Now()
 	c.conn.SetWriteDeadline(time.Now().Add(writeTimeout))
 	_, err := c.conn.Write([]byte(sb.String()))
+	duration := time.Since(start)
+
 	if err != nil {
-		log.Printf("graphite: write to %s failed (%d metrics dropped): %v", c.addr, len(c.buffer), err)
+		slog.Error("graphite: write failed, metrics dropped",
+			"addr", c.addr, "metrics", metrics, "duration", duration, "error", err)
 		c.closeConn()
+	} else {
+		total := c.processed.Add(uint64(metrics))
+		slog.Info("graphite: metrics flushed",
+			"addr", c.addr, "metrics", metrics, "duration", duration, "total_processed", total)
 	}
 
 	c.buffer = c.buffer[:0]

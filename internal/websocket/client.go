@@ -2,7 +2,7 @@ package websocket
 
 import (
 	"encoding/json"
-	"log"
+	"log/slog"
 	"net/http"
 	"strings"
 	"time"
@@ -56,7 +56,7 @@ type subscriptionMessage struct {
 func ServeWS(hub *Hub, w http.ResponseWriter, r *http.Request) {
 	conn, err := upgrader.Upgrade(w, r, nil)
 	if err != nil {
-		log.Printf("websocket: upgrade failed: %v", err)
+		slog.Error("websocket: upgrade failed", "error", err)
 		return
 	}
 
@@ -116,7 +116,7 @@ func (c *Client) readPump() {
 		_, message, err := c.conn.ReadMessage()
 		if err != nil {
 			if websocket.IsUnexpectedCloseError(err, websocket.CloseGoingAway, websocket.CloseAbnormalClosure) {
-				log.Printf("websocket: unexpected close error: %v", err)
+				slog.Warn("websocket: unexpected close error", "error", err)
 			}
 			return
 		}

@@ -3,8 +3,10 @@ package queue
 import (
 	"context"
 	"fmt"
-	"log"
+	"log/slog"
 	"sync"
+	"sync/atomic"
+	"time"
 
 	gearman "github.com/mikespook/gearman-go/worker"
 )
@@ -13,6 +15,13 @@ import (
 // returns. Sends onto it are best-effort (see Start): a full buffer never
 // blocks job processing.
 const outboundBufferSize = 256
+
+// statsLogInterval is how often a running consumer logs a summary of
+// messages processed. Per-message logging would put a log call on the hot
+// job-handling path; aggregating into one line per interval keeps
+// structured logging visible without slowing down ingestion (CLAUDE.md
+// rule 2).
+const statsLogInterval = 30 * time.Second
 
 // GearmanConsumer implements queue.Consumer against a Gearman job server.
 // It registers one worker function per queue name present in its Router;
@@ -27,12 +36,19 @@ type GearmanConsumer struct {
 
 	stopOnce  sync.Once
 	handlerWG sync.WaitGroup
+	statsDone chan struct{}
+
+	// processed/errors count jobs handled since Start, for the periodic
+	// stats log. Incremented from per-connection job-handler goroutines,
+	// hence atomic.
+	processed atomic.Uint64
+	errors    atomic.Uint64
 }
 
 // NewGearmanConsumer creates a consumer that will connect to the Gearman
 // job server at addr (host:port) and handle every queue name in router.
 func NewGearmanConsumer(addr string, router Router) *GearmanConsumer {
-	return &GearmanConsumer{addr: addr, router: router}
+	return &GearmanConsumer{addr: addr, router: router, statsDone: make(chan struct{})}
 }
 
 // Start connects to the Gearman job server, registers a worker function
@@ -46,7 +62,7 @@ func (c *GearmanConsumer) Start(ctx context.Context) (<-chan Message, error) {
 		return nil, fmt.Errorf("gearman: connect to %s: %w", c.addr, err)
 	}
 	w.ErrorHandler = func(err error) {
-		log.Printf("gearman: worker error: %v", err)
+		slog.Warn("gearman: worker error", "error", err)
 	}
 
 	out := make(chan Message, outboundBufferSize)
@@ -67,9 +83,11 @@ func (c *GearmanConsumer) Start(ctx context.Context) (<-chan Message, error) {
 			}
 
 			if err := handle(ctx, payload); err != nil {
-				log.Printf("gearman: handler for %q failed: %v", queueName, err)
+				c.errors.Add(1)
+				slog.Warn("gearman: handler failed", "queue", queueName, "error", err)
 				return nil, err
 			}
+			c.processed.Add(1)
 			return nil, nil
 		}, 0)
 		if err != nil {
@@ -89,13 +107,38 @@ func (c *GearmanConsumer) Start(ctx context.Context) (<-chan Message, error) {
 	c.mu.Unlock()
 
 	go w.Work()
+	go c.logStatsPeriodically(ctx)
 
 	go func() {
 		<-ctx.Done()
 		c.Stop()
 	}()
 
+	slog.Info("gearman: consumer started", "addr", c.addr, "queues", len(c.router))
+
 	return out, nil
+}
+
+// logStatsPeriodically emits one structured summary line of messages
+// processed/errored every statsLogInterval, until ctx is cancelled or Stop
+// closes statsDone - message counts rather than per-message logging, so
+// observability never adds overhead to the hot job-handling path
+// (CLAUDE.md rule 2).
+func (c *GearmanConsumer) logStatsPeriodically(ctx context.Context) {
+	ticker := time.NewTicker(statsLogInterval)
+	defer ticker.Stop()
+
+	for {
+		select {
+		case <-ticker.C:
+			slog.Info("gearman: consumer stats",
+				"addr", c.addr, "processed", c.processed.Load(), "errors", c.errors.Load())
+		case <-c.statsDone:
+			return
+		case <-ctx.Done():
+			return
+		}
+	}
 }
 
 // Stop disconnects from the job server and closes the channel returned by
@@ -117,6 +160,8 @@ func (c *GearmanConsumer) Start(ctx context.Context) (<-chan Message, error) {
 // pointed at a patched fork, treat Gearman shutdown as best-effort.
 func (c *GearmanConsumer) Stop() error {
 	c.stopOnce.Do(func() {
+		close(c.statsDone)
+
 		c.mu.Lock()
 		w, out := c.worker, c.out
 		c.mu.Unlock()
@@ -131,6 +176,9 @@ func (c *GearmanConsumer) Stop() error {
 		if out != nil {
 			close(out)
 		}
+
+		slog.Info("gearman: consumer stopped",
+			"addr", c.addr, "processed", c.processed.Load(), "errors", c.errors.Load())
 	})
 	return nil
 }

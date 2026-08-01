@@ -5,8 +5,9 @@ package db
 import (
 	"context"
 	"database/sql"
-	"log"
+	"log/slog"
 	"strings"
+	"sync/atomic"
 	"time"
 )
 
@@ -42,6 +43,15 @@ type BulkInserter[T any] struct {
 	flushReq chan flushRequest
 
 	buffer []T
+
+	// processed is the running total of rows successfully flushed to db,
+	// reported on every flush log line so operators can see throughput
+	// without needing to scrape metrics separately. Only ever incremented
+	// from flushBuffer, which always runs inside Run's single goroutine -
+	// atomic only because it's convenient to read from outside that
+	// goroutine too (e.g. future health/metrics endpoints), not because
+	// concurrent writers exist.
+	processed atomic.Uint64
 }
 
 // NewBulkInserter creates a BulkInserter for table, using toRow to turn a
@@ -168,15 +178,29 @@ func (b *BulkInserter[T]) finalFlush() {
 // logged and the batch is dropped rather than retried indefinitely, since
 // retrying here would either block the pipeline or grow the buffer
 // unbounded.
+//
+// Every flush is logged exactly once, at most every FlushInterval (or
+// MaxBatchSize rows) - never per row - so structured logging never adds
+// per-message overhead to the hot ingestion path (CLAUDE.md rule 2).
 func (b *BulkInserter[T]) flushBuffer(ctx context.Context) error {
 	if len(b.buffer) == 0 {
 		return nil
 	}
+	rows := len(b.buffer)
 
 	query, args := b.buildInsert(b.buffer)
+
+	start := time.Now()
 	_, err := b.db.ExecContext(ctx, query, args...)
+	duration := time.Since(start)
+
 	if err != nil {
-		log.Printf("db: bulk insert into %s failed (%d rows dropped): %v", b.table, len(b.buffer), err)
+		slog.Error("db: bulk insert failed, rows dropped",
+			"table", b.table, "rows", rows, "duration", duration, "error", err)
+	} else {
+		total := b.processed.Add(uint64(rows))
+		slog.Info("db: bulk insert flushed",
+			"table", b.table, "rows", rows, "duration", duration, "total_processed", total)
 	}
 
 	b.buffer = b.buffer[:0]

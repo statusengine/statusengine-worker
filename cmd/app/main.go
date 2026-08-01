@@ -6,7 +6,7 @@ import (
 	"context"
 	"database/sql"
 	"flag"
-	"log"
+	"log/slog"
 	"net/http"
 	"os"
 	"os/signal"
@@ -33,6 +33,8 @@ type config struct {
 	listenAddr      string
 	graphiteAddr    string
 	perfdataRoute   string // "mysql", "graphite" or "both"
+	logLevel        string // "debug", "info", "warn" or "error"
+	logFormat       string // "text" or "json"
 }
 
 func loadConfig() config {
@@ -52,9 +54,41 @@ func loadConfig() config {
 		"Graphite Carbon plaintext receiver address (host:port)")
 	flag.StringVar(&cfg.perfdataRoute, "perfdata-route", envOrDefault("STATUSENGINE_PERFDATA_ROUTE", "mysql"),
 		`where statusngin_service_perfdata metrics are written: "mysql", "graphite" or "both" (CLAUDE.md rule 5)`)
+	flag.StringVar(&cfg.logLevel, "log-level", envOrDefault("STATUSENGINE_LOG_LEVEL", "info"),
+		`minimum log level: "debug", "info", "warn" or "error"`)
+	flag.StringVar(&cfg.logFormat, "log-format", envOrDefault("STATUSENGINE_LOG_FORMAT", "text"),
+		`structured log output format: "text" or "json"`)
 	flag.Parse()
 
 	return cfg
+}
+
+// setupLogger configures the process-wide slog default logger from cfg and
+// installs it via slog.SetDefault, so every package's package-level
+// slog.Info/Warn/Error calls (they never build their own logger) share one
+// consistent, structured sink.
+func setupLogger(cfg config) {
+	var level slog.Level
+	if err := level.UnmarshalText([]byte(cfg.logLevel)); err != nil {
+		level = slog.LevelInfo
+	}
+
+	opts := &slog.HandlerOptions{Level: level}
+	var handler slog.Handler
+	if strings.EqualFold(cfg.logFormat, "json") {
+		handler = slog.NewJSONHandler(os.Stdout, opts)
+	} else {
+		handler = slog.NewTextHandler(os.Stdout, opts)
+	}
+
+	slog.SetDefault(slog.New(handler))
+}
+
+// fatal logs msg at error level and exits the process - slog has no
+// built-in Fatal, unlike the "log" package's log.Fatalf this replaces.
+func fatal(msg string, args ...any) {
+	slog.Error(msg, args...)
+	os.Exit(1)
 }
 
 func envOrDefault(key, def string) string {
@@ -66,10 +100,11 @@ func envOrDefault(key, def string) string {
 
 func main() {
 	cfg := loadConfig()
+	setupLogger(cfg)
 
 	perfdataRoute, err := queue.ParsePerfdataRoute(cfg.perfdataRoute)
 	if err != nil {
-		log.Fatalf("%v", err)
+		fatal("invalid -perfdata-route", "error", err)
 	}
 
 	// pipelineCtx governs every long-running loop (BulkInserters, the Hub,
@@ -96,21 +131,21 @@ func main() {
 	})
 	httpServer := &http.Server{Addr: cfg.listenAddr, Handler: mux}
 	go func() {
-		log.Printf("websocket: listening on %s (path /ws)", cfg.listenAddr)
+		slog.Info("websocket: listening", "addr", cfg.listenAddr, "path", "/ws")
 		if err := httpServer.ListenAndServe(); err != nil && err != http.ErrServerClosed {
-			log.Printf("websocket: HTTP server error: %v", err)
+			slog.Error("websocket: http server error", "error", err)
 		}
 	}()
 
 	// 3. MySQL connection and BulkInserters, each in its own goroutine.
 	sqlDB, err := sql.Open("mysql", cfg.mysqlDSN)
 	if err != nil {
-		log.Fatalf("mysql: open %q: %v", cfg.mysqlDSN, err)
+		fatal("mysql: open failed", "error", err)
 	}
 	pingCtx, cancelPing := context.WithTimeout(context.Background(), 5*time.Second)
 	if err := sqlDB.PingContext(pingCtx); err != nil {
 		cancelPing()
-		log.Fatalf("mysql: unreachable: %v", err)
+		fatal("mysql: unreachable", "error", err)
 	}
 	cancelPing()
 
@@ -137,14 +172,13 @@ func main() {
 	case "rabbitmq":
 		consumer = queue.NewRabbitMQConsumer(cfg.rabbitMQURL, router)
 	default:
-		log.Fatalf(`unknown -consumer %q: want "gearman" or "rabbitmq"`, cfg.consumerBackend)
+		fatal("unknown -consumer value", "consumer", cfg.consumerBackend, "want", `"gearman" or "rabbitmq"`)
 	}
 
 	rawMessages, err := consumer.Start(pipelineCtx)
 	if err != nil {
-		log.Fatalf("%s: failed to start: %v", cfg.consumerBackend, err)
+		fatal("consumer failed to start", "backend", cfg.consumerBackend, "error", err)
 	}
-	log.Printf("%s: consumer started", cfg.consumerBackend)
 
 	// Raw messages are for observability only (the real work already
 	// happened inside the Router's Handlers); drain them so the channel's
@@ -159,35 +193,37 @@ func main() {
 	defer stopSignals()
 	<-sigCtx.Done()
 	stopSignals()
-	log.Println("shutdown signal received, starting graceful shutdown")
+	slog.Info("shutdown signal received, starting graceful shutdown")
 
 	// 6a. Stop the queue consumer first so no new data comes in.
 	if err := consumer.Stop(); err != nil {
-		log.Printf("%s: error stopping consumer: %v", cfg.consumerBackend, err)
+		slog.Error("error stopping consumer", "backend", cfg.consumerBackend, "error", err)
 	}
 
 	// 6b. Flush every BulkInserter's remaining buffer immediately.
+	flushStart := time.Now()
 	flushCtx, cancelFlush := context.WithTimeout(context.Background(), 10*time.Second)
 	for _, r := range runners {
 		if err := r.Flush(flushCtx); err != nil {
-			log.Printf("mysql: error flushing bulk inserter: %v", err)
+			slog.Error("error flushing runner on shutdown", "error", err)
 		}
 	}
 	cancelFlush()
+	slog.Info("shutdown flush complete", "duration", time.Since(flushStart), "runners", len(runners))
 
 	// 6c. Close the DB connection and the WebSocket hub cleanly.
 	cancelPipeline() // stops the (now-empty) BulkInserters' Run loops and the Hub, closing all client connections
 	wg.Wait()
 
 	if err := sqlDB.Close(); err != nil {
-		log.Printf("mysql: error closing connection: %v", err)
+		slog.Error("mysql: error closing connection", "error", err)
 	}
 
 	shutdownCtx, cancelShutdown := context.WithTimeout(context.Background(), 5*time.Second)
 	if err := httpServer.Shutdown(shutdownCtx); err != nil {
-		log.Printf("websocket: error shutting down HTTP server: %v", err)
+		slog.Error("websocket: error shutting down http server", "error", err)
 	}
 	cancelShutdown()
 
-	log.Println("shutdown complete")
+	slog.Info("shutdown complete")
 }

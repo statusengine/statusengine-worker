@@ -6,13 +6,22 @@ package websocket
 import (
 	"context"
 	"encoding/json"
-	"log"
+	"log/slog"
+	"sync/atomic"
+	"time"
 )
 
 // broadcastBufferSize is the depth of the Hub's inbound event buffer.
 // Publish never blocks: once this buffer is full, further events are
 // dropped rather than backpressuring the ingestion pipeline.
 const broadcastBufferSize = 1024
+
+// statsLogInterval is how often Run logs a summary of throughput and
+// dropped-message counts. Per-event logging would put a log call on the
+// hot dispatch path for every single message; aggregating into one line
+// per interval keeps structured logging visible without slowing down
+// broadcasting (CLAUDE.md rule 4).
+const statsLogInterval = 30 * time.Second
 
 // Event is a single message published by the ingestion pipeline, tagged
 // with the topic (queue name, e.g. "statusngin_hoststatus") clients
@@ -49,6 +58,21 @@ type Hub struct {
 	updateSubscription chan subscriptionUpdate
 
 	clients map[*Client]struct{}
+
+	// publishDropped counts events dropped by Publish because the
+	// broadcast buffer was full. Publish is called from arbitrary
+	// ingestion goroutines (not Run's), so this one counter is atomic;
+	// every other stat below is only ever touched from within Run and
+	// needs no synchronization.
+	publishDropped atomic.Uint64
+
+	// received/dispatched/dropped track broadcast throughput for the
+	// periodic stats log. dropped counts per-client sends skipped because
+	// that client's own send buffer was full (CLAUDE.md rule 4's
+	// non-blocking dispatch), distinct from publishDropped above.
+	received   uint64
+	dispatched uint64
+	dropped    uint64
 }
 
 // NewHub creates a Hub. Run must be started in its own goroutine before the
@@ -66,12 +90,13 @@ func NewHub() *Hub {
 // Publish enqueues an event for broadcasting to subscribed clients. It
 // never blocks the caller: if the Hub's inbound buffer is full, the event
 // is dropped so the ingestion/DB pipeline is never slowed down by
-// WebSocket broadcasting.
+// WebSocket broadcasting. Drops are counted, not logged individually -
+// see statsLogInterval - since Publish sits on the hot ingestion path.
 func (h *Hub) Publish(topic string, payload []byte) {
 	select {
 	case h.broadcast <- Event{Topic: topic, Payload: payload}:
 	default:
-		log.Printf("websocket: broadcast buffer full, dropping event for topic %q", topic)
+		h.publishDropped.Add(1)
 	}
 }
 
@@ -79,6 +104,9 @@ func (h *Hub) Publish(topic string, payload []byte) {
 // broadcasts until ctx is cancelled, at which point it closes every
 // connected client. It must run in exactly one goroutine.
 func (h *Hub) Run(ctx context.Context) {
+	statsTicker := time.NewTicker(statsLogInterval)
+	defer statsTicker.Stop()
+
 	for {
 		select {
 		case <-ctx.Done():
@@ -95,9 +123,26 @@ func (h *Hub) Run(ctx context.Context) {
 			h.applySubscriptionUpdate(update)
 
 		case event := <-h.broadcast:
+			h.received++
 			h.dispatch(event)
+
+		case <-statsTicker.C:
+			h.logStats()
 		}
 	}
+}
+
+// logStats emits one structured summary line of Hub throughput - message
+// counts rather than per-message logging, so observability never adds
+// overhead to the hot dispatch path (CLAUDE.md rule 4).
+func (h *Hub) logStats() {
+	slog.Info("websocket: hub stats",
+		"clients", len(h.clients),
+		"received", h.received,
+		"dispatched", h.dispatched,
+		"dropped", h.dropped,
+		"publish_dropped", h.publishDropped.Load(),
+	)
 }
 
 // dispatch fans an event out to every currently subscribed client, never
@@ -105,7 +150,7 @@ func (h *Hub) Run(ctx context.Context) {
 func (h *Hub) dispatch(event Event) {
 	msg, err := json.Marshal(outboundMessage{Topic: event.Topic, Payload: event.Payload})
 	if err != nil {
-		log.Printf("websocket: failed to encode event for topic %q: %v", event.Topic, err)
+		slog.Error("websocket: failed to encode event", "topic", event.Topic, "error", err)
 		return
 	}
 
@@ -116,11 +161,14 @@ func (h *Hub) dispatch(event Event) {
 
 		select {
 		case client.send <- msg:
+			h.dispatched++
 		default:
 			// Client's buffer is full - drop the message for this client
 			// instead of blocking the dispatch loop (and, transitively,
 			// the ingestion pipeline behind Publish's buffered channel).
-			log.Printf("websocket: dropping event (topic=%q) for slow client", event.Topic)
+			// Counted, not logged per-drop, for the same reason as Publish
+			// above.
+			h.dropped++
 		}
 	}
 }

@@ -3,8 +3,10 @@ package queue
 import (
 	"context"
 	"fmt"
-	"log"
+	"log/slog"
 	"sync"
+	"sync/atomic"
+	"time"
 
 	amqp "github.com/rabbitmq/amqp091-go"
 )
@@ -27,12 +29,19 @@ type RabbitMQConsumer struct {
 
 	stopOnce   sync.Once
 	consumerWG sync.WaitGroup
+	statsDone  chan struct{}
+
+	// processed/errors count deliveries handled since Start, for the
+	// periodic stats log. Incremented from per-queue delivery-loop
+	// goroutines, hence atomic.
+	processed atomic.Uint64
+	errors    atomic.Uint64
 }
 
 // NewRabbitMQConsumer creates a consumer that will connect to the RabbitMQ
 // broker at url (an amqp:// URI) and handle every queue name in router.
 func NewRabbitMQConsumer(url string, router Router) *RabbitMQConsumer {
-	return &RabbitMQConsumer{url: url, router: router}
+	return &RabbitMQConsumer{url: url, router: router, statsDone: make(chan struct{})}
 }
 
 // Start dials the broker, opens one Channel and consumer per queue in the
@@ -85,15 +94,17 @@ func (c *RabbitMQConsumer) Start(ctx context.Context) (<-chan Message, error) {
 				}
 
 				if err := handle(ctx, d.Body); err != nil {
-					log.Printf("rabbitmq: handler for %q failed: %v", queueName, err)
+					c.errors.Add(1)
+					slog.Warn("rabbitmq: handler failed", "queue", queueName, "error", err)
 					if nackErr := d.Nack(false, true); nackErr != nil {
-						log.Printf("rabbitmq: nack for %q failed: %v", queueName, nackErr)
+						slog.Warn("rabbitmq: nack failed", "queue", queueName, "error", nackErr)
 					}
 					continue
 				}
 				if ackErr := d.Ack(false); ackErr != nil {
-					log.Printf("rabbitmq: ack for %q failed: %v", queueName, ackErr)
+					slog.Warn("rabbitmq: ack failed", "queue", queueName, "error", ackErr)
 				}
+				c.processed.Add(1)
 			}
 		}()
 	}
@@ -108,7 +119,32 @@ func (c *RabbitMQConsumer) Start(ctx context.Context) (<-chan Message, error) {
 		c.Stop()
 	}()
 
+	go c.logStatsPeriodically(ctx)
+
+	slog.Info("rabbitmq: consumer started", "queues", len(c.router))
+
 	return out, nil
+}
+
+// logStatsPeriodically emits one structured summary line of messages
+// processed/errored every statsLogInterval, until ctx is cancelled or Stop
+// closes statsDone - message counts rather than per-message logging, so
+// observability never adds overhead to the hot delivery-handling path
+// (CLAUDE.md rule 2).
+func (c *RabbitMQConsumer) logStatsPeriodically(ctx context.Context) {
+	ticker := time.NewTicker(statsLogInterval)
+	defer ticker.Stop()
+
+	for {
+		select {
+		case <-ticker.C:
+			slog.Info("rabbitmq: consumer stats", "processed", c.processed.Load(), "errors", c.errors.Load())
+		case <-c.statsDone:
+			return
+		case <-ctx.Done():
+			return
+		}
+	}
 }
 
 // Stop closes every channel and the connection, which in turn causes
@@ -118,6 +154,8 @@ func (c *RabbitMQConsumer) Start(ctx context.Context) (<-chan Message, error) {
 func (c *RabbitMQConsumer) Stop() error {
 	var err error
 	c.stopOnce.Do(func() {
+		close(c.statsDone)
+
 		c.mu.Lock()
 		conn, channels := c.conn, c.channels
 		c.mu.Unlock()
@@ -128,6 +166,8 @@ func (c *RabbitMQConsumer) Stop() error {
 		if conn != nil {
 			err = conn.Close()
 		}
+
+		slog.Info("rabbitmq: consumer stopped", "processed", c.processed.Load(), "errors", c.errors.Load())
 	})
 	return err
 }
