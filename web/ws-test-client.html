@@ -1,0 +1,439 @@
+<!DOCTYPE html>
+<html lang="de">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Statusengine WebSocket Test Client</title>
+<style>
+  :root {
+    color-scheme: light dark;
+    --bg: #f5f6f8;
+    --panel: #ffffff;
+    --border: #d9dce1;
+    --text: #1b1e24;
+    --muted: #6b7280;
+    --accent: #2563eb;
+    --ok: #16a34a;
+    --err: #dc2626;
+    --warn: #d97706;
+    --mono: "SFMono-Regular", Consolas, "Liberation Mono", Menlo, monospace;
+  }
+  @media (prefers-color-scheme: dark) {
+    :root {
+      --bg: #14161a;
+      --panel: #1d2026;
+      --border: #33373f;
+      --text: #e7e9ec;
+      --muted: #9aa1ac;
+      --accent: #5b8cff;
+    }
+  }
+  * { box-sizing: border-box; }
+  body {
+    margin: 0;
+    font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, sans-serif;
+    background: var(--bg);
+    color: var(--text);
+  }
+  header {
+    padding: 0.9rem 1.2rem;
+    border-bottom: 1px solid var(--border);
+    background: var(--panel);
+  }
+  header h1 { margin: 0; font-size: 1.1rem; }
+  header p { margin: 0.2rem 0 0; color: var(--muted); font-size: 0.85rem; }
+
+  main {
+    display: grid;
+    grid-template-columns: 320px 1fr;
+    gap: 1rem;
+    padding: 1rem;
+    max-width: 1400px;
+    margin: 0 auto;
+  }
+  @media (max-width: 800px) {
+    main { grid-template-columns: 1fr; }
+  }
+
+  .panel {
+    background: var(--panel);
+    border: 1px solid var(--border);
+    border-radius: 8px;
+    padding: 1rem;
+  }
+
+  .panel h2 {
+    margin: 0 0 0.6rem;
+    font-size: 0.95rem;
+  }
+
+  #connectRow {
+    display: flex;
+    gap: 0.5rem;
+    flex-wrap: wrap;
+    align-items: center;
+    margin-bottom: 0.6rem;
+  }
+  #wsUrl {
+    flex: 1;
+    min-width: 220px;
+    padding: 0.4rem 0.5rem;
+    border: 1px solid var(--border);
+    border-radius: 6px;
+    background: var(--bg);
+    color: var(--text);
+    font-family: var(--mono);
+    font-size: 0.85rem;
+  }
+  button {
+    padding: 0.4rem 0.8rem;
+    border: 1px solid var(--border);
+    border-radius: 6px;
+    background: var(--bg);
+    color: var(--text);
+    cursor: pointer;
+    font-size: 0.85rem;
+  }
+  button:hover:not(:disabled) { border-color: var(--accent); }
+  button:disabled { opacity: 0.5; cursor: not-allowed; }
+  button.primary { background: var(--accent); border-color: var(--accent); color: #fff; }
+
+  .status { font-size: 0.85rem; font-weight: 600; }
+  .status.disconnected { color: var(--muted); }
+  .status.connecting { color: var(--warn); }
+  .status.connected { color: var(--ok); }
+  .status.error { color: var(--err); }
+
+  .topic-toolbar { display: flex; gap: 0.4rem; margin-bottom: 0.5rem; }
+  .topic-toolbar button { flex: 1; }
+
+  #topicList {
+    display: flex;
+    flex-direction: column;
+    gap: 0.3rem;
+    max-height: 280px;
+    overflow-y: auto;
+    padding: 0.3rem 0;
+  }
+  .topic-item {
+    display: flex;
+    align-items: center;
+    gap: 0.5rem;
+    padding: 0.25rem 0.3rem;
+    border-radius: 5px;
+    font-size: 0.85rem;
+    cursor: pointer;
+  }
+  .topic-item:hover { background: var(--bg); }
+  .topic-item code { font-family: var(--mono); font-size: 0.8rem; }
+
+  #customTopicForm { display: flex; gap: 0.4rem; margin-top: 0.6rem; }
+  #customTopicInput {
+    flex: 1;
+    padding: 0.35rem 0.5rem;
+    border: 1px solid var(--border);
+    border-radius: 6px;
+    background: var(--bg);
+    color: var(--text);
+    font-size: 0.8rem;
+  }
+
+  #subscriptionInfo {
+    margin-top: 0.7rem;
+    padding-top: 0.6rem;
+    border-top: 1px dashed var(--border);
+    font-size: 0.78rem;
+    color: var(--muted);
+    line-height: 1.4;
+  }
+
+  #eventsPanel { display: flex; flex-direction: column; min-height: 70vh; }
+  #eventsHeader {
+    display: flex;
+    align-items: center;
+    justify-content: space-between;
+    gap: 0.6rem;
+    margin-bottom: 0.6rem;
+    flex-wrap: wrap;
+  }
+  #eventsHeader .right { display: flex; align-items: center; gap: 0.8rem; font-size: 0.8rem; }
+
+  #log {
+    flex: 1;
+    overflow-y: auto;
+    border: 1px solid var(--border);
+    border-radius: 6px;
+    background: var(--bg);
+    padding: 0.4rem;
+  }
+  .log-entry {
+    border-bottom: 1px solid var(--border);
+    padding: 0.4rem 0.2rem;
+  }
+  .log-entry:last-child { border-bottom: none; }
+  .log-meta {
+    display: flex;
+    gap: 0.6rem;
+    align-items: baseline;
+    margin-bottom: 0.15rem;
+  }
+  .log-time { font-family: var(--mono); font-size: 0.72rem; color: var(--muted); }
+  .log-topic {
+    font-family: var(--mono);
+    font-size: 0.75rem;
+    font-weight: 600;
+    color: var(--accent);
+    background: color-mix(in srgb, var(--accent) 12%, transparent);
+    padding: 0.05rem 0.4rem;
+    border-radius: 4px;
+  }
+  .log-payload {
+    margin: 0;
+    font-family: var(--mono);
+    font-size: 0.78rem;
+    white-space: pre-wrap;
+    word-break: break-word;
+  }
+  #log:empty::before {
+    content: "Noch keine Events empfangen.";
+    color: var(--muted);
+    font-size: 0.85rem;
+  }
+</style>
+</head>
+<body>
+
+<header>
+  <h1>Statusengine WebSocket Test Client</h1>
+  <p>Verbindet sich mit dem Hub (<code>/ws</code>) und zeigt live empfangene Events an - Topics können vor oder nach dem Verbinden aus- und abgewählt werden.</p>
+</header>
+
+<main>
+  <section class="panel" id="connectionPanel">
+    <h2>Verbindung</h2>
+    <div id="connectRow">
+      <input id="wsUrl" value="ws://localhost:8080/ws" spellcheck="false">
+      <button id="connectBtn" class="primary">Verbinden</button>
+      <button id="disconnectBtn" disabled>Trennen</button>
+    </div>
+    <span id="status" class="status disconnected">● Getrennt</span>
+
+    <h2 style="margin-top:1.2rem">Topics</h2>
+    <div class="topic-toolbar">
+      <button id="selectAllBtn">Alle</button>
+      <button id="selectNoneBtn">Keine</button>
+    </div>
+    <div id="topicList"></div>
+    <form id="customTopicForm">
+      <input id="customTopicInput" placeholder="eigenes Topic hinzufügen…" spellcheck="false">
+      <button type="submit">+</button>
+    </form>
+    <p id="subscriptionInfo"></p>
+  </section>
+
+  <section class="panel" id="eventsPanel">
+    <div id="eventsHeader">
+      <h2 style="margin:0">Events (<span id="eventCount">0</span>)</h2>
+      <div class="right">
+        <label><input type="checkbox" id="autoScroll" checked> Auto-Scroll</label>
+        <button id="clearBtn">Leeren</button>
+      </div>
+    </div>
+    <div id="log"></div>
+  </section>
+</main>
+
+<script>
+// Every queue name the Router in internal/queue/registry.go knows about -
+// these double as the WebSocket topics clients can subscribe to (see
+// CLAUDE.md rule 4 and internal/websocket/hub.go).
+const KNOWN_TOPICS = [
+  "statusngin_hoststatus",
+  "statusngin_servicestatus",
+  "statusngin_hostchecks",
+  "statusngin_servicechecks",
+  "statusngin_service_perfdata",
+  "statusngin_statechanges",
+  "statusngin_logentries",
+  "statusngin_notifications",
+  "statusngin_contactnotificationmethod",
+  "statusngin_acknowledgements",
+  "statusngin_downtimes",
+  "statusngin_core_restart",
+];
+
+const topicListEl = document.getElementById("topicList");
+const statusEl = document.getElementById("status");
+const logEl = document.getElementById("log");
+const eventCountEl = document.getElementById("eventCount");
+const subscriptionInfoEl = document.getElementById("subscriptionInfo");
+const connectBtn = document.getElementById("connectBtn");
+const disconnectBtn = document.getElementById("disconnectBtn");
+const wsUrlInput = document.getElementById("wsUrl");
+const autoScrollEl = document.getElementById("autoScroll");
+
+let ws = null;
+let eventCount = 0;
+
+function addTopicCheckbox(topic, checked) {
+  if (document.getElementById("topic-" + topic)) return;
+
+  const wrapper = document.createElement("label");
+  wrapper.className = "topic-item";
+  wrapper.innerHTML =
+    `<input type="checkbox" id="topic-${topic}" value="${topic}" ${checked ? "checked" : ""}> <code>${topic}</code>`;
+
+  const checkbox = wrapper.querySelector("input");
+  checkbox.addEventListener("change", () => onTopicToggle(topic, checkbox.checked));
+  topicListEl.appendChild(wrapper);
+}
+
+function getCheckedTopics() {
+  return Array.from(topicListEl.querySelectorAll("input[type=checkbox]:checked")).map(cb => cb.value);
+}
+
+// Mirrors internal/websocket/client.go's wantsTopic: an empty subscription
+// set means "receive everything", so unchecking every box doesn't mean
+// "receive nothing" on the server - it means the wildcard. Surfacing that
+// here avoids a confusing surprise.
+function updateSubscriptionInfo() {
+  const checked = getCheckedTopics();
+  subscriptionInfoEl.textContent = checked.length === 0
+    ? "Kein Topic ausgewählt → Server sendet ALLE Events (leeres Subscription-Set = Wildcard)."
+    : "Abonniert: " + checked.join(", ");
+}
+
+// While connected, every checkbox change is sent immediately as a
+// {"subscribe":[...]}/{"unsubscribe":[...]} control frame - the same
+// protocol internal/websocket/client.go's readPump expects. Before
+// connecting, toggling just updates which topics the initial "?topics="
+// query parameter will carry.
+function onTopicToggle(topic, isChecked) {
+  updateSubscriptionInfo();
+  if (!ws || ws.readyState !== WebSocket.OPEN) return;
+  ws.send(JSON.stringify(isChecked ? { subscribe: [topic] } : { unsubscribe: [topic] }));
+}
+
+document.getElementById("selectAllBtn").addEventListener("click", () => {
+  topicListEl.querySelectorAll("input[type=checkbox]").forEach(cb => {
+    if (!cb.checked) {
+      cb.checked = true;
+      onTopicToggle(cb.value, true);
+    }
+  });
+});
+
+document.getElementById("selectNoneBtn").addEventListener("click", () => {
+  topicListEl.querySelectorAll("input[type=checkbox]").forEach(cb => {
+    if (cb.checked) {
+      cb.checked = false;
+      onTopicToggle(cb.value, false);
+    }
+  });
+  updateSubscriptionInfo();
+});
+
+document.getElementById("customTopicForm").addEventListener("submit", (e) => {
+  e.preventDefault();
+  const input = document.getElementById("customTopicInput");
+  const topic = input.value.trim();
+  if (!topic) return;
+  addTopicCheckbox(topic, true);
+  onTopicToggle(topic, true);
+  updateSubscriptionInfo();
+  input.value = "";
+});
+
+function setStatus(text, cls) {
+  statusEl.textContent = text;
+  statusEl.className = "status " + cls;
+}
+
+function escapeHtml(str) {
+  return str.replace(/[&<>"']/g, c => ({ "&": "&amp;", "<": "&lt;", ">": "&gt;", '"': "&quot;", "'": "&#39;" }[c]));
+}
+
+function appendLogEntry(topic, payload) {
+  eventCount++;
+  eventCountEl.textContent = eventCount;
+
+  const time = new Date().toLocaleTimeString("de-DE", { hour12: false });
+  let pretty;
+  try {
+    pretty = JSON.stringify(payload, null, 2);
+  } catch {
+    pretty = String(payload);
+  }
+
+  const entry = document.createElement("div");
+  entry.className = "log-entry";
+  entry.innerHTML =
+    `<div class="log-meta"><span class="log-time">${time}</span><span class="log-topic">${escapeHtml(topic)}</span></div>` +
+    `<pre class="log-payload">${escapeHtml(pretty)}</pre>`;
+  logEl.appendChild(entry);
+
+  if (autoScrollEl.checked) logEl.scrollTop = logEl.scrollHeight;
+}
+
+function connect() {
+  const base = wsUrlInput.value.trim();
+  if (!base) {
+    alert("Bitte eine WebSocket-URL angeben.");
+    return;
+  }
+
+  const topics = getCheckedTopics();
+  const url = topics.length > 0 ? base + "?topics=" + encodeURIComponent(topics.join(",")) : base;
+
+  setStatus("● Verbinde…", "connecting");
+  ws = new WebSocket(url);
+
+  ws.onopen = () => {
+    setStatus("● Verbunden", "connected");
+    connectBtn.disabled = true;
+    disconnectBtn.disabled = false;
+    wsUrlInput.disabled = true;
+  };
+
+  ws.onmessage = (event) => {
+    let data;
+    try {
+      data = JSON.parse(event.data);
+    } catch {
+      appendLogEntry("(nicht parsbar)", event.data);
+      return;
+    }
+    appendLogEntry(data.topic || "(kein Topic)", data.payload);
+  };
+
+  ws.onclose = () => {
+    setStatus("● Getrennt", "disconnected");
+    connectBtn.disabled = false;
+    disconnectBtn.disabled = true;
+    wsUrlInput.disabled = false;
+    ws = null;
+  };
+
+  ws.onerror = () => {
+    setStatus("● Fehler - siehe Browser-Konsole", "error");
+  };
+}
+
+function disconnect() {
+  if (ws) ws.close();
+}
+
+connectBtn.addEventListener("click", connect);
+disconnectBtn.addEventListener("click", disconnect);
+document.getElementById("clearBtn").addEventListener("click", () => {
+  logEl.innerHTML = "";
+  eventCount = 0;
+  eventCountEl.textContent = "0";
+});
+
+KNOWN_TOPICS.forEach(topic => addTopicCheckbox(topic, false));
+updateSubscriptionInfo();
+</script>
+
+</body>
+</html>
