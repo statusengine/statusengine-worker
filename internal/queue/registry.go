@@ -231,6 +231,8 @@ func newContactNotificationMethodHandler(hub *websocket.Hub, topic string, hostI
 // newStateChangeHandler and newAcknowledgementHandler route each decoded
 // item to one of two BulkInserters depending on whether it describes a
 // host or a service, mirroring the schema's separate host/service tables.
+// newStateChangeHandler routes on ServiceDescription; newAcknowledgementHandler
+// routes on AcknowledgementType instead - see the comment inside it for why.
 // Both items still publish to the same WebSocket topic (the queue name);
 // only MySQL persistence is split.
 
@@ -266,8 +268,12 @@ func newAcknowledgementHandler(hub *websocket.Hub, topic string, hostIns, servic
 		for _, ev := range events {
 			publish(hub, topic, ev)
 
+			// In the broker_acknowledgement_data callback, acknowledgement type is used to determine if it is a host or service acknowledgement
+			// This is a differente behavior than the broker_host_status and broker_service_status callbacks have -.-
+			// 0 = HOST_ACKNOWLEDGEMENT
+			// 1 = SERVICE_ACKNOWLEDGEMENT
 			ins := hostIns
-			if ev.ServiceDescription != "" {
+			if ev.AcknowledgementType == 1 {
 				ins = serviceIns
 			}
 			if err := ins.Enqueue(ctx, ev); err != nil {

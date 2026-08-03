@@ -167,9 +167,10 @@ func TestAcknowledgementHandlerRoutesToHostAndServiceTables(t *testing.T) {
 	hostMsg := types.AcknowledgementMessage{
 		Envelope: types.Envelope{Type: types.EventTypeAcknowledgement, Timestamp: entryTime},
 		Acknowledgement: types.AcknowledgementPayload{
-			HostName:   hostOnly,
-			AuthorName: "test-author",
-			State:      1,
+			HostName:            hostOnly,
+			AuthorName:          "test-author",
+			State:               1,
+			AcknowledgementType: 0, // HOST_ACKNOWLEDGEMENT
 		},
 	}
 	hostPayload, err := json.Marshal(hostMsg)
@@ -183,10 +184,11 @@ func TestAcknowledgementHandlerRoutesToHostAndServiceTables(t *testing.T) {
 	serviceMsg := types.AcknowledgementMessage{
 		Envelope: types.Envelope{Type: types.EventTypeAcknowledgement, Timestamp: entryTime},
 		Acknowledgement: types.AcknowledgementPayload{
-			HostName:           withService,
-			ServiceDescription: "Swap Usage",
-			AuthorName:         "test-author",
-			State:              2,
+			HostName:            withService,
+			ServiceDescription:  "Swap Usage",
+			AuthorName:          "test-author",
+			State:               2,
+			AcknowledgementType: 1, // SERVICE_ACKNOWLEDGEMENT
 		},
 	}
 	servicePayload, err := json.Marshal(serviceMsg)
