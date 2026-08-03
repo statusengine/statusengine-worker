@@ -149,14 +149,28 @@ func logEntryRow(p types.LogEntryPayload) []any {
 
 func hostStateHistoryRow(ev stateChangeEvent) []any {
 	return []any{
-		ev.HostName, ev.Timestamp, ev.StateChangeType, ev.State, isHardState(ev.StateType),
+		ev.HostName, ev.Timestamp, ev.TimestampUsec,
+		// NOTE: Unlike standard NDOUtils where 'state_change' indicates a state transition occurrence,
+		// Statusengine repurposes this field to differentiate between Host (0) and Service (1) state history.
+		// In standard NDO, this field is hardcoded to TRUE.
+		// https://github.com/NagiosEnterprises/ndoutils/blob/2a7171e36e67c5476b2825fffa7bf6a52042a1f5/src/dbhandlers.c#L2940
+		// https://github.com/NagiosEnterprises/ndoutils/blob/2a7171e36e67c5476b2825fffa7bf6a52042a1f5/src/ndomod.c#L3435
+		ev.StateChangeType,
+		ev.State, isHardState(ev.StateType),
 		ev.CurrentAttempt, ev.MaxAttempts, ev.LastState, ev.LastHardState, ev.Output, ev.LongOutput,
 	}
 }
 
 func serviceStateHistoryRow(ev stateChangeEvent) []any {
 	return []any{
-		ev.ServiceDescription, ev.Timestamp, ev.HostName, ev.StateChangeType, ev.State, isHardState(ev.StateType),
+		ev.ServiceDescription, ev.Timestamp, ev.TimestampUsec, ev.HostName,
+		// NOTE: Unlike standard NDOUtils where 'state_change' indicates a state transition occurrence,
+		// Statusengine repurposes this field to differentiate between Host (0) and Service (1) state history.
+		// In standard NDO, this field is hardcoded to TRUE.
+		// https://github.com/NagiosEnterprises/ndoutils/blob/2a7171e36e67c5476b2825fffa7bf6a52042a1f5/src/dbhandlers.c#L2940
+		// https://github.com/NagiosEnterprises/ndoutils/blob/2a7171e36e67c5476b2825fffa7bf6a52042a1f5/src/ndomod.c#L3435
+		ev.StateChangeType,
+		ev.State, isHardState(ev.StateType),
 		ev.CurrentAttempt, ev.MaxAttempts, ev.LastState, ev.LastHardState, ev.Output, ev.LongOutput,
 	}
 }
@@ -231,10 +245,10 @@ func newContactNotificationMethodHandler(hub *websocket.Hub, topic string, hostI
 // newStateChangeHandler and newAcknowledgementHandler route each decoded
 // item to one of two BulkInserters depending on whether it describes a
 // host or a service, mirroring the schema's separate host/service tables.
-// newStateChangeHandler routes on ServiceDescription; newAcknowledgementHandler
-// routes on AcknowledgementType instead - see the comment inside it for why.
-// Both items still publish to the same WebSocket topic (the queue name);
-// only MySQL persistence is split.
+// newStateChangeHandler routes on StateChangeType (0 = host, 1 = service);
+// newAcknowledgementHandler routes on AcknowledgementType instead - see the
+// comment inside it for why. Both items still publish to the same WebSocket
+// topic (the queue name); only MySQL persistence is split.
 
 func newStateChangeHandler(hub *websocket.Hub, topic string, hostIns, serviceIns enqueuer[stateChangeEvent]) Handler {
 	return func(ctx context.Context, payload []byte) error {
@@ -246,8 +260,11 @@ func newStateChangeHandler(hub *websocket.Hub, topic string, hostIns, serviceIns
 		for _, ev := range events {
 			publish(hub, topic, ev)
 
+			// statechange_type distinguishes host (0) from service (1) state
+			// history the same way it's persisted into 'state_change' below -
+			// see hostStateHistoryRow/serviceStateHistoryRow for why.
 			ins := hostIns
-			if ev.ServiceDescription != "" {
+			if ev.StateChangeType == 1 {
 				ins = serviceIns
 			}
 			if err := ins.Enqueue(ctx, ev); err != nil {
@@ -338,13 +355,14 @@ func NewRouter(sqlDB *sql.DB, hub *websocket.Hub, gc *graphite.Client, perfdataR
 		logEntryRow)
 
 	hostStateHistory := db.NewBulkInserter(sqlDB, "statusengine_host_statehistory",
-		[]string{"hostname", "state_time", "state_change", "state", "is_hardstate", "current_check_attempt",
-			"max_check_attempts", "last_state", "last_hard_state", "output", "long_output"},
+		[]string{"hostname", "state_time", "state_time_usec", "state_change", "state", "is_hardstate",
+			"current_check_attempt", "max_check_attempts", "last_state", "last_hard_state", "output", "long_output"},
 		hostStateHistoryRow)
 
 	serviceStateHistory := db.NewBulkInserter(sqlDB, "statusengine_service_statehistory",
-		[]string{"service_description", "state_time", "hostname", "state_change", "state", "is_hardstate",
-			"current_check_attempt", "max_check_attempts", "last_state", "last_hard_state", "output", "long_output"},
+		[]string{"service_description", "state_time", "state_time_usec", "hostname", "state_change", "state",
+			"is_hardstate", "current_check_attempt", "max_check_attempts", "last_state", "last_hard_state",
+			"output", "long_output"},
 		serviceStateHistoryRow)
 
 	hostAcks := db.NewBulkInserter(sqlDB, "statusengine_host_acknowledgements",

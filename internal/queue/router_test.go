@@ -181,8 +181,8 @@ func TestStateChangeHandlerRoutesHostVsService(t *testing.T) {
 		t.Fatalf("handler: %v", err)
 	}
 
-	// Both fixture entries carry a ServiceDescription ("Flapping"), so both
-	// should land in serviceIns and none in hostIns.
+	// Both fixture entries carry statechange_type 1, so both should land in
+	// serviceIns and none in hostIns.
 	if got := len(hostIns.snapshot()); got != 0 {
 		t.Fatalf("hostIns got %d items, want 0", got)
 	}

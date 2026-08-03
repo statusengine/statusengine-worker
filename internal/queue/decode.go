@@ -9,9 +9,12 @@ import (
 // stateChangeEvent augments types.StateChangePayload with the timestamp of
 // the message that carried it: the statechange object itself carries no
 // time field of its own (see .claude/specs/statusngin_statechanges.json),
-// only the message Envelope does.
+// only the message Envelope does. Timestamp/TimestampUsec become
+// statusengine_host_statehistory's and statusengine_service_statehistory's
+// state_time/state_time_usec columns.
 type stateChangeEvent struct {
-	Timestamp int64 `json:"timestamp"`
+	Timestamp     int64 `json:"timestamp"`
+	TimestampUsec int   `json:"timestamp_usec"`
 	types.StateChangePayload
 }
 
@@ -120,7 +123,7 @@ func decodeStateChange(payload []byte) ([]stateChangeEvent, error) {
 	}
 	items := make([]stateChangeEvent, len(bulk.Messages))
 	for i, m := range bulk.Messages {
-		items[i] = stateChangeEvent{Timestamp: m.Timestamp, StateChangePayload: m.StateChange}
+		items[i] = stateChangeEvent{Timestamp: m.Timestamp, TimestampUsec: m.TimestampUsec, StateChangePayload: m.StateChange}
 	}
 	return items, nil
 }
