@@ -39,6 +39,94 @@ func isHardState(stateType int) int {
 	return 0
 }
 
+// isPassiveCheck maps the standard Nagios/Icinga/Naemon check_type
+// convention (0 = ACTIVE, 1 = PASSIVE) to the tinyint(1) is_passive_check
+// column: check_type == 0 means the check was active, so is_passive_check
+// is 1 only when check_type is anything else.
+func isPassiveCheck(checkType int) int {
+	if checkType == 0 {
+		return 1
+	}
+	return 0
+}
+
+// hostStatusColumns and hostStatusUpdateColumns are shared by NewRouter's
+// hostStatus BulkInserter and newHostStatusRow: hostStatusUpdateColumns is
+// every hostStatusColumns entry except the table's primary key ("hostname"),
+// refreshed via ON DUPLICATE KEY UPDATE on every repeat status update for
+// the same host.
+var hostStatusColumns = []string{
+	"hostname", "status_update_time", "output", "long_output", "perfdata", "current_state",
+	"current_check_attempt", "max_check_attempts", "last_check", "next_check", "is_passive_check",
+	"last_state_change", "last_hard_state_change", "last_hard_state", "is_hardstate",
+	"last_notification", "next_notification", "notifications_enabled", "problem_has_been_acknowledged",
+	"acknowledgement_type", "passive_checks_enabled", "active_checks_enabled", "event_handler_enabled",
+	"flap_detection_enabled", "is_flapping", "latency", "execution_time", "scheduled_downtime_depth",
+	"process_performance_data", "obsess_over_host", "normal_check_interval", "retry_check_interval",
+	"check_timeperiod", "node_name", "last_time_up", "last_time_down", "last_time_unreachable",
+	"current_notification_number", "percent_state_change", "event_handler", "check_command",
+}
+
+var hostStatusUpdateColumns = hostStatusColumns[1:]
+
+// serviceStatusColumns and serviceStatusUpdateColumns mirror hostStatusColumns
+// for statusengine_servicestatus, whose primary key is the composite
+// (hostname, service_description) - so both are excluded from the update list.
+var serviceStatusColumns = []string{
+	"hostname", "service_description", "status_update_time", "output", "long_output", "perfdata",
+	"current_state", "current_check_attempt", "max_check_attempts", "last_check", "next_check",
+	"is_passive_check", "last_state_change", "last_hard_state_change", "last_hard_state", "is_hardstate",
+	"last_notification", "next_notification", "notifications_enabled", "problem_has_been_acknowledged",
+	"acknowledgement_type", "passive_checks_enabled", "active_checks_enabled", "event_handler_enabled",
+	"flap_detection_enabled", "is_flapping", "latency", "execution_time", "scheduled_downtime_depth",
+	"process_performance_data", "obsess_over_service", "normal_check_interval", "retry_check_interval",
+	"check_timeperiod", "node_name", "last_time_ok", "last_time_warning", "last_time_critical",
+	"last_time_unknown", "current_notification_number", "percent_state_change", "event_handler", "check_command",
+}
+
+var serviceStatusUpdateColumns = serviceStatusColumns[2:]
+
+// newHostStatusRow returns a RowFunc for statusengine_hoststatus, closing
+// over nodeName since it comes from process configuration rather than the
+// event itself (CLAUDE.md: worker-wide "nodename" option, default
+// "statusengine").
+func newHostStatusRow(nodeName string) db.RowFunc[hostStatusEvent] {
+	return func(ev hostStatusEvent) []any {
+		p := ev.HostStatusPayload
+		return []any{
+			p.Name, ev.Timestamp, p.PluginOutput, p.LongPluginOutput, p.PerfData, p.CurrentState,
+			p.CurrentAttempt, p.MaxAttempts, p.LastCheck, p.NextCheck, isPassiveCheck(p.CheckType),
+			p.LastStateChange, p.LastHardStateChange, p.LastHardState, isHardState(p.StateType),
+			p.LastNotification, p.NextNotification, p.NotificationsEnabled, p.ProblemHasBeenAcknowledged,
+			p.AcknowledgementType, p.AcceptPassiveChecks, p.ChecksEnabled, p.EventHandlerEnabled,
+			p.FlapDetectionEnabled, p.IsFlapping, p.Latency, p.ExecutionTime, p.ScheduledDowntimeDepth,
+			p.ProcessPerformanceData, p.Obsess, int(p.CheckInterval), int(p.RetryInterval),
+			p.CheckPeriod, nodeName, p.LastTimeUp, p.LastTimeDown, p.LastTimeUnreachable,
+			p.CurrentNotificationNumber, p.PercentStateChange, p.EventHandler, p.CheckCommand,
+		}
+	}
+}
+
+// newServiceStatusRow is the statusengine_servicestatus equivalent of
+// newHostStatusRow.
+func newServiceStatusRow(nodeName string) db.RowFunc[serviceStatusEvent] {
+	return func(ev serviceStatusEvent) []any {
+		p := ev.ServiceStatusPayload
+		return []any{
+			p.HostName, p.Description, ev.Timestamp, p.PluginOutput, p.LongPluginOutput, p.PerfData,
+			p.CurrentState, p.CurrentAttempt, p.MaxAttempts, p.LastCheck, p.NextCheck,
+			isPassiveCheck(p.CheckType), p.LastStateChange, p.LastHardStateChange, p.LastHardState,
+			isHardState(p.StateType), p.LastNotification, p.NextNotification, p.NotificationsEnabled,
+			p.ProblemHasBeenAcknowledged, p.AcknowledgementType, p.AcceptPassiveChecks, p.ChecksEnabled,
+			p.EventHandlerEnabled, p.FlapDetectionEnabled, p.IsFlapping, p.Latency, p.ExecutionTime,
+			p.ScheduledDowntimeDepth, p.ProcessPerformanceData, p.Obsess, int(p.CheckInterval),
+			int(p.RetryInterval), p.CheckPeriod, nodeName, p.LastTimeOk, p.LastTimeWarning,
+			p.LastTimeCritical, p.LastTimeUnknown, p.CurrentNotificationNumber, p.PercentStateChange,
+			p.EventHandler, p.CheckCommand,
+		}
+	}
+}
+
 func hostCheckRow(p types.HostCheckPayload) []any {
 	return []any{
 		p.HostName, p.StartTime, p.State, isHardState(p.StateType), p.EndTime,
@@ -141,14 +229,17 @@ func newAcknowledgementHandler(hub *websocket.Hub, topic string, hostIns, servic
 // and dispatches each item onward. Queues whose payload maps cleanly onto a
 // destination table (CLAUDE.md rule 3) get a dedicated *db.BulkInserter;
 // their host/service variants are split across the schema's separate
-// tables. Queues without an unambiguous destination table - hoststatus and
-// servicestatus need legacy-specific fields (e.g. is_passive_check,
-// node_name) that aren't derivable from the sample payloads alone, see the
-// legacy reference in CLAUDE.md; contactnotificationmethod and core_restart
-// have no matching table at all - are broadcast to WebSocket subscribers
-// only. service_perfdata gets its own handler (see processor.go), routing
-// each parsed metric to MySQL, Graphite, or both per perfdataRoute
-// (CLAUDE.md rule 5).
+// tables. hoststatus and servicestatus are upserted (CLAUDE.md rule 3: still
+// batched at 100 rows/250ms, just as "INSERT ... ON DUPLICATE KEY UPDATE ..."
+// instead of a plain INSERT) since repeated status snapshots for the same
+// host/service collide on the tables' primary keys; is_passive_check is
+// derived from check_type (0 = active) and node_name comes from the
+// worker-wide nodeName config value, since neither is present in the sample
+// payloads' hoststatus/servicestatus objects themselves. Queues with no
+// matching table at all - contactnotificationmethod and core_restart - are
+// broadcast to WebSocket subscribers only. service_perfdata gets its own
+// handler (see processor.go), routing each parsed metric to MySQL, Graphite,
+// or both per perfdataRoute (CLAUDE.md rule 5).
 //
 // gc's Run loop is started and Flushed by the caller alongside the
 // returned []Runner (see the runners slice below) even when perfdataRoute
@@ -158,7 +249,16 @@ func newAcknowledgementHandler(hub *websocket.Hub, topic string, hostIns, servic
 // The returned []Runner lets the caller start every BulkInserter's Run loop
 // and Flush them on graceful shutdown without needing to know each one's
 // concrete item type.
-func NewRouter(sqlDB *sql.DB, hub *websocket.Hub, gc *graphite.Client, perfdataRoute PerfdataRoute) (Router, []Runner) {
+//
+// nodeName is written into every hoststatus/servicestatus row's node_name
+// column (worker-wide "nodename" config option, default "statusengine").
+func NewRouter(sqlDB *sql.DB, hub *websocket.Hub, gc *graphite.Client, perfdataRoute PerfdataRoute, nodeName string) (Router, []Runner) {
+	hostStatus := db.NewUpsertBulkInserter(sqlDB, "statusengine_hoststatus",
+		hostStatusColumns, hostStatusUpdateColumns, newHostStatusRow(nodeName))
+
+	serviceStatus := db.NewUpsertBulkInserter(sqlDB, "statusengine_servicestatus",
+		serviceStatusColumns, serviceStatusUpdateColumns, newServiceStatusRow(nodeName))
+
 	hostChecks := db.NewBulkInserter(sqlDB, "statusengine_hostchecks",
 		[]string{"hostname", "start_time", "state", "is_hardstate", "end_time", "output", "long_output",
 			"timeout", "early_timeout", "latency", "execution_time", "perfdata", "command",
@@ -206,9 +306,9 @@ func NewRouter(sqlDB *sql.DB, hub *websocket.Hub, gc *graphite.Client, perfdataR
 		QueueStateChanges:     newStateChangeHandler(hub, QueueStateChanges, hostStateHistory, serviceStateHistory),
 		QueueAcknowledgements: newAcknowledgementHandler(hub, QueueAcknowledgements, hostAcks, serviceAcks),
 		QueueServicePerfdata:  NewPerfdataHandler(hub, QueueServicePerfdata, perfdataRoute, perfdata, gc),
+		QueueHostStatus:       NewHandler(hub, QueueHostStatus, hostStatus, decodeHostStatus),
+		QueueServiceStatus:    NewHandler(hub, QueueServiceStatus, serviceStatus, decodeServiceStatus),
 
-		QueueHostStatus:                NewBroadcastHandler(hub, QueueHostStatus, decodeHostStatus),
-		QueueServiceStatus:             NewBroadcastHandler(hub, QueueServiceStatus, decodeServiceStatus),
 		QueueNotifications:             NewBroadcastHandler(hub, QueueNotifications, decodeNotification),
 		QueueContactNotificationMethod: NewBroadcastHandler(hub, QueueContactNotificationMethod, decodeContactNotificationMethod),
 		QueueDowntimes:                 NewBroadcastHandler(hub, QueueDowntimes, decodeDowntime),
@@ -216,6 +316,7 @@ func NewRouter(sqlDB *sql.DB, hub *websocket.Hub, gc *graphite.Client, perfdataR
 	}
 
 	runners := []Runner{
+		hostStatus, serviceStatus,
 		hostChecks, serviceChecks, logEntries,
 		hostStateHistory, serviceStateHistory,
 		hostAcks, serviceAcks,

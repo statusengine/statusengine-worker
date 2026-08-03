@@ -33,6 +33,7 @@ type config struct {
 	listenAddr      string
 	graphiteAddr    string
 	perfdataRoute   string // "mysql", "graphite" or "both"
+	nodeName        string // written into hoststatus/servicestatus rows' node_name column
 	logLevel        string // "debug", "info", "warn" or "error"
 	logFormat       string // "text" or "json"
 }
@@ -54,6 +55,8 @@ func loadConfig() config {
 		"Graphite Carbon plaintext receiver address (host:port)")
 	flag.StringVar(&cfg.perfdataRoute, "perfdata-route", envOrDefault("STATUSENGINE_PERFDATA_ROUTE", "mysql"),
 		`where statusngin_service_perfdata metrics are written: "mysql", "graphite" or "both" (CLAUDE.md rule 5)`)
+	flag.StringVar(&cfg.nodeName, "nodename", envOrDefault("STATUSENGINE_NODENAME", "statusengine"),
+		"node_name value written into statusengine_hoststatus/statusengine_servicestatus rows")
 	flag.StringVar(&cfg.logLevel, "log-level", envOrDefault("STATUSENGINE_LOG_LEVEL", "info"),
 		`minimum log level: "debug", "info", "warn" or "error"`)
 	flag.StringVar(&cfg.logFormat, "log-format", envOrDefault("STATUSENGINE_LOG_FORMAT", "text"),
@@ -155,7 +158,7 @@ func main() {
 	// connection is ever dialed (CLAUDE.md rule 5).
 	gc := graphite.NewClient(cfg.graphiteAddr)
 
-	router, runners := queue.NewRouter(sqlDB, hub, gc, perfdataRoute)
+	router, runners := queue.NewRouter(sqlDB, hub, gc, perfdataRoute, cfg.nodeName)
 	for _, r := range runners {
 		wg.Add(1)
 		go func(r queue.Runner) {

@@ -39,6 +39,14 @@ type BulkInserter[T any] struct {
 	columns []string
 	toRow   RowFunc[T]
 
+	// updateColumns, when non-empty, turns every flush into an
+	// "INSERT ... ON DUPLICATE KEY UPDATE" upsert instead of a plain INSERT:
+	// on a primary-key collision, each listed column is refreshed from the
+	// row that would have been inserted (MySQL's VALUES(col)). Set via
+	// NewUpsertBulkInserter for tables that receive repeated snapshots of
+	// the same row (e.g. hoststatus/servicestatus, keyed on hostname).
+	updateColumns []string
+
 	in       chan T
 	flushReq chan flushRequest
 
@@ -68,6 +76,19 @@ func NewBulkInserter[T any](db *sql.DB, table string, columns []string, toRow Ro
 		flushReq: make(chan flushRequest),
 		buffer:   make([]T, 0, MaxBatchSize),
 	}
+}
+
+// NewUpsertBulkInserter creates a BulkInserter exactly like NewBulkInserter,
+// except every flush is executed as a single
+// "INSERT INTO table (...) VALUES (...), ... ON DUPLICATE KEY UPDATE ..."
+// statement: on a primary-key collision, each column named in updateColumns
+// is refreshed from the row that would have been inserted. Use this for
+// tables that receive repeated snapshots of the same logical row (e.g.
+// statusengine_hoststatus/statusengine_servicestatus, keyed on hostname).
+func NewUpsertBulkInserter[T any](db *sql.DB, table string, columns []string, updateColumns []string, toRow RowFunc[T]) *BulkInserter[T] {
+	b := NewBulkInserter(db, table, columns, toRow)
+	b.updateColumns = updateColumns
+	return b
 }
 
 // Enqueue hands an item to the inserter's buffer, blocking only until
@@ -226,6 +247,19 @@ func (b *BulkInserter[T]) buildInsert(items []T) (string, []any) {
 		}
 		query.WriteString(rowPlaceholder)
 		args = append(args, b.toRow(item)...)
+	}
+
+	if len(b.updateColumns) > 0 {
+		query.WriteString(" ON DUPLICATE KEY UPDATE ")
+		for i, col := range b.updateColumns {
+			if i > 0 {
+				query.WriteString(", ")
+			}
+			query.WriteString(col)
+			query.WriteString(" = VALUES(")
+			query.WriteString(col)
+			query.WriteString(")")
+		}
 	}
 
 	return query.String(), args

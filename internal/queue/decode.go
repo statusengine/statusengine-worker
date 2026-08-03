@@ -25,26 +25,42 @@ type acknowledgementEvent struct {
 	types.AcknowledgementPayload
 }
 
-func decodeHostStatus(payload []byte) ([]types.HostStatusPayload, error) {
+// hostStatusEvent augments types.HostStatusPayload with the timestamp of the
+// message that carried it: statusengine_hoststatus's status_update_time
+// column has no equivalent field on the hoststatus object itself, only the
+// message Envelope does.
+type hostStatusEvent struct {
+	Timestamp int64 `json:"timestamp"`
+	types.HostStatusPayload
+}
+
+// serviceStatusEvent is the servicestatus equivalent of hostStatusEvent, for
+// statusengine_servicestatus's status_update_time column.
+type serviceStatusEvent struct {
+	Timestamp int64 `json:"timestamp"`
+	types.ServiceStatusPayload
+}
+
+func decodeHostStatus(payload []byte) ([]hostStatusEvent, error) {
 	var bulk types.HostStatusBulk
 	if err := json.Unmarshal(payload, &bulk); err != nil {
 		return nil, err
 	}
-	items := make([]types.HostStatusPayload, len(bulk.Messages))
+	items := make([]hostStatusEvent, len(bulk.Messages))
 	for i, m := range bulk.Messages {
-		items[i] = m.HostStatus
+		items[i] = hostStatusEvent{Timestamp: m.Timestamp, HostStatusPayload: m.HostStatus}
 	}
 	return items, nil
 }
 
-func decodeServiceStatus(payload []byte) ([]types.ServiceStatusPayload, error) {
+func decodeServiceStatus(payload []byte) ([]serviceStatusEvent, error) {
 	var bulk types.ServiceStatusBulk
 	if err := json.Unmarshal(payload, &bulk); err != nil {
 		return nil, err
 	}
-	items := make([]types.ServiceStatusPayload, len(bulk.Messages))
+	items := make([]serviceStatusEvent, len(bulk.Messages))
 	for i, m := range bulk.Messages {
-		items[i] = m.ServiceStatus
+		items[i] = serviceStatusEvent{Timestamp: m.Timestamp, ServiceStatusPayload: m.ServiceStatus}
 	}
 	return items, nil
 }

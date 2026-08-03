@@ -32,6 +32,22 @@ func TestBuildInsert(t *testing.T) {
 	}
 }
 
+func TestBuildInsertUpsert(t *testing.T) {
+	b := NewUpsertBulkInserter[row](nil, "mytable", []string{"id", "name"}, []string{"name"}, toRow)
+
+	query, args := b.buildInsert([]row{{1, "a"}, {2, "b"}})
+
+	wantQuery := "INSERT INTO mytable (id, name) VALUES (?,?), (?,?) ON DUPLICATE KEY UPDATE name = VALUES(name)"
+	if query != wantQuery {
+		t.Fatalf("query = %q, want %q", query, wantQuery)
+	}
+
+	wantArgs := []any{1, "a", 2, "b"}
+	if !reflect.DeepEqual(args, wantArgs) {
+		t.Fatalf("args = %v, want %v", args, wantArgs)
+	}
+}
+
 func TestBuildInsertEmpty(t *testing.T) {
 	b := NewBulkInserter[row](nil, "mytable", []string{"id", "name"}, toRow)
 	if _, args := b.buildInsert(nil); len(args) != 0 {
