@@ -181,7 +181,16 @@ func main() {
 	slog.Info("simulator starting",
 		"queues", strings.Join(queueNames, ","), "target_rate", cfg.rate, "workers", cfg.workers, "duration", cfg.duration)
 
-	sent := runLoad(runCtx, router, queueNames, payloads, cfg.rate, cfg.workers)
+	// runSeed folds the process's own start time into every offset (see
+	// runLoad), so that re-running the simulator against the same
+	// (deliberately non-truncated) dev database never regenerates the
+	// exact offsets - and therefore exact primary keys - a previous run
+	// already inserted. seq alone always restarts at 1 each run, which
+	// would otherwise reproduce identical rows and fail with the very
+	// Error 1062 this tool is meant to demonstrate the absence of.
+	runSeed := time.Now().Unix()
+
+	sent := runLoad(runCtx, router, queueNames, payloads, cfg.rate, cfg.workers, runSeed)
 	slog.Info("simulator stopped sending", "messages_sent", sent)
 
 	// Flush every BulkInserter's remaining buffer immediately, so the
@@ -242,10 +251,9 @@ func loadFixtures(specsDir string, queueNames []string) (map[string][]byte, erro
 
 // timestampFields lists every JSON object key, anywhere in a fixture's
 // tree, that withUniqueTimestamps treats as a Unix-seconds timestamp to
-// shift. It deliberately excludes "*_usec" companions (e.g.
-// "timestamp_usec") - those are a sub-second component of the same
-// instant and adding a multi-second offset to the whole-second field
-// alone already guarantees uniqueness.
+// shift. It deliberately excludes "timestamp_usec" - that field gets its
+// own fresh per-event value from bumpUsec instead of an offset; see there
+// for why.
 var timestampFields = map[string]bool{
 	"timestamp":  true,
 	"start_time": true,
@@ -257,31 +265,36 @@ var timestampFields = map[string]bool{
 // timestampSpacing is the gap, in seconds, between two calls' offsets
 // (see runLoad's seq.Add(1)*timestampSpacing). A single fixture's several
 // messages can differ by a few seconds from each other (e.g.
-// statusngin_statechanges.json's two entries are 3 seconds apart); some
-// destination rows don't carry sub-second (usec) precision into their
-// primary key at all, only the whole-second field this tool shifts, so
+// statusngin_statechanges.json's two entries are 3 seconds apart), so
 // consecutive calls need a gap far larger than any such intra-fixture
 // delta - otherwise two different calls could still coincidentally land
-// on the same shifted second and collide with each other. 100000 (~27h)
-// comfortably clears that.
+// on the same shifted second and collide with each other, since bumpUsec's
+// counter resets to 0 for every call and can't disambiguate across calls
+// on its own. 100000 (~27h) comfortably clears that.
 const timestampSpacing = 100_000
 
-// withUniqueTimestamps returns a copy of payload with every field named
-// in timestampFields shifted by offsetSeconds, wherever it appears in the
-// JSON tree. Fixtures are static files replayed thousands of times per
-// run; several destination tables key their primary key on one of these
-// fields (e.g. statusengine_hostchecks on hostname+start_time), so
-// without this every replay past the first would collide and get dropped
-// as a duplicate - which would demonstrate a MySQL error, not the
-// buffer's flush behaviour this tool exists to show. Falls back to
-// returning payload unmodified if it doesn't parse as JSON, which should
-// never happen for our own fixtures.
+// withUniqueTimestamps returns a copy of payload with every field named in
+// timestampFields shifted by offsetSeconds, and every "timestamp_usec"
+// occurrence replaced with a fresh per-event value (see bumpUsec),
+// wherever either appears in the JSON tree. Fixtures are static files
+// replayed thousands of times per run; several destination tables key
+// their primary key on some combination of these fields plus
+// timestamp_usec (e.g. statusengine_host_statehistory on
+// hostname+state_time+state_time_usec), so without this every replay past
+// the first - or even two events inside the very same bulk call, if their
+// original fixture timestamps happen to coincide - would collide and get
+// dropped as a duplicate (Error 1062), which would demonstrate a MySQL
+// error, not the buffer's flush behaviour this tool exists to show. Falls
+// back to returning payload unmodified if it doesn't parse as JSON, which
+// should never happen for our own fixtures.
 func withUniqueTimestamps(payload []byte, offsetSeconds int64) []byte {
 	var v any
 	if err := json.Unmarshal(payload, &v); err != nil {
 		return payload
 	}
 	bumpTimestamps(v, offsetSeconds)
+	usec := 0
+	bumpUsec(v, &usec)
 
 	out, err := json.Marshal(v)
 	if err != nil {
@@ -314,12 +327,46 @@ func bumpTimestamps(v any, offset int64) {
 	}
 }
 
+// bumpUsec walks a decoded JSON value the same way bumpTimestamps does,
+// but instead of shifting every "timestamp_usec" occurrence by a common
+// offset, it overwrites each one with a fresh value from *counter
+// (0..999999, then wrapping), incrementing counter every time. Every
+// queue's envelope carries exactly one "timestamp_usec" per event -
+// nested per entry inside a bulk payload's "messages" array, or once at
+// the top level for CLAUDE.md's non-bulk exception queues - so resetting
+// counter to 0 at the start of each call (see withUniqueTimestamps) and
+// incrementing it per event guarantees every event within that one call's
+// payload gets a distinct sub-second value, closing the collision window
+// bumpTimestamps' shared per-call offset alone can't: two events that
+// happen to already share the same whole-second timestamp in the static
+// fixture (before or after the offset) would otherwise still collide on
+// timestamp_usec too, since bumpTimestamps never touched it.
+func bumpUsec(v any, counter *int) {
+	switch t := v.(type) {
+	case map[string]any:
+		for key, val := range t {
+			if key == "timestamp_usec" {
+				t[key] = float64(*counter % 1_000_000)
+				*counter++
+				continue
+			}
+			bumpUsec(val, counter)
+		}
+	case []any:
+		for _, item := range t {
+			bumpUsec(item, counter)
+		}
+	}
+}
+
 // runLoad fans a rate-limited stream of fixture replays across workers
 // concurrent goroutines, picking a random queue per send the same way a
 // busy production pipeline receives many different queues interleaved.
 // It returns the total number of messages successfully handled once
-// runCtx is done and every in-flight handler call has returned.
-func runLoad(runCtx context.Context, router queue.Router, queueNames []string, payloads map[string][]byte, ratePerSec, workers int) uint64 {
+// runCtx is done and every in-flight handler call has returned. runSeed
+// (see main) is folded into every call's timestamp offset so consecutive
+// process runs don't reproduce each other's rows.
+func runLoad(runCtx context.Context, router queue.Router, queueNames []string, payloads map[string][]byte, ratePerSec, workers int, runSeed int64) uint64 {
 	tokens := rateLimiter(runCtx, ratePerSec)
 
 	var sent atomic.Uint64
@@ -341,14 +388,17 @@ func runLoad(runCtx context.Context, router queue.Router, queueNames []string, p
 			for range tokens {
 				name := queueNames[rng.Intn(len(queueNames))]
 				// Every call gets a fresh timestamp offset, widely spaced
-				// (see timestampSpacing) - the static fixtures would
+				// (see timestampSpacing) and anchored to this process's own
+				// start time (runSeed) - the static fixtures would
 				// otherwise replay the exact same hostname+start_time (or
-				// service_description+state_time, etc.) on every send,
-				// which collides with the primary key on
-				// statusengine_hostchecks, statusengine_servicechecks,
-				// the *_acknowledgements and *_statehistory tables after
-				// the very first insert. See withUniqueTimestamps.
-				payload := withUniqueTimestamps(payloads[name], seq.Add(1)*timestampSpacing)
+				// service_description+state_time, etc.) on every send, or
+				// on every re-run of this tool against the same
+				// (deliberately non-truncated) dev database, which
+				// collides with the primary key on statusengine_hostchecks,
+				// statusengine_servicechecks, the *_acknowledgements and
+				// *_statehistory tables after the very first insert. See
+				// withUniqueTimestamps.
+				payload := withUniqueTimestamps(payloads[name], runSeed+seq.Add(1)*timestampSpacing)
 				if err := router[name](runCtx, payload); err != nil {
 					slog.Warn("simulator: handler failed", "queue", name, "error", err)
 					continue
