@@ -140,14 +140,29 @@ func decodeLogEntry(payload []byte) ([]types.LogEntryPayload, error) {
 	return items, nil
 }
 
-func decodeNotification(payload []byte) ([]types.NotificationPayload, error) {
+// notificationLogEvent augments types.NotificationPayload with the envelope
+// fields the handler needs: Type gates the early-exit filter (only
+// NEBTYPE_NOTIFICATION_END, 601, is persisted), and TimestampUsec becomes
+// statusengine_host_notifications_log's and
+// statusengine_service_notifications_log's start_time_usec column. Unlike
+// notificationMethodEvent/stateChangeEvent, the start_time column itself
+// comes straight from the payload's own StartTime field, not the envelope's
+// Timestamp - the notification_data object already carries its own
+// start_time.
+type notificationLogEvent struct {
+	Type          int `json:"type"`
+	TimestampUsec int `json:"timestamp_usec"`
+	types.NotificationPayload
+}
+
+func decodeNotificationLog(payload []byte) ([]notificationLogEvent, error) {
 	var bulk types.NotificationBulk
 	if err := json.Unmarshal(payload, &bulk); err != nil {
 		return nil, err
 	}
-	items := make([]types.NotificationPayload, len(bulk.Messages))
+	items := make([]notificationLogEvent, len(bulk.Messages))
 	for i, m := range bulk.Messages {
-		items[i] = m.NotificationData
+		items[i] = notificationLogEvent{Type: m.Type, TimestampUsec: m.TimestampUsec, NotificationPayload: m.NotificationData}
 	}
 	return items, nil
 }

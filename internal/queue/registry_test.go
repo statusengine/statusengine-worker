@@ -53,10 +53,10 @@ func TestNewRouterCoversAllQueues(t *testing.T) {
 	if len(router) != len(want) {
 		t.Errorf("router has %d queues, want %d", len(router), len(want))
 	}
-	if len(runners) != 13 {
-		t.Errorf("expected 13 runners (host/service status, hostchecks, servicechecks, logentries, "+
+	if len(runners) != 15 {
+		t.Errorf("expected 15 runners (host/service status, hostchecks, servicechecks, logentries, "+
 			"host/service statehistory, host/service acknowledgements, host/service notifications, "+
-			"perfdata, graphite client), got %d", len(runners))
+			"host/service notifications_log, perfdata, graphite client), got %d", len(runners))
 	}
 }
 

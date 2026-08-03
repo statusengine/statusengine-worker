@@ -242,6 +242,58 @@ func newContactNotificationMethodHandler(hub *websocket.Hub, topic string, hostI
 	}
 }
 
+// notificationTypeEnd is the Nagios/Icinga/Naemon NEBTYPE_NOTIFICATION_END
+// event type: the only notification event persisted to
+// statusengine_host_notifications_log/statusengine_service_notifications_log,
+// and only once it actually reached at least one contact.
+const notificationTypeEnd = 601
+
+func hostNotificationLogRow(ev notificationLogEvent) []any {
+	// long_output is identical to output in this context, so it is skipped to save database space.
+	return []any{
+		ev.HostName, ev.StartTime, ev.TimestampUsec, ev.EndTime, ev.State, ev.ReasonType,
+		ev.Escalated, ev.ContactsNotified, ev.Output, ev.AckAuthor, ev.AckData,
+	}
+}
+
+func serviceNotificationLogRow(ev notificationLogEvent) []any {
+	// long_output is identical to output in this context, so it is skipped to save database space.
+	return []any{
+		ev.HostName, ev.ServiceDescription, ev.StartTime, ev.TimestampUsec, ev.EndTime, ev.State,
+		ev.ReasonType, ev.Escalated, ev.ContactsNotified, ev.Output, ev.AckAuthor, ev.AckData,
+	}
+}
+
+// newNotificationHandler discards every event that isn't
+// notificationTypeEnd or that reached no contacts at all
+// (contacts_notified <= 0), then routes the rest to hostIns or serviceIns
+// depending on whether service_description is set.
+func newNotificationHandler(hub *websocket.Hub, topic string, hostIns, serviceIns enqueuer[notificationLogEvent]) Handler {
+	return func(ctx context.Context, payload []byte) error {
+		events, err := decodeNotificationLog(payload)
+		if err != nil {
+			return fmt.Errorf("queue: decode %s: %w", topic, err)
+		}
+
+		for _, ev := range events {
+			if ev.Type != notificationTypeEnd || ev.ContactsNotified <= 0 {
+				continue
+			}
+
+			publish(hub, topic, ev)
+
+			ins := hostIns
+			if ev.ServiceDescription != "" {
+				ins = serviceIns
+			}
+			if err := ins.Enqueue(ctx, ev); err != nil {
+				return fmt.Errorf("queue: enqueue %s event: %w", topic, err)
+			}
+		}
+		return nil
+	}
+}
+
 // newStateChangeHandler and newAcknowledgementHandler route each decoded
 // item to one of two BulkInserters depending on whether it describes a
 // host or a service, mirroring the schema's separate host/service tables.
@@ -389,6 +441,16 @@ func NewRouter(sqlDB *sql.DB, hub *websocket.Hub, gc *graphite.Client, perfdataR
 			"command_name", "command_args", "state", "end_time", "reason_type", "output", "ack_author", "ack_data"},
 		serviceNotificationRow)
 
+	hostNotificationsLog := db.NewBulkInserter(sqlDB, "statusengine_host_notifications_log",
+		[]string{"hostname", "start_time", "start_time_usec", "end_time", "state", "reason_type",
+			"is_escalated", "contacts_notified_count", "output", "ack_author", "ack_data"},
+		hostNotificationLogRow)
+
+	serviceNotificationsLog := db.NewBulkInserter(sqlDB, "statusengine_service_notifications_log",
+		[]string{"hostname", "service_description", "start_time", "start_time_usec", "end_time", "state",
+			"reason_type", "is_escalated", "contacts_notified_count", "output", "ack_author", "ack_data"},
+		serviceNotificationLogRow)
+
 	router := Router{
 		QueueHostChecks:                NewHandler(hub, QueueHostChecks, hostChecks, decodeHostCheck),
 		QueueServiceChecks:             NewHandler(hub, QueueServiceChecks, serviceChecks, decodeServiceCheck),
@@ -399,10 +461,10 @@ func NewRouter(sqlDB *sql.DB, hub *websocket.Hub, gc *graphite.Client, perfdataR
 		QueueHostStatus:                NewHandler(hub, QueueHostStatus, hostStatus, decodeHostStatus),
 		QueueServiceStatus:             NewHandler(hub, QueueServiceStatus, serviceStatus, decodeServiceStatus),
 		QueueContactNotificationMethod: newContactNotificationMethodHandler(hub, QueueContactNotificationMethod, hostNotifications, serviceNotifications),
+		QueueNotifications:             newNotificationHandler(hub, QueueNotifications, hostNotificationsLog, serviceNotificationsLog),
 
-		QueueNotifications: NewBroadcastHandler(hub, QueueNotifications, decodeNotification),
-		QueueDowntimes:     NewBroadcastHandler(hub, QueueDowntimes, decodeDowntime),
-		QueueCoreRestart:   NewBroadcastHandler(hub, QueueCoreRestart, decodeCoreRestart),
+		QueueDowntimes:   NewBroadcastHandler(hub, QueueDowntimes, decodeDowntime),
+		QueueCoreRestart: NewBroadcastHandler(hub, QueueCoreRestart, decodeCoreRestart),
 	}
 
 	runners := []Runner{
@@ -411,6 +473,7 @@ func NewRouter(sqlDB *sql.DB, hub *websocket.Hub, gc *graphite.Client, perfdataR
 		hostStateHistory, serviceStateHistory,
 		hostAcks, serviceAcks,
 		hostNotifications, serviceNotifications,
+		hostNotificationsLog, serviceNotificationsLog,
 		perfdata, gc,
 	}
 

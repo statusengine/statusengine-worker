@@ -87,11 +87,11 @@ func TestDecodeBulkQueues(t *testing.T) {
 	})
 
 	t.Run("Notification", func(t *testing.T) {
-		items, err := decodeNotification(readFixture(t, "statusngin_notifications.json"))
+		items, err := decodeNotificationLog(readFixture(t, "statusngin_notifications.json"))
 		if err != nil {
 			t.Fatalf("decode: %v", err)
 		}
-		if len(items) != 1 || items[0].ContactsNotified != 1 {
+		if len(items) != 2 || items[0].ContactsNotified != 1 || items[0].Type != 601 {
 			t.Fatalf("unexpected items: %+v", items)
 		}
 	})
