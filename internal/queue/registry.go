@@ -4,6 +4,7 @@ import (
 	"context"
 	"database/sql"
 	"fmt"
+	"log/slog"
 
 	"statusengine-worker/internal/db"
 	"statusengine-worker/internal/graphite"
@@ -294,6 +295,86 @@ func newNotificationHandler(hub *websocket.Hub, topic string, hostIns, serviceIn
 	}
 }
 
+// coreRestartObjectType is the Nagios/Icinga/Naemon broker object type for a
+// monitoring core restart (see .claude/specs/statusngin_core_restart.json,
+// whose only field is {"object_type": 102}). Every other object_type value
+// on this queue is ignored.
+const coreRestartObjectType = 102
+
+// hoststatusTruncateQuery/servicestatusTruncateQuery discard every current
+// status row unconditionally: on a core restart, every host/service will
+// report its status again shortly, so stale rows would otherwise linger
+// forever for objects removed from the config in the meantime.
+const (
+	hoststatusTruncateQuery    = "TRUNCATE TABLE statusengine_hoststatus;"
+	servicestatusTruncateQuery = "TRUNCATE TABLE statusengine_servicestatus;"
+)
+
+// hoststatusOpenITCockpitDeleteQuery/servicestatusOpenITCockpitDeleteQuery
+// are used instead of a plain TRUNCATE when ENABLE_OPENITCOCKPIT_TWEAKS is
+// set: openITCockpit keeps its own hosts/services tables as the source of
+// truth for which objects still exist, so only rows for objects that are
+// gone or disabled there are removed - status for objects that still exist
+// survives the restart instead of needing to be rebuilt from scratch.
+const (
+	hoststatusOpenITCockpitDeleteQuery = "DELETE FROM statusengine_hoststatus WHERE NOT EXISTS " +
+		"(SELECT hosts.uuid FROM hosts WHERE statusengine_hoststatus.hostname = hosts.uuid AND hosts.disabled=0)"
+	servicestatusOpenITCockpitDeleteQuery = "DELETE FROM statusengine_servicestatus WHERE NOT EXISTS " +
+		"(SELECT services.uuid FROM services WHERE statusengine_servicestatus.service_description = services.uuid AND services.disabled=0)"
+)
+
+// tableCleaner is implemented by *db.BulkInserter[T] for any T: the subset
+// newCoreRestartHandler needs to safely run the hoststatus/servicestatus
+// cleanup query against the same table a BulkInserter writes to, without
+// racing an in-flight bulk INSERT/UPSERT and risking a lock-wait/deadlock
+// against MySQL (CLAUDE.md: pause the BulkInserter during this cleanup).
+type tableCleaner interface {
+	WithPaused(ctx context.Context, fn func(ctx context.Context) error) error
+}
+
+// newCoreRestartHandler reacts only to object_type 102 (a monitoring core
+// restart): it logs, publishes the event, then clears out stale
+// hoststatus/servicestatus rows - via TRUNCATE, or via the openITCockpit-aware
+// DELETE queries above when enableOpenITCockpitTweaks is set - pausing each
+// BulkInserter for the duration of its own table's cleanup query.
+func newCoreRestartHandler(hub *websocket.Hub, topic string, sqlDB *sql.DB, hostStatus, serviceStatus tableCleaner, enableOpenITCockpitTweaks bool) Handler {
+	hostQuery, serviceQuery := hoststatusTruncateQuery, servicestatusTruncateQuery
+	if enableOpenITCockpitTweaks {
+		hostQuery, serviceQuery = hoststatusOpenITCockpitDeleteQuery, servicestatusOpenITCockpitDeleteQuery
+	}
+
+	return func(ctx context.Context, payload []byte) error {
+		events, err := decodeCoreRestart(payload)
+		if err != nil {
+			return fmt.Errorf("queue: decode %s: %w", topic, err)
+		}
+
+		for _, ev := range events {
+			if ev.ObjectType != coreRestartObjectType {
+				continue
+			}
+
+			slog.Info("Catch monitoring restart. Trigger callbacks...")
+			publish(hub, topic, ev)
+
+			if err := hostStatus.WithPaused(ctx, func(ctx context.Context) error {
+				_, err := sqlDB.ExecContext(ctx, hostQuery)
+				return err
+			}); err != nil {
+				return fmt.Errorf("queue: %s hoststatus cleanup: %w", topic, err)
+			}
+
+			if err := serviceStatus.WithPaused(ctx, func(ctx context.Context) error {
+				_, err := sqlDB.ExecContext(ctx, serviceQuery)
+				return err
+			}); err != nil {
+				return fmt.Errorf("queue: %s servicestatus cleanup: %w", topic, err)
+			}
+		}
+		return nil
+	}
+}
+
 // newStateChangeHandler and newAcknowledgementHandler route each decoded
 // item to one of two BulkInserters depending on whether it describes a
 // host or a service, mirroring the schema's separate host/service tables.
@@ -367,10 +448,12 @@ func newAcknowledgementHandler(hub *websocket.Hub, topic string, hostIns, servic
 // is filtered before persistence - only NEBTYPE_CONTACTNOTIFICATIONMETHOD_END
 // (605) events are kept, then split into statusengine_host_notifications /
 // statusengine_service_notifications - see newContactNotificationMethodHandler.
-// core_restart has no matching table at all and is broadcast to WebSocket
-// subscribers only. service_perfdata gets its own handler (see processor.go),
-// routing each parsed metric to MySQL, Graphite, or both per perfdataRoute
-// (CLAUDE.md rule 5).
+// core_restart has no matching table of its own; on object_type 102 it
+// instead clears out statusengine_hoststatus/statusengine_servicestatus -
+// see newCoreRestartHandler and the enableOpenITCockpitTweaks parameter.
+// service_perfdata gets its own handler (see processor.go), routing each
+// parsed metric to MySQL, Graphite, or both per perfdataRoute (CLAUDE.md
+// rule 5).
 //
 // gc's Run loop is started and Flushed by the caller alongside the
 // returned []Runner (see the runners slice below) even when perfdataRoute
@@ -383,7 +466,10 @@ func newAcknowledgementHandler(hub *websocket.Hub, topic string, hostIns, servic
 //
 // nodeName is written into every hoststatus/servicestatus row's node_name
 // column (worker-wide "nodename" config option, default "statusengine").
-func NewRouter(sqlDB *sql.DB, hub *websocket.Hub, gc *graphite.Client, perfdataRoute PerfdataRoute, nodeName string) (Router, []Runner) {
+// enableOpenITCockpitTweaks selects which query newCoreRestartHandler uses
+// to clear hoststatus/servicestatus on a core restart (worker-wide
+// "ENABLE_OPENITCOCKPIT_TWEAKS" config option, default false).
+func NewRouter(sqlDB *sql.DB, hub *websocket.Hub, gc *graphite.Client, perfdataRoute PerfdataRoute, nodeName string, enableOpenITCockpitTweaks bool) (Router, []Runner) {
 	hostStatus := db.NewUpsertBulkInserter(sqlDB, "statusengine_hoststatus",
 		hostStatusColumns, hostStatusUpdateColumns, newHostStatusRow(nodeName))
 
@@ -464,7 +550,7 @@ func NewRouter(sqlDB *sql.DB, hub *websocket.Hub, gc *graphite.Client, perfdataR
 		QueueNotifications:             newNotificationHandler(hub, QueueNotifications, hostNotificationsLog, serviceNotificationsLog),
 
 		QueueDowntimes:   NewBroadcastHandler(hub, QueueDowntimes, decodeDowntime),
-		QueueCoreRestart: NewBroadcastHandler(hub, QueueCoreRestart, decodeCoreRestart),
+		QueueCoreRestart: newCoreRestartHandler(hub, QueueCoreRestart, sqlDB, hostStatus, serviceStatus, enableOpenITCockpitTweaks),
 	}
 
 	runners := []Runner{

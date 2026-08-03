@@ -28,6 +28,15 @@ type flushRequest struct {
 	reply chan error
 }
 
+// pauseRequest asks Run's goroutine to stop flushing until resume is closed:
+// paused is closed once Run has actually stopped (so the caller knows it's
+// safe to run a statement against the table outside the BulkInserter), then
+// Run blocks until resume is closed.
+type pauseRequest struct {
+	paused chan struct{}
+	resume chan struct{}
+}
+
 // BulkInserter batches items received via Enqueue and flushes them to a
 // single MySQL table as one multi-row INSERT statement as soon as EITHER
 // the buffer reaches MaxBatchSize OR FlushInterval elapses - whichever
@@ -49,6 +58,7 @@ type BulkInserter[T any] struct {
 
 	in       chan T
 	flushReq chan flushRequest
+	pauseReq chan pauseRequest
 
 	buffer []T
 
@@ -74,6 +84,7 @@ func NewBulkInserter[T any](db *sql.DB, table string, columns []string, toRow Ro
 		toRow:    toRow,
 		in:       make(chan T, MaxBatchSize),
 		flushReq: make(chan flushRequest),
+		pauseReq: make(chan pauseRequest),
 		buffer:   make([]T, 0, MaxBatchSize),
 	}
 }
@@ -122,6 +133,40 @@ func (b *BulkInserter[T]) Flush(ctx context.Context) error {
 	}
 }
 
+// WithPaused flushes whatever is currently buffered, then blocks Run's
+// goroutine from touching the table (no more Enqueue-triggered or
+// ticker-triggered flushes) until fn returns. Use this to run a statement
+// against the same table from outside the BulkInserter - e.g. the
+// core-restart hoststatus/servicestatus TRUNCATE/DELETE cleanup - without
+// racing an in-flight bulk INSERT and risking a lock-wait/deadlock against
+// MySQL. Items can still be Enqueued while paused (they just buffer in the
+// input channel up to MaxBatchSize), so ingestion is never blocked, only
+// briefly delayed.
+func (b *BulkInserter[T]) WithPaused(ctx context.Context, fn func(ctx context.Context) error) error {
+	if err := b.Flush(ctx); err != nil {
+		return err
+	}
+
+	req := pauseRequest{paused: make(chan struct{}), resume: make(chan struct{})}
+	select {
+	case b.pauseReq <- req:
+	case <-ctx.Done():
+		return ctx.Err()
+	}
+	// Run has now received req and is guaranteed to reach its close(req.paused)
+	// (see the pauseReq case in Run) independent of anything below, so it's
+	// always safe - and necessary - to unblock it via resume before returning.
+	defer close(req.resume)
+
+	select {
+	case <-req.paused:
+	case <-ctx.Done():
+		return ctx.Err()
+	}
+
+	return fn(ctx)
+}
+
 // Run owns the buffer and drives it until ctx is cancelled or the input
 // channel is closed, at which point it performs one last best-effort flush
 // (using a fresh, short-lived context, since ctx is already done at that
@@ -167,6 +212,22 @@ func (b *BulkInserter[T]) Run(ctx context.Context) {
 			err := b.flushBuffer(req.ctx)
 			ticker.Reset(FlushInterval)
 			req.reply <- err
+
+		case req := <-b.pauseReq:
+			// The caller already called Flush before sending req (see
+			// WithPaused), so the buffer is empty here; just stop touching
+			// the table until resume is closed. ctx.Done() is watched too,
+			// so a shutdown mid-pause still exits cleanly instead of hanging
+			// forever waiting for a resume that will never come.
+			close(req.paused)
+			select {
+			case <-req.resume:
+				ticker.Reset(FlushInterval)
+			case <-ctx.Done():
+				b.drainPending()
+				b.finalFlush()
+				return
+			}
 		}
 	}
 }

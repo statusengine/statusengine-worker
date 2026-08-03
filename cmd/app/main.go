@@ -10,6 +10,7 @@ import (
 	"net/http"
 	"os"
 	"os/signal"
+	"strconv"
 	"strings"
 	"sync"
 	"syscall"
@@ -26,16 +27,17 @@ import (
 // variable (flag wins if both are given). Defaults match the local dev
 // setup documented in .claude/specs/ressources.txt.
 type config struct {
-	consumerBackend string // "gearman" or "rabbitmq"
-	gearmanAddr     string
-	rabbitMQURL     string
-	mysqlDSN        string
-	listenAddr      string
-	graphiteAddr    string
-	perfdataRoute   string // "mysql", "graphite" or "both"
-	nodeName        string // written into hoststatus/servicestatus rows' node_name column
-	logLevel        string // "debug", "info", "warn" or "error"
-	logFormat       string // "text" or "json"
+	consumerBackend           string // "gearman" or "rabbitmq"
+	gearmanAddr               string
+	rabbitMQURL               string
+	mysqlDSN                  string
+	listenAddr                string
+	graphiteAddr              string
+	perfdataRoute             string // "mysql", "graphite" or "both"
+	nodeName                  string // written into hoststatus/servicestatus rows' node_name column
+	enableOpenITCockpitTweaks bool   // selects the core-restart hoststatus/servicestatus cleanup query
+	logLevel                  string // "debug", "info", "warn" or "error"
+	logFormat                 string // "text" or "json"
 }
 
 func loadConfig() config {
@@ -57,6 +59,10 @@ func loadConfig() config {
 		`where statusngin_service_perfdata metrics are written: "mysql", "graphite" or "both" (CLAUDE.md rule 5)`)
 	flag.StringVar(&cfg.nodeName, "nodename", envOrDefault("STATUSENGINE_NODENAME", "statusengine"),
 		"node_name value written into statusengine_hoststatus/statusengine_servicestatus rows")
+	flag.BoolVar(&cfg.enableOpenITCockpitTweaks, "enable-openitcockpit-tweaks",
+		envBoolOrDefault("ENABLE_OPENITCOCKPIT_TWEAKS", false),
+		"on a core restart, delete only hoststatus/servicestatus rows for objects openITCockpit no longer "+
+			"knows about instead of truncating both tables outright")
 	flag.StringVar(&cfg.logLevel, "log-level", envOrDefault("STATUSENGINE_LOG_LEVEL", "info"),
 		`minimum log level: "debug", "info", "warn" or "error"`)
 	flag.StringVar(&cfg.logFormat, "log-format", envOrDefault("STATUSENGINE_LOG_FORMAT", "text"),
@@ -99,6 +105,21 @@ func envOrDefault(key, def string) string {
 		return v
 	}
 	return def
+}
+
+// envBoolOrDefault parses key as a bool (accepting the same formats as
+// strconv.ParseBool: "1"/"0", "t"/"f", "true"/"false", ...), falling back to
+// def if the variable is unset or not a valid bool.
+func envBoolOrDefault(key string, def bool) bool {
+	v, ok := os.LookupEnv(key)
+	if !ok {
+		return def
+	}
+	parsed, err := strconv.ParseBool(v)
+	if err != nil {
+		return def
+	}
+	return parsed
 }
 
 func main() {
@@ -158,7 +179,7 @@ func main() {
 	// connection is ever dialed (CLAUDE.md rule 5).
 	gc := graphite.NewClient(cfg.graphiteAddr)
 
-	router, runners := queue.NewRouter(sqlDB, hub, gc, perfdataRoute, cfg.nodeName)
+	router, runners := queue.NewRouter(sqlDB, hub, gc, perfdataRoute, cfg.nodeName, cfg.enableOpenITCockpitTweaks)
 	for _, r := range runners {
 		wg.Add(1)
 		go func(r queue.Runner) {

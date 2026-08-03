@@ -165,6 +165,64 @@ func TestFlushMethodClearsBuffer(t *testing.T) {
 	}
 }
 
+// TestWithPaused proves the pause/resume contract end-to-end against a real
+// Run goroutine: whatever was already buffered gets flushed before fn runs,
+// items Enqueued while fn is running only buffer (no flush fires until
+// resume), and Run keeps working normally once WithPaused returns.
+func TestWithPaused(t *testing.T) {
+	mockDB, mock, err := sqlmock.New()
+	if err != nil {
+		t.Fatalf("sqlmock.New: %v", err)
+	}
+	defer mockDB.Close()
+
+	mock.ExpectExec(`^INSERT INTO events \(id, name\) VALUES \(\?,\?\)$`).
+		WithArgs(1, "first").
+		WillReturnResult(sqlmock.NewResult(0, 1))
+	mock.ExpectExec(`^TRUNCATE TABLE events$`).WillReturnResult(sqlmock.NewResult(0, 0))
+	mock.ExpectExec(`^INSERT INTO events \(id, name\) VALUES \(\?,\?\)$`).
+		WithArgs(2, "second").
+		WillReturnResult(sqlmock.NewResult(0, 1))
+
+	inserter := NewBulkInserter[row](mockDB, "events", []string{"id", "name"}, toRow)
+
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	go inserter.Run(ctx)
+
+	if err := inserter.Enqueue(ctx, row{id: 1, name: "first"}); err != nil {
+		t.Fatalf("Enqueue: %v", err)
+	}
+
+	var fnRan, enqueuedDuringPause bool
+	err = inserter.WithPaused(ctx, func(ctx context.Context) error {
+		fnRan = true
+		if _, err := mockDB.ExecContext(ctx, "TRUNCATE TABLE events"); err != nil {
+			return err
+		}
+		// Must not trigger a flush while Run is paused - only buffer.
+		if err := inserter.Enqueue(ctx, row{id: 2, name: "second"}); err != nil {
+			return err
+		}
+		enqueuedDuringPause = true
+		return nil
+	})
+	if err != nil {
+		t.Fatalf("WithPaused: %v", err)
+	}
+	if !fnRan || !enqueuedDuringPause {
+		t.Fatalf("fn did not run fully: fnRan=%v enqueuedDuringPause=%v", fnRan, enqueuedDuringPause)
+	}
+
+	// Proves Run wasn't left stuck: the item buffered during the pause still
+	// flushes normally once resumed.
+	if err := inserter.Flush(ctx); err != nil {
+		t.Fatalf("Flush: %v", err)
+	}
+
+	waitForExpectations(t, mock, time.Second)
+}
+
 func TestFlushOnEmptyBufferIsNoop(t *testing.T) {
 	mockDB, mock, err := sqlmock.New()
 	if err != nil {
