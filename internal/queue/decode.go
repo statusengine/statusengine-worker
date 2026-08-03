@@ -153,12 +153,33 @@ func decodeNotification(payload []byte) ([]types.NotificationPayload, error) {
 // single JSON object, not a {"messages": [...]} envelope, so their decode
 // functions always return a slice of at most one item.
 
-func decodeContactNotificationMethod(payload []byte) ([]types.ContactNotificationMethodPayload, error) {
+// notificationMethodEvent augments types.ContactNotificationMethodPayload
+// with the envelope fields the handler needs: Type gates the early-exit
+// filter (only NEBTYPE_CONTACTNOTIFICATIONMETHOD_END, 605, is persisted),
+// and Timestamp/TimestampUsec become statusengine_host_notifications' and
+// statusengine_service_notifications' start_time/start_time_usec columns -
+// the payload's own start_time field describes the parent notification's
+// timeframe, not this specific delivery, mirroring how host/service
+// acknowledgements key on the envelope's entry_time rather than a payload
+// field.
+type notificationMethodEvent struct {
+	Type          int   `json:"type"`
+	Timestamp     int64 `json:"timestamp"`
+	TimestampUsec int   `json:"timestamp_usec"`
+	types.ContactNotificationMethodPayload
+}
+
+func decodeContactNotificationMethod(payload []byte) ([]notificationMethodEvent, error) {
 	var msg types.ContactNotificationMethodMessage
 	if err := json.Unmarshal(payload, &msg); err != nil {
 		return nil, err
 	}
-	return []types.ContactNotificationMethodPayload{msg.ContactNotificationMethod}, nil
+	return []notificationMethodEvent{{
+		Type:                             msg.Type,
+		Timestamp:                        msg.Timestamp,
+		TimestampUsec:                    msg.TimestampUsec,
+		ContactNotificationMethodPayload: msg.ContactNotificationMethod,
+	}}, nil
 }
 
 func decodeAcknowledgement(payload []byte) ([]acknowledgementEvent, error) {

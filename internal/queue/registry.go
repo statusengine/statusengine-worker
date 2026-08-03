@@ -175,6 +175,59 @@ func serviceAcknowledgementRow(ev acknowledgementEvent) []any {
 	}
 }
 
+// notificationTypeContactNotificationMethodEnd is the Nagios/Icinga/Naemon
+// NEBTYPE_CONTACTNOTIFICATIONMETHOD_END event type: the only
+// contactnotificationmethod event that represents a completed notification
+// method delivery, and therefore the only one persisted to
+// statusengine_host_notifications/statusengine_service_notifications. Every
+// other type value on this queue is discarded immediately.
+const notificationTypeContactNotificationMethodEnd = 605
+
+func hostNotificationRow(ev notificationMethodEvent) []any {
+	return []any{
+		ev.HostName, ev.Timestamp, ev.TimestampUsec, ev.ContactName, ev.CommandName, ev.CommandArgs,
+		ev.State, ev.EndTime, ev.ReasonType, ev.Output, ev.AckAuthor, ev.AckData,
+	}
+}
+
+func serviceNotificationRow(ev notificationMethodEvent) []any {
+	return []any{
+		ev.ServiceDescription, ev.Timestamp, ev.TimestampUsec, ev.HostName, ev.ContactName, ev.CommandName,
+		ev.CommandArgs, ev.State, ev.EndTime, ev.ReasonType, ev.Output, ev.AckAuthor, ev.AckData,
+	}
+}
+
+// newContactNotificationMethodHandler filters out every event whose type
+// isn't notificationTypeContactNotificationMethodEnd, then routes the rest
+// to hostIns or serviceIns depending on whether service_description is set
+// - mirroring newStateChangeHandler/newAcknowledgementHandler's host-vs-
+// service split.
+func newContactNotificationMethodHandler(hub *websocket.Hub, topic string, hostIns, serviceIns enqueuer[notificationMethodEvent]) Handler {
+	return func(ctx context.Context, payload []byte) error {
+		events, err := decodeContactNotificationMethod(payload)
+		if err != nil {
+			return fmt.Errorf("queue: decode %s: %w", topic, err)
+		}
+
+		for _, ev := range events {
+			if ev.Type != notificationTypeContactNotificationMethodEnd {
+				continue
+			}
+
+			publish(hub, topic, ev)
+
+			ins := hostIns
+			if ev.ServiceDescription != "" {
+				ins = serviceIns
+			}
+			if err := ins.Enqueue(ctx, ev); err != nil {
+				return fmt.Errorf("queue: enqueue %s event: %w", topic, err)
+			}
+		}
+		return nil
+	}
+}
+
 // newStateChangeHandler and newAcknowledgementHandler route each decoded
 // item to one of two BulkInserters depending on whether it describes a
 // host or a service, mirroring the schema's separate host/service tables.
@@ -235,11 +288,14 @@ func newAcknowledgementHandler(hub *websocket.Hub, topic string, hostIns, servic
 // host/service collide on the tables' primary keys; is_passive_check is
 // derived from check_type (0 = active) and node_name comes from the
 // worker-wide nodeName config value, since neither is present in the sample
-// payloads' hoststatus/servicestatus objects themselves. Queues with no
-// matching table at all - contactnotificationmethod and core_restart - are
-// broadcast to WebSocket subscribers only. service_perfdata gets its own
-// handler (see processor.go), routing each parsed metric to MySQL, Graphite,
-// or both per perfdataRoute (CLAUDE.md rule 5).
+// payloads' hoststatus/servicestatus objects themselves. contactnotificationmethod
+// is filtered before persistence - only NEBTYPE_CONTACTNOTIFICATIONMETHOD_END
+// (605) events are kept, then split into statusengine_host_notifications /
+// statusengine_service_notifications - see newContactNotificationMethodHandler.
+// core_restart has no matching table at all and is broadcast to WebSocket
+// subscribers only. service_perfdata gets its own handler (see processor.go),
+// routing each parsed metric to MySQL, Graphite, or both per perfdataRoute
+// (CLAUDE.md rule 5).
 //
 // gc's Run loop is started and Flushed by the caller alongside the
 // returned []Runner (see the runners slice below) even when perfdataRoute
@@ -299,20 +355,30 @@ func NewRouter(sqlDB *sql.DB, hub *websocket.Hub, gc *graphite.Client, perfdataR
 		[]string{"hostname", "service_description", "label", "timestamp", "timestamp_unix", "value", "unit"},
 		perfdataRow)
 
-	router := Router{
-		QueueHostChecks:       NewHandler(hub, QueueHostChecks, hostChecks, decodeHostCheck),
-		QueueServiceChecks:    NewHandler(hub, QueueServiceChecks, serviceChecks, decodeServiceCheck),
-		QueueLogEntries:       NewHandler(hub, QueueLogEntries, logEntries, decodeLogEntry),
-		QueueStateChanges:     newStateChangeHandler(hub, QueueStateChanges, hostStateHistory, serviceStateHistory),
-		QueueAcknowledgements: newAcknowledgementHandler(hub, QueueAcknowledgements, hostAcks, serviceAcks),
-		QueueServicePerfdata:  NewPerfdataHandler(hub, QueueServicePerfdata, perfdataRoute, perfdata, gc),
-		QueueHostStatus:       NewHandler(hub, QueueHostStatus, hostStatus, decodeHostStatus),
-		QueueServiceStatus:    NewHandler(hub, QueueServiceStatus, serviceStatus, decodeServiceStatus),
+	hostNotifications := db.NewBulkInserter(sqlDB, "statusengine_host_notifications",
+		[]string{"hostname", "start_time", "start_time_usec", "contact_name", "command_name", "command_args",
+			"state", "end_time", "reason_type", "output", "ack_author", "ack_data"},
+		hostNotificationRow)
 
-		QueueNotifications:             NewBroadcastHandler(hub, QueueNotifications, decodeNotification),
-		QueueContactNotificationMethod: NewBroadcastHandler(hub, QueueContactNotificationMethod, decodeContactNotificationMethod),
-		QueueDowntimes:                 NewBroadcastHandler(hub, QueueDowntimes, decodeDowntime),
-		QueueCoreRestart:               NewBroadcastHandler(hub, QueueCoreRestart, decodeCoreRestart),
+	serviceNotifications := db.NewBulkInserter(sqlDB, "statusengine_service_notifications",
+		[]string{"service_description", "start_time", "start_time_usec", "hostname", "contact_name",
+			"command_name", "command_args", "state", "end_time", "reason_type", "output", "ack_author", "ack_data"},
+		serviceNotificationRow)
+
+	router := Router{
+		QueueHostChecks:                NewHandler(hub, QueueHostChecks, hostChecks, decodeHostCheck),
+		QueueServiceChecks:             NewHandler(hub, QueueServiceChecks, serviceChecks, decodeServiceCheck),
+		QueueLogEntries:                NewHandler(hub, QueueLogEntries, logEntries, decodeLogEntry),
+		QueueStateChanges:              newStateChangeHandler(hub, QueueStateChanges, hostStateHistory, serviceStateHistory),
+		QueueAcknowledgements:          newAcknowledgementHandler(hub, QueueAcknowledgements, hostAcks, serviceAcks),
+		QueueServicePerfdata:           NewPerfdataHandler(hub, QueueServicePerfdata, perfdataRoute, perfdata, gc),
+		QueueHostStatus:                NewHandler(hub, QueueHostStatus, hostStatus, decodeHostStatus),
+		QueueServiceStatus:             NewHandler(hub, QueueServiceStatus, serviceStatus, decodeServiceStatus),
+		QueueContactNotificationMethod: newContactNotificationMethodHandler(hub, QueueContactNotificationMethod, hostNotifications, serviceNotifications),
+
+		QueueNotifications: NewBroadcastHandler(hub, QueueNotifications, decodeNotification),
+		QueueDowntimes:     NewBroadcastHandler(hub, QueueDowntimes, decodeDowntime),
+		QueueCoreRestart:   NewBroadcastHandler(hub, QueueCoreRestart, decodeCoreRestart),
 	}
 
 	runners := []Runner{
@@ -320,6 +386,7 @@ func NewRouter(sqlDB *sql.DB, hub *websocket.Hub, gc *graphite.Client, perfdataR
 		hostChecks, serviceChecks, logEntries,
 		hostStateHistory, serviceStateHistory,
 		hostAcks, serviceAcks,
+		hostNotifications, serviceNotifications,
 		perfdata, gc,
 	}
 
