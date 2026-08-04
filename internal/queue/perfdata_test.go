@@ -1,0 +1,69 @@
+package queue
+
+import "testing"
+
+func TestParsePerfData(t *testing.T) {
+	tests := []struct {
+		name string
+		raw  string
+		want []perfDataPoint
+	}{
+		{
+			name: "single metric without unit",
+			raw:  "users=0;20;50;0",
+			want: []perfDataPoint{{Label: "users", Value: 0, Unit: ""}},
+		},
+		{
+			name: "single metric with unit",
+			raw:  "swap=0MB;0;0;0;0",
+			want: []perfDataPoint{{Label: "swap", Value: 0, Unit: "MB"}},
+		},
+		{
+			name: "multiple metrics separated by whitespace",
+			raw:  "rta=0.084000ms;100.000000;500.000000;0.000000 pl=0%;20;60;0",
+			want: []perfDataPoint{
+				{Label: "rta", Value: 0.084, Unit: "ms"},
+				{Label: "pl", Value: 0, Unit: "%"},
+			},
+		},
+		{
+			name: "quoted label containing spaces",
+			raw:  "'response time'=0.5s;1;2;0",
+			want: []perfDataPoint{{Label: "response time", Value: 0.5, Unit: "s"}},
+		},
+		{
+			name: "negative and signed values",
+			raw:  "temp=-3.5C;;;",
+			want: []perfDataPoint{{Label: "temp", Value: -3.5, Unit: "C"}},
+		},
+		{
+			name: "undefined value is skipped",
+			raw:  "users=0;20;50;0 broken=U;;;",
+			want: []perfDataPoint{{Label: "users", Value: 0, Unit: ""}},
+		},
+		{
+			name: "empty string yields no points",
+			raw:  "",
+			want: nil,
+		},
+		{
+			name: "token without equals sign is skipped",
+			raw:  "garbage users=1;;;",
+			want: []perfDataPoint{{Label: "users", Value: 1, Unit: ""}},
+		},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			got := parsePerfData(tt.raw)
+			if len(got) != len(tt.want) {
+				t.Fatalf("parsePerfData(%q) = %+v, want %+v", tt.raw, got, tt.want)
+			}
+			for i := range got {
+				if got[i] != tt.want[i] {
+					t.Fatalf("parsePerfData(%q)[%d] = %+v, want %+v", tt.raw, i, got[i], tt.want[i])
+				}
+			}
+		})
+	}
+}

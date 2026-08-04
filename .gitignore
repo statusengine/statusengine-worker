@@ -1,0 +1,3 @@
+simulator
+worker
+cmd/app/__debug_bin*
