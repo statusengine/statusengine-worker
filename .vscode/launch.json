@@ -1,0 +1,32 @@
+{
+    "version": "0.2.0",
+    "configurations": [
+        {
+            "name": "Debug App",
+            "type": "go",
+            "request": "launch",
+            "mode": "auto",
+            "program": "${workspaceFolder}/cmd/app",
+            "cwd": "${workspaceFolder}",
+            "args": [
+                "-log-level", "debug"
+            ],
+            "env": {}
+        },
+        {
+            "name": "Debug Simulator",
+            "type": "go",
+            "request": "launch",
+            "mode": "auto",
+            "program": "${workspaceFolder}/cmd/simulator",
+            "cwd": "${workspaceFolder}",
+            "args": [
+                "-rate", "10",
+                "-workers", "1",
+                "-duration", "0",
+                "-log-level", "debug"
+            ],
+            "env": {}
+        }
+    ]
+}
