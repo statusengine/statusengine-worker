@@ -5,6 +5,10 @@ https://github.com/statusengine/worker
 
 It is implemented in Go for maximum concurrency and performance, with a pipeline designed for high-throughput event ingestion, efficient bulk persistence, and low-latency fan-out.
 
+## Built with Vibe Coding
+
+This repository was created using Claude Code and the principles of Vibe Coding. Instead of writing every line of code by hand, I acted as the conductor—guiding the architecture, reviewing the logic, and keeping the "vibe" aligned while Claude handled the heavy lifting of generation and implementation.
+
 ## What It Does
 
 - Consumes monitoring events from either Gearman or RabbitMQ.
