@@ -4,10 +4,14 @@ import (
 	"encoding/json"
 	"log/slog"
 	"net/http"
+	"strconv"
 	"strings"
+	"sync/atomic"
 	"time"
 
 	"github.com/gorilla/websocket"
+
+	"statusengine-worker/internal/metrics"
 )
 
 const (
@@ -30,6 +34,13 @@ type Client struct {
 	hub  *Hub
 	conn *websocket.Conn
 
+	// id uniquely identifies this client for the lifetime of the process -
+	// used only as the "client_id" label on
+	// metrics.WebsocketMessagesDroppedTotal, so a slow client can be told
+	// apart from the rest without exposing anything about the connection
+	// itself (e.g. remote address).
+	id string
+
 	// send is this client's outbound message buffer. The Hub writes to it
 	// non-blockingly; writePump drains it to the socket.
 	send chan []byte
@@ -38,6 +49,9 @@ type Client struct {
 	// receive. An empty set means "subscribe to everything".
 	topics map[string]struct{}
 }
+
+// nextClientID hands out a unique id per Client, process-wide.
+var nextClientID atomic.Uint64
 
 // subscriptionMessage is the client->server control message used to
 // (re)configure topic subscriptions after the connection is established,
@@ -57,12 +71,14 @@ func ServeWS(hub *Hub, w http.ResponseWriter, r *http.Request) {
 	conn, err := upgrader.Upgrade(w, r, nil)
 	if err != nil {
 		slog.Error("websocket: upgrade failed", "error", err)
+		metrics.PipelineErrorsTotal.WithLabelValues(metrics.ComponentWebSocket).Inc()
 		return
 	}
 
 	client := &Client{
 		hub:    hub,
 		conn:   conn,
+		id:     strconv.FormatUint(nextClientID.Add(1), 10),
 		send:   make(chan []byte, sendBufferSize),
 		topics: parseTopics(r.URL.Query().Get("topics")),
 	}

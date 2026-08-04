@@ -16,6 +16,8 @@ import (
 	"syscall"
 	"time"
 
+	"github.com/prometheus/client_golang/prometheus/promhttp"
+
 	_ "github.com/go-sql-driver/mysql"
 
 	"statusengine-worker/internal/graphite"
@@ -32,6 +34,7 @@ type config struct {
 	rabbitMQURL               string
 	mysqlDSN                  string
 	listenAddr                string
+	metricsListenAddr         string
 	graphiteAddr              string
 	perfdataRoute             string // "mysql", "graphite" or "both"
 	nodeName                  string // written into hoststatus/servicestatus rows' node_name column
@@ -53,6 +56,8 @@ func loadConfig() config {
 		"MySQL data source name")
 	flag.StringVar(&cfg.listenAddr, "listen-addr", envOrDefault("STATUSENGINE_LISTEN_ADDR", ":8080"),
 		"address the WebSocket HTTP server listens on")
+	flag.StringVar(&cfg.metricsListenAddr, "metrics-listen-addr", envOrDefault("STATUSENGINE_METRICS_LISTEN_ADDR", ":9105"),
+		"address the Prometheus /metrics HTTP server listens on")
 	flag.StringVar(&cfg.graphiteAddr, "graphite-addr", envOrDefault("STATUSENGINE_GRAPHITE_ADDR", "127.0.0.1:2003"),
 		"Graphite Carbon plaintext receiver address (host:port)")
 	flag.StringVar(&cfg.perfdataRoute, "perfdata-route", envOrDefault("STATUSENGINE_PERFDATA_ROUTE", "mysql"),
@@ -161,6 +166,18 @@ func main() {
 		}
 	}()
 
+	// Prometheus /metrics endpoint, on its own port so scraping it never
+	// shares a listener (or its request queue) with the WebSocket server.
+	metricsMux := http.NewServeMux()
+	metricsMux.Handle("/metrics", promhttp.Handler())
+	metricsServer := &http.Server{Addr: cfg.metricsListenAddr, Handler: metricsMux}
+	go func() {
+		slog.Info("metrics: listening", "addr", cfg.metricsListenAddr, "path", "/metrics")
+		if err := metricsServer.ListenAndServe(); err != nil && err != http.ErrServerClosed {
+			slog.Error("metrics: http server error", "error", err)
+		}
+	}()
+
 	// 3. MySQL connection and BulkInserters, each in its own goroutine.
 	sqlDB, err := sql.Open("mysql", cfg.mysqlDSN)
 	if err != nil {
@@ -246,6 +263,9 @@ func main() {
 	shutdownCtx, cancelShutdown := context.WithTimeout(context.Background(), 5*time.Second)
 	if err := httpServer.Shutdown(shutdownCtx); err != nil {
 		slog.Error("websocket: error shutting down http server", "error", err)
+	}
+	if err := metricsServer.Shutdown(shutdownCtx); err != nil {
+		slog.Error("metrics: error shutting down http server", "error", err)
 	}
 	cancelShutdown()
 

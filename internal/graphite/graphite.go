@@ -15,6 +15,8 @@ import (
 	"strings"
 	"sync/atomic"
 	"time"
+
+	metricsPkg "statusengine-worker/internal/metrics"
 )
 
 const (
@@ -191,6 +193,7 @@ func (c *Client) flushBuffer(ctx context.Context) error {
 
 	if err := c.ensureConn(ctx); err != nil {
 		slog.Error("graphite: dial failed, metrics dropped", "addr", c.addr, "metrics", metrics, "error", err)
+		metricsPkg.PipelineErrorsTotal.WithLabelValues(metricsPkg.ComponentGraphite).Inc()
 		c.buffer = c.buffer[:0]
 		return err
 	}
@@ -213,6 +216,7 @@ func (c *Client) flushBuffer(ctx context.Context) error {
 	if err != nil {
 		slog.Error("graphite: write failed, metrics dropped",
 			"addr", c.addr, "metrics", metrics, "duration", duration, "error", err)
+		metricsPkg.PipelineErrorsTotal.WithLabelValues(metricsPkg.ComponentGraphite).Inc()
 		c.closeConn()
 	} else {
 		total := c.processed.Add(uint64(metrics))

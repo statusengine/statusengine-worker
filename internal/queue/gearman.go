@@ -9,6 +9,8 @@ import (
 	"time"
 
 	gearman "github.com/mikespook/gearman-go/worker"
+
+	"statusengine-worker/internal/metrics"
 )
 
 // outboundBufferSize is the capacity of the raw-Message channel Start
@@ -74,6 +76,7 @@ func (c *GearmanConsumer) Start(ctx context.Context) (<-chan Message, error) {
 			defer c.handlerWG.Done()
 
 			payload := job.Data()
+			metrics.QueueMessagesReceivedTotal.WithLabelValues(queueName).Inc()
 
 			select {
 			case out <- Message{Queue: queueName, Payload: payload}:
@@ -84,6 +87,7 @@ func (c *GearmanConsumer) Start(ctx context.Context) (<-chan Message, error) {
 
 			if err := handle(ctx, payload); err != nil {
 				c.errors.Add(1)
+				metrics.PipelineErrorsTotal.WithLabelValues(metrics.ComponentQueue).Inc()
 				slog.Warn("gearman: handler failed", "queue", queueName, "error", err)
 				return nil, err
 			}

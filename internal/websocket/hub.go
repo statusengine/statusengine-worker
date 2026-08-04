@@ -9,6 +9,8 @@ import (
 	"log/slog"
 	"sync/atomic"
 	"time"
+
+	"statusengine-worker/internal/metrics"
 )
 
 // broadcastBufferSize is the depth of the Hub's inbound event buffer.
@@ -115,6 +117,7 @@ func (h *Hub) Run(ctx context.Context) {
 
 		case client := <-h.register:
 			h.clients[client] = struct{}{}
+			metrics.WebsocketClientsActive.Inc()
 
 		case client := <-h.unregister:
 			h.removeClient(client)
@@ -151,6 +154,7 @@ func (h *Hub) dispatch(event Event) {
 	msg, err := json.Marshal(outboundMessage{Topic: event.Topic, Payload: event.Payload})
 	if err != nil {
 		slog.Error("websocket: failed to encode event", "topic", event.Topic, "error", err)
+		metrics.PipelineErrorsTotal.WithLabelValues(metrics.ComponentWebSocket).Inc()
 		return
 	}
 
@@ -162,6 +166,7 @@ func (h *Hub) dispatch(event Event) {
 		select {
 		case client.send <- msg:
 			h.dispatched++
+			metrics.WebsocketMessagesBroadcastedTotal.Inc()
 		default:
 			// Client's buffer is full - drop the message for this client
 			// instead of blocking the dispatch loop (and, transitively,
@@ -169,6 +174,7 @@ func (h *Hub) dispatch(event Event) {
 			// Counted, not logged per-drop, for the same reason as Publish
 			// above.
 			h.dropped++
+			metrics.WebsocketMessagesDroppedTotal.WithLabelValues(client.id).Inc()
 		}
 	}
 }
@@ -177,6 +183,7 @@ func (h *Hub) removeClient(client *Client) {
 	if _, ok := h.clients[client]; ok {
 		delete(h.clients, client)
 		close(client.send)
+		metrics.WebsocketClientsActive.Dec()
 	}
 }
 
@@ -196,5 +203,6 @@ func (h *Hub) closeAll() {
 	for client := range h.clients {
 		delete(h.clients, client)
 		close(client.send)
+		metrics.WebsocketClientsActive.Dec()
 	}
 }

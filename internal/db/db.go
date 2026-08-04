@@ -9,6 +9,8 @@ import (
 	"strings"
 	"sync/atomic"
 	"time"
+
+	"statusengine-worker/internal/metrics"
 )
 
 const (
@@ -276,11 +278,16 @@ func (b *BulkInserter[T]) flushBuffer(ctx context.Context) error {
 	_, err := b.db.ExecContext(ctx, query, args...)
 	duration := time.Since(start)
 
+	metrics.DBBatchFlushDurationSeconds.Observe(duration.Seconds())
+	metrics.DBBatchSizeAtFlush.Observe(float64(rows))
+
 	if err != nil {
 		slog.Error("db: bulk insert failed, rows dropped",
 			"table", b.table, "rows", rows, "duration", duration, "error", err)
+		metrics.PipelineErrorsTotal.WithLabelValues(metrics.ComponentMySQL).Inc()
 	} else {
 		total := b.processed.Add(uint64(rows))
+		metrics.DBEventsWrittenTotal.WithLabelValues(b.table).Add(float64(rows))
 		slog.Info("db: bulk insert flushed",
 			"table", b.table, "rows", rows, "duration", duration, "total_processed", total)
 	}

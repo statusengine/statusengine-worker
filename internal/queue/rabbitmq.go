@@ -9,6 +9,8 @@ import (
 	"time"
 
 	amqp "github.com/rabbitmq/amqp091-go"
+
+	"statusengine-worker/internal/metrics"
 )
 
 // RabbitMQConsumer implements queue.Consumer against a RabbitMQ broker. It
@@ -86,6 +88,8 @@ func (c *RabbitMQConsumer) Start(ctx context.Context) (<-chan Message, error) {
 			// the channel/connection goes away, so this loop's exit is what
 			// gates closing out below - never before every sender is done.
 			for d := range deliveries {
+				metrics.QueueMessagesReceivedTotal.WithLabelValues(queueName).Inc()
+
 				select {
 				case out <- Message{Queue: queueName, Payload: d.Body}:
 				default:
@@ -95,6 +99,7 @@ func (c *RabbitMQConsumer) Start(ctx context.Context) (<-chan Message, error) {
 
 				if err := handle(ctx, d.Body); err != nil {
 					c.errors.Add(1)
+					metrics.PipelineErrorsTotal.WithLabelValues(metrics.ComponentQueue).Inc()
 					slog.Warn("rabbitmq: handler failed", "queue", queueName, "error", err)
 					if nackErr := d.Nack(false, true); nackErr != nil {
 						slog.Warn("rabbitmq: nack failed", "queue", queueName, "error", nackErr)
