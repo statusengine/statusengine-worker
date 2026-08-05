@@ -126,53 +126,77 @@ nicht aus der Nachricht selbst.
 5. Verarbeitungslogik je Event-Typ
 ----------------------------------------
 
+[KORRIGIERT - siehe auch internal/queue/downtime_processor.go's Package-Doc-
+Kommentar. Beim 1:1-Nachvollziehen von MiscChild::handleDowntime() fuer die
+Implementierung (Schritt 2 des Fahrplans) stellte sich heraus, dass die
+urspruengliche Fassung dieses Abschnitts an zwei Stellen ungenau war:
+LOAD wurde faelschlich wie ADD behandelt (Zeile "Fachlich identisch zu ADD"),
+und DELETE wurde faelschlich ein unbedingtes UPDATE auf downtimehistory
+zugeschrieben. Der Code unten ist die verifizierte Fassung.]
+
 Das ist die aus MiscChild::handleDowntime() rekonstruierte Kernlogik (dort
 pro Nachricht, hier sinngemaess uebersetzt):
 
   wasNeverStarted := (type == DELETE) AND (downtime.start_time > envelope.timestamp)
     // Downtime wurde geloescht, obwohl ihre geplante start_time noch in der
     // Zukunft lag/nie erreicht wurde -> sie hat nie "gewirkt".
+    // Strikt "> ", nicht ">=" - genau in dem Moment, in dem start_time
+    // erreicht wird, gilt die Downtime noch als gestartet.
 
   Schritt A - downtimehistory:
-    WENN type NICHT IN (DELETE, LOAD):
-        UPSERT nach *_downtimehistory
-          (siehe 5a - Spalten inkl. was_started/actual_start_time/
-          actual_end_time/was_cancelled)
-    WENN type == START:
-        UPDATE *_downtimehistory SET was_started=1, actual_start_time=jetzt
-          WHERE <PK>
-    WENN type IN (STOP, DELETE):
-        UPDATE *_downtimehistory SET actual_end_time=jetzt,
-          was_cancelled=(attr==CANCELLED) WHERE <PK>
+    WENN type IN (ADD, START, STOP):     <- NICHT bei DELETE oder LOAD!
+        WENN type == ADD:
+            UPSERT nach *_downtimehistory
+              (siehe 5a - was_started=0, actual_start_time=0,
+              actual_end_time=0, was_cancelled=0)
+        WENN type == START:
+            UPDATE *_downtimehistory SET was_started=1, actual_start_time=jetzt
+              WHERE <PK>
+        WENN type == STOP:
+            UPDATE *_downtimehistory SET actual_end_time=jetzt,
+              was_cancelled=(attr==CANCELLED) WHERE <PK>
+    WENN type IN (DELETE, LOAD):
+        (nichts - downtimehistory wird hier NICHT angefasst; bei DELETE
+        siehe aber Schritt B unten fuer den wasNeverStarted-Sonderfall)
 
   Schritt B - scheduleddowntimes:
     WENN type IN (STOP, DELETE):
         DELETE FROM *_scheduleddowntimes WHERE <PK>
-        WENN wasNeverStarted:
+        WENN type == DELETE UND wasNeverStarted:
             DELETE FROM *_downtimehistory WHERE <PK>
             // Downtime hat nie gewirkt - auch aus der Historie entfernen,
             // sonst taucht sie dort als "nie gestartet, nie beendet" auf.
-    SONST (type IN (ADD, LOAD, START)):
+            // (Falls die Downtime doch schon lief: downtimehistory bleibt
+            // unveraendert - deren actual_end_time/was_cancelled wurden
+            // bereits vom vorherigen STOP-Event gesetzt, siehe Schritt A.)
+    WENN type IN (ADD, START):            <- NICHT LOAD!
         UPSERT nach *_scheduleddowntimes
           (siehe 5b - Spalten inkl. was_started/actual_start_time)
+    WENN type == LOAD:
+        (nichts)
 
 Praezisiert nach Envelope.Type (das ist die tatsaechlich pro type
-auszufuehrende Aktion - Schritt A und B kombiniert):
+auszufuehrende Aktion - Schritt A und B kombiniert, in Ausfuehrungsreihenfolge):
 
   ADD (1100):
-    - INSERT/UPSERT downtimehistory  (was_started=0, actual_start_time=0,
+    - UPSERT downtimehistory  (was_started=0, actual_start_time=0,
       actual_end_time=0, was_cancelled=0 - "frisch angelegt, noch nichts
       passiert")
-    - INSERT/UPSERT scheduleddowntimes (was_started=0, actual_start_time=0)
+    - UPSERT scheduleddowntimes (was_started=0, actual_start_time=0)
 
   LOAD (1102):
-    - Fachlich identisch zu ADD (Core-Neustart, Downtime existierte bereits).
+    - NICHTS. Weder downtimehistory noch scheduleddowntimes werden
+      angefasst. Begruendung: eine LOAD-Nachricht kommt ausschliesslich fuer
+      Downtimes, die bereits VOR dem Core-Neustart per ADD angelegt (und
+      damit bereits persistiert) wurden - es gibt nichts neu zu schreiben.
+      Der Legacy-Code kommentiert das selbst mit "Filter delete and load
+      events".
 
   START (1103):
     - UPDATE downtimehistory: was_started=1, actual_start_time=envelope.timestamp
     - UPSERT scheduleddowntimes: was_started=1, actual_start_time=envelope.timestamp
       (kein Insert der Kernfelder mehr noetig, die Zeile existiert i.d.R.
-      schon aus ADD/LOAD - Legacy nutzt trotzdem denselben
+      schon aus ADD - Legacy nutzt trotzdem denselben
       INSERT...ON DUPLICATE KEY UPDATE-Pfad wie ADD, um robust gegen eine
       fehlende vorherige ADD-Nachricht zu sein)
 
@@ -183,15 +207,15 @@ auszufuehrende Aktion - Schritt A und B kombiniert):
       (Downtime ist vorbei -> raus aus "aktuell aktiv/geplant")
 
   DELETE (1101):
-    - UPDATE downtimehistory: actual_end_time=envelope.timestamp,
-      was_cancelled = (attr == NEBATTR_DOWNTIME_STOP_CANCELLED)
-      (gleiches Verhalten wie STOP - falls kein vorheriges STOP kam)
     - DELETE FROM scheduleddowntimes WHERE <PK>
-    - ZUSAETZLICH, falls wasNeverStarted (siehe oben):
+    - downtimehistory bleibt UNVERAENDERT, ausser wasNeverStarted (siehe
+      oben) trifft zu:
       DELETE FROM downtimehistory WHERE <PK>
-      (die vorherige UPDATE-Zeile aus ADD/LOAD wird also gleich wieder
-      entfernt - Downtime war nie wirksam, soll nicht in der Historie
-      auftauchen)
+      (die per ADD geschriebene Zeile wird also wieder entfernt - Downtime
+      war nie wirksam, soll nicht in der Historie auftauchen)
+    - Im Normalfall (Downtime lief bereits, jetzt regulaer geloescht nach
+      einem vorherigen STOP) passiert an downtimehistory NICHTS - deren
+      actual_end_time/was_cancelled wurden bereits vom STOP-Event gesetzt.
 
 
 5a. Spalten UPSERT downtimehistory (ADD/LOAD)
@@ -260,21 +284,19 @@ mit denselben Ueberlegungen wie dort:
     kommt neu hinzu.
 
 
-7. Zusammenfassung: Envelope.Type -> DB-Aktion
+7. Zusammenfassung: Envelope.Type -> DB-Aktion  [KORRIGIERT, siehe Abschnitt 5]
 ------------------------------------------------------------------------
 
   Type     scheduleddowntimes         downtimehistory
   ------   -------------------------  --------------------------------------
   ADD      UPSERT (was_started=0)     UPSERT (was_started=0, actual_*=0)
-  LOAD     UPSERT (was_started=0)     UPSERT (was_started=0, actual_*=0)
+  LOAD     NICHTS                     NICHTS
   START    UPSERT (was_started=1,     UPDATE (was_started=1,
            actual_start_time=jetzt)   actual_start_time=jetzt)
   STOP     DELETE                     UPDATE (actual_end_time=jetzt,
                                        was_cancelled=attr==CANCELLED)
-  DELETE   DELETE                     UPDATE (actual_end_time=jetzt,
-                                       was_cancelled=attr==CANCELLED)
-                                       + DELETE, falls start_time > timestamp
-                                         (Downtime nie gestartet)
+  DELETE   DELETE                     NICHTS, ausser start_time > timestamp
+                                       ("nie gestartet"): dann DELETE
 
 8. Außerdem
 ------------------------------------------------------------------------

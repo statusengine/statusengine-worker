@@ -10,11 +10,19 @@ const (
 	EventTypeHostCheck                 = 801
 	EventTypeNotification              = 601
 	EventTypeContactNotificationMethod = 605
-	EventTypeDowntime                  = 1100
-	EventTypeHostStatus                = 1201
-	EventTypeServiceStatus             = 1202
-	EventTypeAcknowledgement           = 1700
-	EventTypeStateChange               = 1801
+	// EventTypeDowntimeAdd..EventTypeDowntimeStop are the five NEBTYPE_DOWNTIME_*
+	// values the statusngin_downtimes queue delivers over a single downtime_id's
+	// lifetime - see .claude/specs/downtime_ablauf.txt section 2 for the full
+	// per-type processing rules.
+	EventTypeDowntimeAdd     = 1100
+	EventTypeDowntimeDelete  = 1101
+	EventTypeDowntimeLoad    = 1102
+	EventTypeDowntimeStart   = 1103
+	EventTypeDowntimeStop    = 1104
+	EventTypeHostStatus      = 1201
+	EventTypeServiceStatus   = 1202
+	EventTypeAcknowledgement = 1700
+	EventTypeStateChange     = 1801
 )
 
 // Envelope is the common header present on every queue message.
@@ -349,6 +357,25 @@ type AcknowledgementMessage struct {
 	Envelope
 	Acknowledgement AcknowledgementPayload `json:"acknowledgement"`
 }
+
+// Envelope.Attr values, only meaningful when Envelope.Type is
+// EventTypeDowntimeStop: distinguish a downtime that ran to its scheduled
+// end_time (NORMAL) from one a user cancelled early (CANCELLED). Legacy
+// NEBATTR_DOWNTIME_STOP_* naming.
+const (
+	DowntimeAttrStopNormal    = 1
+	DowntimeAttrStopCancelled = 2
+)
+
+// DowntimePayload.DowntimeType values. Note this is the INVERSE of the
+// 0=host/1=service convention AcknowledgementType and StateChangeType use
+// elsewhere in this package - downtime_type genuinely is 1=service,
+// 2=host in the wire format (see .claude/specs/downtime_ablauf.txt
+// section 3).
+const (
+	DowntimeTypeService = 1
+	DowntimeTypeHost    = 2
+)
 
 // DowntimePayload mirrors the `downtime` object and the
 // statusengine_host_scheduleddowntimes / statusengine_host_downtimehistory
