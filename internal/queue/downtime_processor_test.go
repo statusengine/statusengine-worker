@@ -119,7 +119,7 @@ func TestDetermineDowntimeActions(t *testing.T) {
 				row.WasStarted = true
 				row.ActualStartTime = 2005
 				return []DowntimeAction{
-					{Table: DowntimeHistoryTable, Action: DowntimeActionUpdate, Data: row},
+					{Table: DowntimeHistoryTable, Action: DowntimeActionUpdateStarted, Data: row},
 					{Table: ScheduledDowntimesTable, Action: DowntimeActionUpsert, Data: row},
 				}
 			}(),
@@ -135,7 +135,7 @@ func TestDetermineDowntimeActions(t *testing.T) {
 				row.WasStarted = true
 				row.ActualStartTime = 2005
 				return []DowntimeAction{
-					{Table: DowntimeHistoryTable, Action: DowntimeActionUpdate, Data: row},
+					{Table: DowntimeHistoryTable, Action: DowntimeActionUpdateStarted, Data: row},
 					{Table: ScheduledDowntimesTable, Action: DowntimeActionUpsert, Data: row},
 				}
 			}(),
@@ -151,7 +151,7 @@ func TestDetermineDowntimeActions(t *testing.T) {
 				row.ActualEndTime = 2500
 				row.WasCancelled = false
 				return []DowntimeAction{
-					{Table: DowntimeHistoryTable, Action: DowntimeActionUpdate, Data: row},
+					{Table: DowntimeHistoryTable, Action: DowntimeActionUpdateStopped, Data: row},
 					{Table: ScheduledDowntimesTable, Action: DowntimeActionDelete, Data: row},
 				}
 			}(),
@@ -167,7 +167,7 @@ func TestDetermineDowntimeActions(t *testing.T) {
 				row.ActualEndTime = 2200
 				row.WasCancelled = true
 				return []DowntimeAction{
-					{Table: DowntimeHistoryTable, Action: DowntimeActionUpdate, Data: row},
+					{Table: DowntimeHistoryTable, Action: DowntimeActionUpdateStopped, Data: row},
 					{Table: ScheduledDowntimesTable, Action: DowntimeActionDelete, Data: row},
 				}
 			}(),

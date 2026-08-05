@@ -5,9 +5,11 @@ import (
 	"database/sql"
 	"fmt"
 	"log/slog"
+	"time"
 
 	"statusengine-worker/internal/db"
 	"statusengine-worker/internal/graphite"
+	"statusengine-worker/internal/metrics"
 	"statusengine-worker/internal/types"
 	"statusengine-worker/internal/websocket"
 )
@@ -375,6 +377,121 @@ func newCoreRestartHandler(hub *websocket.Hub, topic string, sqlDB *sql.DB, host
 	}
 }
 
+// downtimeMetricsTable renders the concrete table name an executed
+// DowntimeAction wrote to, for the "table" label on
+// metrics.DBEventsWrittenTotal - mirrors db.downtimeTable's naming
+// (statusengine_host_*/statusengine_service_* + scheduleddowntimes/
+// downtimehistory) without needing that unexported helper itself.
+func downtimeMetricsTable(action DowntimeAction) string {
+	scope := "service"
+	if action.Data.IsHostDowntime {
+		scope = "host"
+	}
+	return "statusengine_" + scope + "_" + action.Table.String()
+}
+
+// execDowntimeAction turns one DowntimeAction into its concrete (query,
+// args) pair via the matching internal/db builder (Schritt 3), executes it,
+// and reports the outcome through the same db-write instrumentation
+// BulkInserter.flushBuffer uses for every other table - done by hand here
+// since downtime writes deliberately bypass BulkInserter entirely (see
+// .claude/specs/downtime_ablauf.txt section 6: a single downtime message
+// can require an UPSERT, UPDATE or DELETE, not just an INSERT). Unlike
+// BulkInserter's batch histograms (which track 100-item/250ms batching
+// behaviour that plainly doesn't apply here, per downtime_ablauf.txt
+// section 6), only DBEventsWrittenTotal/PipelineErrorsTotal apply to a
+// single-row ExecContext like this one.
+func execDowntimeAction(ctx context.Context, sqlDB *sql.DB, action DowntimeAction) error {
+	row := db.DowntimeRow{
+		IsHostDowntime:     action.Data.IsHostDowntime,
+		HostName:           action.Data.HostName,
+		ServiceDescription: action.Data.ServiceDescription,
+		NodeName:           action.Data.NodeName,
+		InternalDowntimeID: action.Data.InternalDowntimeID,
+		EntryTime:          action.Data.EntryTime,
+		EntryTimeUsec:      action.Data.EntryTimeUsec,
+		AuthorName:         action.Data.AuthorName,
+		CommentData:        action.Data.CommentData,
+		TriggeredByID:      action.Data.TriggeredByID,
+		IsFixed:            action.Data.IsFixed,
+		Duration:           action.Data.Duration,
+		ScheduledStartTime: action.Data.ScheduledStartTime,
+		ScheduledEndTime:   action.Data.ScheduledEndTime,
+		WasStarted:         action.Data.WasStarted,
+		ActualStartTime:    action.Data.ActualStartTime,
+		ActualEndTime:      action.Data.ActualEndTime,
+		WasCancelled:       action.Data.WasCancelled,
+	}
+
+	var query string
+	var args []any
+	switch {
+	case action.Table == ScheduledDowntimesTable && action.Action == DowntimeActionUpsert:
+		query, args = db.UpsertScheduledDowntimeQuery(row)
+	case action.Table == ScheduledDowntimesTable && action.Action == DowntimeActionDelete:
+		query, args = db.DeleteScheduledDowntimeQuery(row)
+	case action.Table == DowntimeHistoryTable && action.Action == DowntimeActionUpsert:
+		query, args = db.UpsertDowntimeHistoryQuery(row)
+	case action.Table == DowntimeHistoryTable && action.Action == DowntimeActionUpdateStarted:
+		query, args = db.UpdateDowntimeHistoryStartedQuery(row)
+	case action.Table == DowntimeHistoryTable && action.Action == DowntimeActionUpdateStopped:
+		query, args = db.UpdateDowntimeHistoryStoppedQuery(row)
+	case action.Table == DowntimeHistoryTable && action.Action == DowntimeActionDelete:
+		query, args = db.DeleteDowntimeHistoryQuery(row)
+	default:
+		// Unreachable given DetermineDowntimeActions' own switch, but kept
+		// explicit rather than silently doing nothing if a future action
+		// combination is added there without a matching case here.
+		return fmt.Errorf("unhandled downtime action %s on %s", action.Action, action.Table)
+	}
+
+	table := downtimeMetricsTable(action)
+	start := time.Now()
+	_, err := sqlDB.ExecContext(ctx, query, args...)
+	duration := time.Since(start)
+
+	if err != nil {
+		metrics.PipelineErrorsTotal.WithLabelValues(metrics.ComponentMySQL).Inc()
+		slog.Error("queue: downtime write failed", "table", table, "action", action.Action, "duration", duration, "error", err)
+		return fmt.Errorf("%s %s: %w", action.Action, table, err)
+	}
+
+	metrics.DBEventsWrittenTotal.WithLabelValues(table).Add(1)
+	slog.Info("queue: downtime write", "table", table, "action", action.Action, "duration", duration)
+	return nil
+}
+
+// newDowntimeHandler builds the Handler for the statusngin_downtimes queue.
+// Like newCoreRestartHandler, it bypasses BulkInserter entirely and writes
+// straight to sqlDB: DetermineDowntimeActions (downtime_processor.go)
+// decides exactly which INSERT/UPSERT, UPDATE or DELETE calls a given
+// message requires across statusengine_{host,service}_scheduleddowntimes
+// and statusengine_{host,service}_downtimehistory, and execDowntimeAction
+// runs each in the order returned - see .claude/specs/downtime_ablauf.txt
+// for why a single BulkInserter-based table can't express this.
+//
+// The full decoded message (envelope Type/Attr included, not just the
+// downtime payload) is published to hub for every event, same as every
+// other Handler in this file - so WebSocket subscribers can tell an ADD
+// from a START/STOP/DELETE, which the payload alone doesn't carry.
+func newDowntimeHandler(hub *websocket.Hub, topic string, sqlDB *sql.DB, nodeName string) Handler {
+	return func(ctx context.Context, payload []byte) error {
+		msg, err := decodeDowntimeMessage(payload)
+		if err != nil {
+			return fmt.Errorf("queue: decode %s: %w", topic, err)
+		}
+
+		publish(hub, topic, msg)
+
+		for _, action := range DetermineDowntimeActions(msg, nodeName) {
+			if err := execDowntimeAction(ctx, sqlDB, action); err != nil {
+				return fmt.Errorf("queue: %s: %w", topic, err)
+			}
+		}
+		return nil
+	}
+}
+
 // newStateChangeHandler and newAcknowledgementHandler route each decoded
 // item to one of two BulkInserters depending on whether it describes a
 // host or a service, mirroring the schema's separate host/service tables.
@@ -451,6 +568,10 @@ func newAcknowledgementHandler(hub *websocket.Hub, topic string, hostIns, servic
 // core_restart has no matching table of its own; on object_type 102 it
 // instead clears out statusengine_hoststatus/statusengine_servicestatus -
 // see newCoreRestartHandler and the enableOpenITCockpitTweaks parameter.
+// downtimes also bypasses BulkInserter, for the opposite reason: a single
+// message can require an INSERT/UPSERT, UPDATE or DELETE across two tables
+// depending on its type - see newDowntimeHandler, downtime_processor.go's
+// DetermineDowntimeActions and .claude/specs/downtime_ablauf.txt.
 // service_perfdata gets its own handler (see processor.go), routing each
 // parsed metric to MySQL, Graphite, or both per perfdataRoute (CLAUDE.md
 // rule 5).
@@ -549,7 +670,7 @@ func NewRouter(sqlDB *sql.DB, hub *websocket.Hub, gc *graphite.Client, perfdataR
 		QueueContactNotificationMethod: newContactNotificationMethodHandler(hub, QueueContactNotificationMethod, hostNotifications, serviceNotifications),
 		QueueNotifications:             newNotificationHandler(hub, QueueNotifications, hostNotificationsLog, serviceNotificationsLog),
 
-		QueueDowntimes:   NewBroadcastHandler(hub, QueueDowntimes, decodeDowntime),
+		QueueDowntimes:   newDowntimeHandler(hub, QueueDowntimes, sqlDB, nodeName),
 		QueueCoreRestart: newCoreRestartHandler(hub, QueueCoreRestart, sqlDB, hostStatus, serviceStatus, enableOpenITCockpitTweaks),
 	}
 

@@ -119,12 +119,12 @@ func TestDecodeNonBulkQueues(t *testing.T) {
 	})
 
 	t.Run("Downtime", func(t *testing.T) {
-		items, err := decodeDowntime(readFixture(t, "statusngin_downtimes.json"))
+		msg, err := decodeDowntimeMessage(readFixture(t, "statusngin_downtimes.json"))
 		if err != nil {
 			t.Fatalf("decode: %v", err)
 		}
-		if len(items) != 1 || items[0].DowntimeID != 1 {
-			t.Fatalf("unexpected items: %+v", items)
+		if msg.Type != 1100 || msg.Downtime.DowntimeID != 1 {
+			t.Fatalf("unexpected message: %+v", msg)
 		}
 	})
 

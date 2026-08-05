@@ -65,11 +65,22 @@ func (t DowntimeTargetTable) String() string {
 }
 
 // DowntimeActionType is the SQL operation a DowntimeAction represents.
+//
+// downtimehistory's UPDATE needs two distinct SET clauses depending on why
+// it's being updated (START sets was_started/actual_start_time; STOP sets
+// actual_end_time/was_cancelled - see downtime_ablauf.txt section 5) - so
+// unlike a plain UPSERT/DELETE, "UPDATE" alone would be ambiguous once step
+// 3 has to turn this into a concrete query. Splitting it into
+// DowntimeActionUpdateStarted/DowntimeActionUpdateStopped keeps that
+// decision here, in the one place that already knows why the update is
+// happening, instead of pushing a msg.Type switch into the SQL-building or
+// handler layer too.
 type DowntimeActionType int
 
 const (
 	DowntimeActionUpsert DowntimeActionType = iota
-	DowntimeActionUpdate
+	DowntimeActionUpdateStarted
+	DowntimeActionUpdateStopped
 	DowntimeActionDelete
 )
 
@@ -77,8 +88,10 @@ func (a DowntimeActionType) String() string {
 	switch a {
 	case DowntimeActionUpsert:
 		return "UPSERT"
-	case DowntimeActionUpdate:
-		return "UPDATE"
+	case DowntimeActionUpdateStarted:
+		return "UPDATE(started)"
+	case DowntimeActionUpdateStopped:
+		return "UPDATE(stopped)"
 	case DowntimeActionDelete:
 		return "DELETE"
 	default:
@@ -177,7 +190,7 @@ func DetermineDowntimeActions(msg types.DowntimeMessage, nodeName string) []Down
 		data.WasStarted = true
 		data.ActualStartTime = msg.Timestamp
 		return []DowntimeAction{
-			{Table: DowntimeHistoryTable, Action: DowntimeActionUpdate, Data: data},
+			{Table: DowntimeHistoryTable, Action: DowntimeActionUpdateStarted, Data: data},
 			{Table: ScheduledDowntimesTable, Action: DowntimeActionUpsert, Data: data},
 		}
 
@@ -186,7 +199,7 @@ func DetermineDowntimeActions(msg types.DowntimeMessage, nodeName string) []Down
 		data.ActualEndTime = msg.Timestamp
 		data.WasCancelled = msg.Attr == types.DowntimeAttrStopCancelled
 		return []DowntimeAction{
-			{Table: DowntimeHistoryTable, Action: DowntimeActionUpdate, Data: data},
+			{Table: DowntimeHistoryTable, Action: DowntimeActionUpdateStopped, Data: data},
 			{Table: ScheduledDowntimesTable, Action: DowntimeActionDelete, Data: data},
 		}
 

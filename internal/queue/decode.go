@@ -212,12 +212,17 @@ func decodeAcknowledgement(payload []byte) ([]acknowledgementEvent, error) {
 	}}, nil
 }
 
-func decodeDowntime(payload []byte) ([]types.DowntimePayload, error) {
+// decodeDowntimeMessage returns the full types.DowntimeMessage - Envelope
+// (Type/Attr/Timestamp) included - rather than just its Downtime payload:
+// unlike every other queue, DetermineDowntimeActions needs Type and Attr to
+// decide what to do, not just the payload fields (see
+// .claude/specs/downtime_ablauf.txt section 1).
+func decodeDowntimeMessage(payload []byte) (types.DowntimeMessage, error) {
 	var msg types.DowntimeMessage
 	if err := json.Unmarshal(payload, &msg); err != nil {
-		return nil, err
+		return types.DowntimeMessage{}, err
 	}
-	return []types.DowntimePayload{msg.Downtime}, nil
+	return msg, nil
 }
 
 // decodeCoreRestart has no envelope at all - just {"object_type": 102}.
