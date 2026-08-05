@@ -1,0 +1,293 @@
+Downtime-Verarbeitung (statusngin_downtimes) - Ablaufbeschreibung
+====================================================================
+
+Quelle dieser Beschreibung: Legacy PHP-Worker (github.com/statusengine/worker)
+  - src/Childs/MiscChild.php               (Zeilen 217-249, handleDowntime())
+  - src/ValueObjects/Downtime.php          (Bedeutung von type/attr/downtime_type)
+  - src/Backends/MySQL/SqlObjects/MysqlServiceDowntimehistory.php
+  - src/Backends/MySQL/SqlObjects/MysqlServiceScheduleddowntime.php
+  - src/Backends/Crate/SqlObjects/CrateServiceDowntimehistory.php
+  - src/Backends/Crate/SqlObjects/CrateServiceScheduleddowntime.php
+    (Crate-Varianten inhaltlich identisch zur MySQL-Logik, nur ON CONFLICT
+    statt ON DUPLICATE KEY UPDATE - als Bestätigung der Business-Logik gelesen)
+
+Beispiel-Payload: .claude/specs/statusngin_downtimes.json
+Aktueller Stand in diesem Repo: internal/queue/registry.go verdrahtet
+QueueDowntimes bereits, aber NUR als NewBroadcastHandler(hub, QueueDowntimes,
+decodeDowntime) - d.h. Downtimes werden aktuell ausschliesslich per WebSocket
+gebroadcastet, aber gar nicht in MySQL persistiert. Das hier ist die
+Verarbeitungslogik, die noch fehlt.
+
+
+1. Envelope-Felder und ihre Bedeutung
+--------------------------------------
+
+Jede Downtime-Nachricht hat (wie jede andere Queue-Message) das gemeinsame
+Envelope (type, flags, attr, timestamp, timestamp_usec) plus ein "downtime"-
+Objekt. Bei Downtimes tragen zwei Envelope-Felder die eigentliche Semantik,
+die woanders im Repo nicht vorkommt:
+
+  - type: welche Art von Downtime-Ereignis das ist (siehe Abschnitt 2).
+    Das Beispiel-JSON zeigt type=1100 (ADD). Die anderen vier Typen kommen
+    als eigene Nachrichten auf derselben Queue rein.
+  - attr: nur bei type=STOP relevant - unterscheidet "Downtime ist regulär
+    ausgelaufen" von "Downtime wurde vom User abgebrochen" (siehe Abschnitt 2).
+
+Aktuell kennt internal/types/events.go nur EventTypeDowntime = 1100 (ADD).
+Fuer eine korrekte Verarbeitung werden zusaetzlich die Konstanten fuer
+DELETE/LOAD/START/STOP benoetigt (siehe Abschnitt 6).
+
+
+2. Die 5 Event-Typen (Envelope.Type)
+--------------------------------------
+
+  1100  ADD     Downtime wurde neu angelegt/geplant (z.B. User plant eine
+                Downtime fuer morgen 10 Uhr).
+  1101  DELETE  Downtime wurde entfernt - entweder manuell durch einen User,
+                oder weil sie automatisch abgelaufen ist, NACHDEM sie bereits
+                lief (dann kommt vorher ein STOP, danach DELETE), ODER weil
+                sie geloescht wurde, BEVOR ihre start_time je erreicht wurde
+                (dann kommt NUR ein DELETE, kein START/STOP - siehe Abschnitt 5).
+  1102  LOAD    Downtime wurde beim Start des Monitoring-Cores aus der
+                retention.dat wiederhergestellt (Core-Neustart mit einer zu
+                diesem Zeitpunkt bereits bekannten/geplanten Downtime).
+                Wird fachlich wie ADD behandelt.
+  1103  START   Die geplante Downtime hat begonnen (aktuelle Zeit hat
+                start_time erreicht). Der Host/Service gilt ab jetzt als "in
+                Downtime".
+  1104  STOP    Die laufende Downtime endet - entweder weil ihre end_time
+                erreicht wurde (attr=1, NORMAL) oder weil sie vom User vorzeitig
+                abgebrochen wurde (attr=2, CANCELLED).
+
+Envelope.Attr (nur bei STOP ausgewertet):
+  1  NORMAL      regulaeres Ende (end_time erreicht)
+  2  CANCELLED   User hat die laufende Downtime manuell beendet
+
+Wichtig: Fuer eine einzelne geplante Downtime (identifiziert durch
+downtime_id) kommen ueber ihre Lebenszeit hinweg MEHRERE Nachrichten auf der
+Queue an, typischerweise in dieser Reihenfolge:
+
+  ADD  -> START -> STOP -> DELETE      (normaler Ablauf: startet, laeuft ab)
+  ADD  -> DELETE                       (User loescht die Downtime, bevor sie
+                                         je gestartet ist)
+  LOAD -> START -> STOP -> DELETE      (Core-Neustart waehrend eine Downtime
+                                         bereits geplant war)
+
+
+3. Host- vs. Service-Downtime (downtime_type)
+------------------------------------------------
+
+downtime.downtime_type unterscheidet Host- von Service-Downtime - ACHTUNG,
+invers zur Konvention, die newAcknowledgementHandler/newStateChangeHandler in
+registry.go fuer AcknowledgementType/StateChangeType verwenden (dort ist
+0/host, 1/service):
+
+  1 = SERVICE_DOWNTIME
+  2 = HOST_DOWNTIME
+
+Host-Downtimes haben service_description = "" (leer). Genau wie beim
+bestehenden Acknowledgement-Handler ist das Feld selbst aussagekraeftig, aber
+hier muss auf downtime_type geroutet werden, nicht auf "ist
+service_description gesetzt" - der Legacy-Code prueft ausschliesslich
+downtime_type (isHostDowntime() == downtime_type === HOST_DOWNTIME).
+
+Je nachdem wird in eines von zwei Tabellenpaaren geschrieben:
+  Host:    statusengine_host_downtimehistory / statusengine_host_scheduleddowntimes
+  Service: statusengine_service_downtimehistory / statusengine_service_scheduleddowntimes
+
+
+4. Die zwei Zieltabellen und ihr Zweck
+------------------------------------------
+
+statusengine_*_scheduleddowntimes
+  "Aktuell existierende/aktive Downtimes". Ist im Prinzip ein 1:1-Abbild
+  dessen, was der Monitoring-Core gerade an geplanten Downtimes kennt - Zeilen
+  werden per DELETE entfernt, sobald die Downtime endgueltig vorbei ist (STOP
+  oder DELETE). Diese Tabelle hat KEINE was_cancelled/actual_end_time-Spalten
+  (siehe mysql_schema.sql) - sie kennt nur was_started/actual_start_time als
+  "dynamische" Felder.
+
+statusengine_*_downtimehistory
+  Historisches Log ueber alle jemals aufgetretenen Downtimes - Zeilen werden
+  NICHT per DELETE entfernt, ausser im Sonderfall "nie gestartet" (Abschnitt
+  5). Zusaetzlich zu was_started/actual_start_time hat diese Tabelle auch
+  actual_end_time und was_cancelled sowie (nur hier) entry_time_usec.
+
+Beide Tabellen haben denselben Primaerschluessel-Aufbau:
+  Host:    (hostname, node_name, scheduled_start_time, internal_downtime_id)
+  Service: (hostname, service_description, node_name, scheduled_start_time,
+            internal_downtime_id)
+
+"internal_downtime_id" = downtime.downtime_id aus der Nachricht.
+node_name kommt (wie ueberall sonst im Repo) aus der Worker-Konfiguration,
+nicht aus der Nachricht selbst.
+
+
+5. Verarbeitungslogik je Event-Typ
+----------------------------------------
+
+Das ist die aus MiscChild::handleDowntime() rekonstruierte Kernlogik (dort
+pro Nachricht, hier sinngemaess uebersetzt):
+
+  wasNeverStarted := (type == DELETE) AND (downtime.start_time > envelope.timestamp)
+    // Downtime wurde geloescht, obwohl ihre geplante start_time noch in der
+    // Zukunft lag/nie erreicht wurde -> sie hat nie "gewirkt".
+
+  Schritt A - downtimehistory:
+    WENN type NICHT IN (DELETE, LOAD):
+        UPSERT nach *_downtimehistory
+          (siehe 5a - Spalten inkl. was_started/actual_start_time/
+          actual_end_time/was_cancelled)
+    WENN type == START:
+        UPDATE *_downtimehistory SET was_started=1, actual_start_time=jetzt
+          WHERE <PK>
+    WENN type IN (STOP, DELETE):
+        UPDATE *_downtimehistory SET actual_end_time=jetzt,
+          was_cancelled=(attr==CANCELLED) WHERE <PK>
+
+  Schritt B - scheduleddowntimes:
+    WENN type IN (STOP, DELETE):
+        DELETE FROM *_scheduleddowntimes WHERE <PK>
+        WENN wasNeverStarted:
+            DELETE FROM *_downtimehistory WHERE <PK>
+            // Downtime hat nie gewirkt - auch aus der Historie entfernen,
+            // sonst taucht sie dort als "nie gestartet, nie beendet" auf.
+    SONST (type IN (ADD, LOAD, START)):
+        UPSERT nach *_scheduleddowntimes
+          (siehe 5b - Spalten inkl. was_started/actual_start_time)
+
+Praezisiert nach Envelope.Type (das ist die tatsaechlich pro type
+auszufuehrende Aktion - Schritt A und B kombiniert):
+
+  ADD (1100):
+    - INSERT/UPSERT downtimehistory  (was_started=0, actual_start_time=0,
+      actual_end_time=0, was_cancelled=0 - "frisch angelegt, noch nichts
+      passiert")
+    - INSERT/UPSERT scheduleddowntimes (was_started=0, actual_start_time=0)
+
+  LOAD (1102):
+    - Fachlich identisch zu ADD (Core-Neustart, Downtime existierte bereits).
+
+  START (1103):
+    - UPDATE downtimehistory: was_started=1, actual_start_time=envelope.timestamp
+    - UPSERT scheduleddowntimes: was_started=1, actual_start_time=envelope.timestamp
+      (kein Insert der Kernfelder mehr noetig, die Zeile existiert i.d.R.
+      schon aus ADD/LOAD - Legacy nutzt trotzdem denselben
+      INSERT...ON DUPLICATE KEY UPDATE-Pfad wie ADD, um robust gegen eine
+      fehlende vorherige ADD-Nachricht zu sein)
+
+  STOP (1104):
+    - UPDATE downtimehistory: actual_end_time=envelope.timestamp,
+      was_cancelled = (attr == NEBATTR_DOWNTIME_STOP_CANCELLED)
+    - DELETE FROM scheduleddowntimes WHERE <PK>
+      (Downtime ist vorbei -> raus aus "aktuell aktiv/geplant")
+
+  DELETE (1101):
+    - UPDATE downtimehistory: actual_end_time=envelope.timestamp,
+      was_cancelled = (attr == NEBATTR_DOWNTIME_STOP_CANCELLED)
+      (gleiches Verhalten wie STOP - falls kein vorheriges STOP kam)
+    - DELETE FROM scheduleddowntimes WHERE <PK>
+    - ZUSAETZLICH, falls wasNeverStarted (siehe oben):
+      DELETE FROM downtimehistory WHERE <PK>
+      (die vorherige UPDATE-Zeile aus ADD/LOAD wird also gleich wieder
+      entfernt - Downtime war nie wirksam, soll nicht in der Historie
+      auftauchen)
+
+
+5a. Spalten UPSERT downtimehistory (ADD/LOAD)
+------------------------------------------------
+Feste Spalten (immer gesetzt):
+  hostname, [service_description,] entry_time, entry_time_usec, author_name,
+  comment_data, internal_downtime_id, triggered_by_id, is_fixed, duration,
+  scheduled_start_time, scheduled_end_time, node_name
+Dynamische Spalten (UPSERT-Update-Anteil):
+  was_started (=0), actual_start_time (=0), actual_end_time (=0),
+  was_cancelled (=0)
+
+5b. Spalten UPSERT scheduleddowntimes (ADD/LOAD/START)
+------------------------------------------------
+Feste Spalten:
+  hostname, [service_description,] entry_time, author_name, comment_data,
+  internal_downtime_id, triggered_by_id, is_fixed, duration,
+  scheduled_start_time, scheduled_end_time, node_name
+  (Achtung: KEIN entry_time_usec - die Spalte existiert in
+  *_scheduleddowntimes gar nicht, nur in *_downtimehistory)
+Dynamische Spalten:
+  was_started, actual_start_time
+  - bei ADD/LOAD: was_started=0, actual_start_time=0
+  - bei START: was_started=1, actual_start_time=envelope.timestamp
+
+
+6. Warum das nicht in die bestehende BulkInserter-Abstraktion passt
+------------------------------------------------------------------------
+
+Jeder andere bisher angebundene Queue-Typ in diesem Repo (hoststatus,
+acknowledgements, statechanges, ...) wird ausschliesslich per INSERT bzw.
+INSERT ... ON DUPLICATE KEY UPDATE geschrieben - genau das kann
+internal/db.BulkInserter[T] (NewBulkInserter/NewUpsertBulkInserter).
+
+Downtimes brauchen je nach Envelope.Type UNTERSCHIEDLICHE SQL-Operationen auf
+ZWEI Tabellen gleichzeitig:
+  - INSERT/UPSERT  (ADD, LOAD)
+  - UPDATE          (START: nur downtimehistory + upsert scheduleddowntimes;
+                      STOP/DELETE: nur downtimehistory)
+  - DELETE          (STOP, DELETE: scheduleddowntimes; DELETE mit
+                      wasNeverStarted zusaetzlich: downtimehistory)
+
+Das passt konzeptionell nicht in "ein RowFunc pro Item, ein Batch-INSERT pro
+Tabelle" - genau wie beim vorhandenen newCoreRestartHandler (der ebenfalls
+eine TRUNCATE/DELETE-Query ausserhalb der BulkInserter-Batching-Logik gegen
+sqlDB fahren muss, und dafuer BulkInserter.WithPaused nutzt, um nicht mit
+einem parallel laufenden Batch-Flush zu kollidieren).
+
+Fuer die Implementierung heisst das: kein neuer
+BulkInserter[DowntimeEvent], sondern ein eigener Handler (aehnlich
+newCoreRestartHandler), der direkt gegen sqlDB.ExecContext(...) arbeitet -
+mit denselben Ueberlegungen wie dort:
+  - Es reicht auch ein direktes ExecContext ohne Pause, wenn ALLE Downtime-
+    Schreibzugriffe zentral durch diesen einen Handler laufen (dann gibt es
+    keinen konkurrierenden Writer auf diesen Tabellen und WithPaused waere
+    unnoetig). Das ist eine Design-Entscheidung fuer die Implementierung.
+  - Batching (100 Eintraege/250ms) im Sinne von CLAUDE.md Regel 3 ist fuer
+    Downtimes nicht relevant.
+    Downtimes sind volumenmaessig sehr viel seltener (siehe
+    CLAUDE.md-Ausnahmeliste: statusngin_downtimes liefert ohnehin KEINE
+    Bulk-Payloads, sondern einzelne Nachrichten - im Gegensatz zu z.B.
+    statusngin_hoststatus). Ein einfacher synchroner ExecContext pro
+    Downtime-Event duerfte fachlich ausreichen.
+  - publish(hub, topic, ev) fuer den WebSocket-Broadcast bleibt wie bisher
+    (NewBroadcastHandler-Verhalten) erhalten - nur die MySQL-Persistierung
+    kommt neu hinzu.
+
+
+7. Zusammenfassung: Envelope.Type -> DB-Aktion
+------------------------------------------------------------------------
+
+  Type     scheduleddowntimes         downtimehistory
+  ------   -------------------------  --------------------------------------
+  ADD      UPSERT (was_started=0)     UPSERT (was_started=0, actual_*=0)
+  LOAD     UPSERT (was_started=0)     UPSERT (was_started=0, actual_*=0)
+  START    UPSERT (was_started=1,     UPDATE (was_started=1,
+           actual_start_time=jetzt)   actual_start_time=jetzt)
+  STOP     DELETE                     UPDATE (actual_end_time=jetzt,
+                                       was_cancelled=attr==CANCELLED)
+  DELETE   DELETE                     UPDATE (actual_end_time=jetzt,
+                                       was_cancelled=attr==CANCELLED)
+                                       + DELETE, falls start_time > timestamp
+                                         (Downtime nie gestartet)
+
+8. Außerdem
+------------------------------------------------------------------------
+  - internal/types/events.go: Konstanten fuer DELETE/LOAD/START/STOP
+    (1101-1104) und NEBATTR_DOWNTIME_STOP_NORMAL/CANCELLED (1/2) ergaenzen.
+  - Der Handler fuer Host+Service (routet intern auf
+    downtime_type), analog zu newAcknowledgementHandler.
+  - Baue eine eigene kleine "downtime SQL"-Helper-Datei/-Typ (kein
+    BulkInserter) mit den vier Queries (UPSERT scheduleddowntimes, DELETE
+    scheduleddowntimes, UPSERT downtimehistory, UPDATE downtimehistory,
+    DELETE downtimehistory) je einmal fuer host_* und einmal fuer service_*.
+  - Tests: braucht go-sqlmock-Abdeckung fuer jede der 5 Type-Kombinationen
+    (ADD, LOAD, START, STOP normal, STOP cancelled, DELETE mit/ohne
+    wasNeverStarted) - siehe existierende Tests fuer registry.go als Vorlage.
+
+
