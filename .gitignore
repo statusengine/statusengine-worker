@@ -1,4 +1,5 @@
 /simulator
-/publisher
+/gearman_publisher
+/rabbitmq_publisher
 /worker
 cmd/app/__debug_bin*

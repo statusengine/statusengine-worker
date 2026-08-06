@@ -50,7 +50,7 @@ func loadConfig() config {
 		`queue backend to use: "gearman" or "rabbitmq"`)
 	flag.StringVar(&cfg.gearmanAddr, "gearman-addr", envOrDefault("STATUSENGINE_GEARMAN_ADDR", "127.0.0.1:4730"),
 		"Gearman job server address (host:port)")
-	flag.StringVar(&cfg.rabbitMQURL, "rabbitmq-url", envOrDefault("STATUSENGINE_RABBITMQ_URL", "amqp://guest:guest@127.0.0.1:5672/"),
+	flag.StringVar(&cfg.rabbitMQURL, "rabbitmq-url", envOrDefault("STATUSENGINE_RABBITMQ_URL", "amqp://statusengine:statusengine@127.0.0.1:5672/"),
 		"RabbitMQ broker URL")
 	flag.StringVar(&cfg.mysqlDSN, "mysql-dsn", envOrDefault("STATUSENGINE_MYSQL_DSN", "statusengine-dev:statusengine-dev@tcp(127.0.0.1:3306)/statusengine-dev?parseTime=true"),
 		"MySQL data source name")

@@ -4,3 +4,7 @@ MySQL Password: statusengine-dev
 Database: statusengine-dev
 
 Gearman Job Server: 127.0.0.1:4730
+
+RabbitMQ Server: 127.0.0.1:5672
+Benutzername: statusengine
+Passwort: statusengine
