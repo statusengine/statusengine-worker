@@ -39,6 +39,7 @@ import (
 
 	"statusengine-worker/internal/graphite"
 	"statusengine-worker/internal/queue"
+	"statusengine-worker/internal/types"
 	"statusengine-worker/internal/websocket"
 )
 
@@ -189,6 +190,18 @@ func main() {
 	// would otherwise reproduce identical rows and fail with the very
 	// Error 1062 this tool is meant to demonstrate the absence of.
 	runSeed := time.Now().Unix()
+
+	// Unlike every other queue, downtimes can't be exercised meaningfully
+	// by runLoad's "replay one random static fixture" loop: a downtime_id's
+	// events must arrive as a coherent, correctly ordered sequence (ADD
+	// before START before STOP before DELETE, all sharing the same
+	// host/downtime_id/scheduled_start_time) for DetermineDowntimeActions'
+	// matrix (.claude/specs/downtime_ablauf.txt) to actually be exercised -
+	// so it gets its own scripted scenario instead, run once up front, only
+	// when the caller actually selected the downtimes queue.
+	if queueIncludes(queueNames, queue.QueueDowntimes) {
+		runDowntimeScenario(runCtx, router, runSeed)
+	}
 
 	sent := runLoad(runCtx, router, queueNames, payloads, cfg.rate, cfg.workers, runSeed)
 	slog.Info("simulator stopped sending", "messages_sent", sent)
@@ -447,6 +460,132 @@ func rateLimiter(ctx context.Context, ratePerSec int) <-chan struct{} {
 		}
 	}()
 	return tokens
+}
+
+// queueIncludes reports whether want is present in names.
+func queueIncludes(names []string, want string) bool {
+	for _, n := range names {
+		if n == want {
+			return true
+		}
+	}
+	return false
+}
+
+// runDowntimeScenario sends two complete, correctly ordered downtime event
+// sequences straight through router's QueueDowntimes handler: a full host
+// downtime lifecycle (ADD -> START -> STOP, cancelled early -> DELETE) and a
+// service downtime that demonstrates the "wasNeverStarted" edge case (ADD ->
+// DELETE, deleted before its scheduled start_time was ever reached) - see
+// .claude/specs/downtime_ablauf.txt sections 2 and 5. Both are gated in main
+// on the downtimes queue actually being selected.
+//
+// runSeed (see main) keeps hostnames/downtime_ids unique across repeated
+// runs against the same non-truncated dev database, the same way runLoad's
+// timestamp offsets do.
+func runDowntimeScenario(ctx context.Context, router queue.Router, runSeed int64) {
+	handle := router[queue.QueueDowntimes]
+
+	slog.Info("simulator: downtime scenario starting")
+
+	// --- Full lifecycle: ADD -> START -> STOP (cancelled) -> DELETE ---
+	lifecycleHost := fmt.Sprintf("simulator-downtime-host-%d", runSeed)
+	lifecycleID := int(runSeed % 1_000_000)
+	entryTime := runSeed
+	scheduledStart := entryTime + 60      // scheduled to begin a minute out
+	scheduledEnd := scheduledStart + 1800 // a 30-minute maintenance window
+
+	lifecycle := types.DowntimePayload{
+		HostName:     lifecycleHost,
+		AuthorName:   "simulator",
+		CommentData:  "scripted downtime lifecycle demo",
+		DowntimeType: types.DowntimeTypeHost,
+		EntryTime:    entryTime,
+		StartTime:    scheduledStart,
+		EndTime:      scheduledEnd,
+		DowntimeID:   lifecycleID,
+		Fixed:        1,
+		Duration:     int(scheduledEnd - scheduledStart),
+	}
+
+	sendDowntime(ctx, handle, "lifecycle ADD", types.DowntimeMessage{
+		Envelope: types.Envelope{Type: types.EventTypeDowntimeAdd, Timestamp: entryTime},
+		Downtime: lifecycle,
+	})
+
+	actualStart := scheduledStart + 5 // the core starts it a few seconds after the scheduled time
+	sendDowntime(ctx, handle, "lifecycle START", types.DowntimeMessage{
+		Envelope: types.Envelope{Type: types.EventTypeDowntimeStart, Timestamp: actualStart},
+		Downtime: lifecycle,
+	})
+
+	actualStop := actualStart + 300 // an admin cancels it 5 minutes in, well before scheduledEnd
+	sendDowntime(ctx, handle, "lifecycle STOP (cancelled)", types.DowntimeMessage{
+		Envelope: types.Envelope{Type: types.EventTypeDowntimeStop, Attr: types.DowntimeAttrStopCancelled, Timestamp: actualStop},
+		Downtime: lifecycle,
+	})
+
+	sendDowntime(ctx, handle, "lifecycle DELETE", types.DowntimeMessage{
+		Envelope: types.Envelope{Type: types.EventTypeDowntimeDelete, Timestamp: actualStop + 1},
+		Downtime: lifecycle,
+	})
+
+	// --- wasNeverStarted edge case: ADD -> DELETE, no START/STOP at all ---
+	neverStartedHost := fmt.Sprintf("simulator-downtime-svc-host-%d", runSeed)
+	neverStartedID := lifecycleID + 1
+	neverStartedEntry := entryTime
+	neverStartedStart := neverStartedEntry + 3600 // scheduled an hour out
+	neverStartedEnd := neverStartedStart + 1800
+
+	neverStarted := types.DowntimePayload{
+		HostName:           neverStartedHost,
+		ServiceDescription: "Simulator Maintenance Window",
+		AuthorName:         "simulator",
+		CommentData:        "scripted wasNeverStarted demo - cancelled before it could start",
+		DowntimeType:       types.DowntimeTypeService,
+		EntryTime:          neverStartedEntry,
+		StartTime:          neverStartedStart,
+		EndTime:            neverStartedEnd,
+		DowntimeID:         neverStartedID,
+		Fixed:              1,
+		Duration:           int(neverStartedEnd - neverStartedStart),
+	}
+
+	sendDowntime(ctx, handle, "wasNeverStarted ADD", types.DowntimeMessage{
+		Envelope: types.Envelope{Type: types.EventTypeDowntimeAdd, Timestamp: neverStartedEntry},
+		Downtime: neverStarted,
+	})
+
+	// Deleted moments later - long before neverStartedStart is ever
+	// reached, so DetermineDowntimeActions must purge it from
+	// downtimehistory too, not just scheduleddowntimes.
+	sendDowntime(ctx, handle, "wasNeverStarted DELETE", types.DowntimeMessage{
+		Envelope: types.Envelope{Type: types.EventTypeDowntimeDelete, Timestamp: neverStartedEntry + 5},
+		Downtime: neverStarted,
+	})
+
+	slog.Info("simulator: downtime scenario done",
+		"lifecycle_downtime_id", lifecycleID, "lifecycle_host", lifecycleHost,
+		"never_started_downtime_id", neverStartedID, "never_started_host", neverStartedHost)
+}
+
+// sendDowntime marshals msg and hands it to handle, logging the outcome of
+// each step - this scenario is meant to be watched, not just asserted on in
+// a test, so every stage gets its own structured log line.
+func sendDowntime(ctx context.Context, handle queue.Handler, step string, msg types.DowntimeMessage) {
+	payload, err := json.Marshal(msg)
+	if err != nil {
+		slog.Error("simulator: marshal downtime scenario message failed", "step", step, "error", err)
+		return
+	}
+
+	if err := handle(ctx, payload); err != nil {
+		slog.Warn("simulator: downtime scenario step failed", "step", step, "error", err)
+		return
+	}
+
+	slog.Info("simulator: downtime scenario step sent", "step", step,
+		"downtime_id", msg.Downtime.DowntimeID, "host", msg.Downtime.HostName, "service", msg.Downtime.ServiceDescription)
 }
 
 // reportProgress logs achieved throughput every 2 seconds, so a run's

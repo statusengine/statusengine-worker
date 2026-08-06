@@ -13,6 +13,17 @@ A highly performant, concurrent Go-based event pipeline. It consumes bulk JSON m
 - **Queue Payload Examples:** Read JSON dumps in `/.claude/specs/` (Note: Each queue delivers a specific type, but payloads arrive as a JSON bulk array).
 - **Queue Payload Bulk Exceptions:** The Queues `statusngin_acknowledgements`, `statusngin_contactnotificationmethod.json`, `statusngin_core_restart.json` and `statusngin_downtimes` do not use bulk payloads.
 
+## Implementation Status
+Every queue is wired end-to-end in `internal/queue/registry.go`'s `NewRouter` - decoded, persisted to MySQL where applicable (rule 3), and broadcast (rule 4):
+
+- **Done** — Host/Service Status, Host/Service Checks, Perfdata (rule 5 MySQL/Graphite routing)
+- **Done** — Notifications (`statusngin_notifications`, `statusngin_contactnotificationmethod`)
+- **Done** — Acknowledgements (`statusngin_acknowledgements`)
+- **Done** — State Changes (`statusngin_statechanges`)
+- **Done** — Core Restarts (`statusngin_core_restart`)
+- **Done** — Downtimes (`statusngin_downtimes`) - full ADD/LOAD/START/STOP/DELETE lifecycle across the `scheduleddowntimes`/`downtimehistory` table pairs; doesn't use the BulkInserter abstraction (see `.claude/specs/downtime_ablauf.txt` for the processing matrix and why)
+- **Done** — Prometheus metrics exporter (`internal/metrics`, served on its own port, default `:9105/metrics`)
+
 ## Core Architecture Rules
 
 ### 1. Queue Abstraction (Pluggable Ingestion)
