@@ -90,6 +90,7 @@ The following queue names are also the WebSocket subscription topics:
 
 ```bash
 go build -o simulator ./cmd/simulator
+go build -o publisher ./cmd/publisher
 go build -o worker ./cmd/app
 ```
 
@@ -149,3 +150,34 @@ Known non-bulk exceptions:
 
 Legacy PHP implementation:
 https://github.com/statusengine/worker
+
+## Truncate all tables (development only)
+
+```SQL
+SET FOREIGN_KEY_CHECKS = 0;
+
+TRUNCATE TABLE statusengine_dbversion;
+TRUNCATE TABLE statusengine_host_acknowledgements;
+TRUNCATE TABLE statusengine_host_downtimehistory;
+TRUNCATE TABLE statusengine_host_notifications;
+TRUNCATE TABLE statusengine_host_notifications_log;
+TRUNCATE TABLE statusengine_host_scheduleddowntimes;
+TRUNCATE TABLE statusengine_host_statehistory;
+TRUNCATE TABLE statusengine_hostchecks;
+TRUNCATE TABLE statusengine_hoststatus;
+TRUNCATE TABLE statusengine_logentries;
+TRUNCATE TABLE statusengine_nodes;
+TRUNCATE TABLE statusengine_perfdata;
+TRUNCATE TABLE statusengine_service_acknowledgements;
+TRUNCATE TABLE statusengine_service_downtimehistory;
+TRUNCATE TABLE statusengine_service_notifications;
+TRUNCATE TABLE statusengine_service_notifications_log;
+TRUNCATE TABLE statusengine_service_scheduleddowntimes;
+TRUNCATE TABLE statusengine_service_statehistory;
+TRUNCATE TABLE statusengine_servicechecks;
+TRUNCATE TABLE statusengine_servicestatus;
+TRUNCATE TABLE statusengine_tasks;
+TRUNCATE TABLE statusengine_users;
+
+SET FOREIGN_KEY_CHECKS = 1;
+```

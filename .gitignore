@@ -1,3 +1,4 @@
-simulator
-worker
+/simulator
+/publisher
+/worker
 cmd/app/__debug_bin*

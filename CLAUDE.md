@@ -57,3 +57,4 @@ Every queue is wired end-to-end in `internal/queue/registry.go`'s `NewRouter` - 
 - **Initialize & Clean:** `go mod tidy`
 - **Run Application:** `go run cmd/app/main.go`
 - **Test Pipeline:** `go test ./... -v -race`
+- **Build Test Publisher:** `go build -o bin/publisher cmd/publisher/main.go` - standalone CLI that publishes synthetic test events for a single queue to a real Gearman job server (`-queue`, `-count`, `-server`), exercising the full Gearman → Router → BulkInserter path from outside the process; run with `go run cmd/publisher/main.go -queue statusngin_hoststatus -count 1000 -server localhost:4730`
