@@ -130,19 +130,19 @@ func newServiceStatusRow(nodeName string) db.RowFunc[serviceStatusEvent] {
 	}
 }
 
-func hostCheckRow(p types.HostCheckPayload) []any {
+func hostCheckRow(ev hostCheckEvent) []any {
 	return []any{
-		p.HostName, p.StartTime, p.State, isHardState(p.StateType), p.EndTime,
-		p.Output, p.LongOutput, p.Timeout, p.EarlyTimeout, p.Latency,
-		p.ExecutionTime, p.PerfData, p.CommandLine, p.CurrentAttempt, p.MaxAttempts,
+		ev.HostName, ev.StartTime, ev.TimestampUsec, ev.State, isHardState(ev.StateType), ev.EndTime,
+		ev.Output, ev.LongOutput, ev.Timeout, ev.EarlyTimeout, ev.Latency,
+		ev.ExecutionTime, ev.PerfData, ev.CommandLine, ev.CurrentAttempt, ev.MaxAttempts,
 	}
 }
 
-func serviceCheckRow(p types.ServiceCheckPayload) []any {
+func serviceCheckRow(ev serviceCheckEvent) []any {
 	return []any{
-		p.ServiceDescription, p.StartTime, p.HostName, p.State, isHardState(p.StateType), p.EndTime,
-		p.Output, p.LongOutput, p.Timeout, p.EarlyTimeout, p.Latency,
-		p.ExecutionTime, p.PerfData, p.CommandLine, p.CurrentAttempt, p.MaxAttempts,
+		ev.ServiceDescription, ev.StartTime, ev.TimestampUsec, ev.HostName, ev.State, isHardState(ev.StateType), ev.EndTime,
+		ev.Output, ev.LongOutput, ev.Timeout, ev.EarlyTimeout, ev.Latency,
+		ev.ExecutionTime, ev.PerfData, ev.CommandLine, ev.CurrentAttempt, ev.MaxAttempts,
 	}
 }
 
@@ -180,14 +180,14 @@ func serviceStateHistoryRow(ev stateChangeEvent) []any {
 
 func hostAcknowledgementRow(ev acknowledgementEvent) []any {
 	return []any{
-		ev.HostName, ev.EntryTime, ev.State, ev.AuthorName, ev.CommentData,
+		ev.HostName, ev.EntryTime, ev.EntryTimeUsec, ev.State, ev.AuthorName, ev.CommentData,
 		ev.AcknowledgementType, ev.IsSticky, ev.PersistentComment, ev.NotifyContacts,
 	}
 }
 
 func serviceAcknowledgementRow(ev acknowledgementEvent) []any {
 	return []any{
-		ev.ServiceDescription, ev.EntryTime, ev.HostName, ev.State, ev.AuthorName, ev.CommentData,
+		ev.ServiceDescription, ev.EntryTime, ev.EntryTimeUsec, ev.HostName, ev.State, ev.AuthorName, ev.CommentData,
 		ev.AcknowledgementType, ev.IsSticky, ev.PersistentComment, ev.NotifyContacts,
 	}
 }
@@ -598,13 +598,13 @@ func NewRouter(sqlDB *sql.DB, hub *websocket.Hub, gc *graphite.Client, perfdataR
 		serviceStatusColumns, serviceStatusUpdateColumns, newServiceStatusRow(nodeName))
 
 	hostChecks := db.NewBulkInserter(sqlDB, "statusengine_hostchecks",
-		[]string{"hostname", "start_time", "state", "is_hardstate", "end_time", "output", "long_output",
+		[]string{"hostname", "start_time", "start_time_usec", "state", "is_hardstate", "end_time", "output", "long_output",
 			"timeout", "early_timeout", "latency", "execution_time", "perfdata", "command",
 			"current_check_attempt", "max_check_attempts"},
 		hostCheckRow)
 
 	serviceChecks := db.NewBulkInserter(sqlDB, "statusengine_servicechecks",
-		[]string{"service_description", "start_time", "hostname", "state", "is_hardstate", "end_time", "output",
+		[]string{"service_description", "start_time", "start_time_usec", "hostname", "state", "is_hardstate", "end_time", "output",
 			"long_output", "timeout", "early_timeout", "latency", "execution_time", "perfdata", "command",
 			"current_check_attempt", "max_check_attempts"},
 		serviceCheckRow)
@@ -625,12 +625,12 @@ func NewRouter(sqlDB *sql.DB, hub *websocket.Hub, gc *graphite.Client, perfdataR
 		serviceStateHistoryRow)
 
 	hostAcks := db.NewBulkInserter(sqlDB, "statusengine_host_acknowledgements",
-		[]string{"hostname", "entry_time", "state", "author_name", "comment_data",
+		[]string{"hostname", "entry_time", "entry_time_usec", "state", "author_name", "comment_data",
 			"acknowledgement_type", "is_sticky", "persistent_comment", "notify_contacts"},
 		hostAcknowledgementRow)
 
 	serviceAcks := db.NewBulkInserter(sqlDB, "statusengine_service_acknowledgements",
-		[]string{"service_description", "entry_time", "hostname", "state", "author_name", "comment_data",
+		[]string{"service_description", "entry_time", "entry_time_usec", "hostname", "state", "author_name", "comment_data",
 			"acknowledgement_type", "is_sticky", "persistent_comment", "notify_contacts"},
 		serviceAcknowledgementRow)
 

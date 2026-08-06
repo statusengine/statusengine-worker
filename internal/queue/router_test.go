@@ -92,7 +92,7 @@ func TestNewHandlerPersistsAndBroadcasts(t *testing.T) {
 
 	conn := dialTopic(t, hub, QueueHostChecks)
 
-	fake := &fakeEnqueuer[types.HostCheckPayload]{}
+	fake := &fakeEnqueuer[hostCheckEvent]{}
 	handler := NewHandler(hub, QueueHostChecks, fake, decodeHostCheck)
 
 	if err := handler(ctx, readFixture(t, "statusngin_hostchecks.json")); err != nil {
@@ -123,7 +123,7 @@ func TestNewHandlerPropagatesEnqueueError(t *testing.T) {
 	defer cancel()
 	go hub.Run(ctx)
 
-	fake := &fakeEnqueuer[types.HostCheckPayload]{err: context.DeadlineExceeded}
+	fake := &fakeEnqueuer[hostCheckEvent]{err: context.DeadlineExceeded}
 	handler := NewHandler(hub, QueueHostChecks, fake, decodeHostCheck)
 
 	if err := handler(ctx, readFixture(t, "statusngin_hostchecks.json")); err == nil {
@@ -133,7 +133,7 @@ func TestNewHandlerPropagatesEnqueueError(t *testing.T) {
 
 func TestNewHandlerPropagatesDecodeError(t *testing.T) {
 	hub := websocket.NewHub()
-	fake := &fakeEnqueuer[types.HostCheckPayload]{}
+	fake := &fakeEnqueuer[hostCheckEvent]{}
 	handler := NewHandler(hub, QueueHostChecks, fake, decodeHostCheck)
 
 	if err := handler(context.Background(), []byte("not json")); err == nil {

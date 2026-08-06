@@ -68,29 +68,46 @@ func decodeServiceStatus(payload []byte) ([]serviceStatusEvent, error) {
 	return items, nil
 }
 
-func decodeHostCheck(payload []byte) ([]types.HostCheckPayload, error) {
+// hostCheckEvent augments types.HostCheckPayload with the envelope's
+// TimestampUsec: the hostcheck object's own start_time has no usec
+// counterpart, but statusengine_hostchecks keys its PRIMARY KEY on
+// (hostname, start_time, start_time_usec) - leaving it unset left every
+// check within the same second colliding on start_time_usec=0.
+type hostCheckEvent struct {
+	TimestampUsec int `json:"timestamp_usec"`
+	types.HostCheckPayload
+}
+
+func decodeHostCheck(payload []byte) ([]hostCheckEvent, error) {
 	var bulk types.HostCheckBulk
 	if err := json.Unmarshal(payload, &bulk); err != nil {
 		return nil, err
 	}
-	items := make([]types.HostCheckPayload, len(bulk.Messages))
+	items := make([]hostCheckEvent, len(bulk.Messages))
 	for i, m := range bulk.Messages {
-		items[i] = m.HostCheck
+		items[i] = hostCheckEvent{TimestampUsec: m.TimestampUsec, HostCheckPayload: m.HostCheck}
 	}
 	return items, nil
+}
+
+// serviceCheckEvent is the statusengine_servicechecks equivalent of
+// hostCheckEvent, for the same start_time_usec PRIMARY KEY reason.
+type serviceCheckEvent struct {
+	TimestampUsec int `json:"timestamp_usec"`
+	types.ServiceCheckPayload
 }
 
 // decodeServiceCheck is shared by the statusngin_servicechecks and
 // statusngin_service_perfdata queues - both deliver the same "servicecheck"
 // wire format (see types.ServiceCheckPayload's doc comment).
-func decodeServiceCheck(payload []byte) ([]types.ServiceCheckPayload, error) {
+func decodeServiceCheck(payload []byte) ([]serviceCheckEvent, error) {
 	var bulk types.ServiceCheckBulk
 	if err := json.Unmarshal(payload, &bulk); err != nil {
 		return nil, err
 	}
-	items := make([]types.ServiceCheckPayload, len(bulk.Messages))
+	items := make([]serviceCheckEvent, len(bulk.Messages))
 	for i, m := range bulk.Messages {
-		items[i] = m.ServiceCheck
+		items[i] = serviceCheckEvent{TimestampUsec: m.TimestampUsec, ServiceCheckPayload: m.ServiceCheck}
 	}
 	return items, nil
 }
