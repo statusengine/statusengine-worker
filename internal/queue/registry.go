@@ -146,8 +146,14 @@ func serviceCheckRow(ev serviceCheckEvent) []any {
 	}
 }
 
-func logEntryRow(p types.LogEntryPayload) []any {
-	return []any{p.EntryTime, p.DataType, p.Data}
+// newLogEntryRow returns a RowFunc for statusengine_logentries, closing over
+// nodeName since it comes from process configuration rather than the event
+// itself (CLAUDE.md: worker-wide "nodename" option) - the logentry payload
+// carries no node identifier of its own (see .claude/specs/statusngin_logentries.json).
+func newLogEntryRow(nodeName string) db.RowFunc[types.LogEntryPayload] {
+	return func(p types.LogEntryPayload) []any {
+		return []any{p.EntryTime, p.DataType, p.Data, nodeName}
+	}
 }
 
 func hostStateHistoryRow(ev stateChangeEvent) []any {
@@ -610,8 +616,8 @@ func NewRouter(sqlDB *sql.DB, hub *websocket.Hub, gc *graphite.Client, perfdataR
 		serviceCheckRow)
 
 	logEntries := db.NewBulkInserter(sqlDB, "statusengine_logentries",
-		[]string{"entry_time", "logentry_type", "logentry_data"},
-		logEntryRow)
+		[]string{"entry_time", "logentry_type", "logentry_data", "node_name"},
+		newLogEntryRow(nodeName))
 
 	hostStateHistory := db.NewBulkInserter(sqlDB, "statusengine_host_statehistory",
 		[]string{"hostname", "state_time", "state_time_usec", "state_change", "state", "is_hardstate",
