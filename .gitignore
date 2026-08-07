@@ -2,4 +2,5 @@
 /gearman_publisher
 /rabbitmq_publisher
 /worker
+/db_verifier
 cmd/app/__debug_bin*
