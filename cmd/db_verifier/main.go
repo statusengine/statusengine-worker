@@ -40,12 +40,14 @@ type tableSpec struct {
 	orderBy   []string
 }
 
-// tableSpecs covers every event table CLAUDE.md's pipeline writes to -
-// every Status, History, Notification, Acknowledgement, Check and
-// Scheduled-Downtime table in .claude/specs/mysql_schema.sql. Tables that
-// carry no event data of their own (statusengine_dbversion, statusengine_nodes,
-// statusengine_tasks, statusengine_users) are intentionally left out: there's
-// nothing meaningful to shadow-compare there.
+// tableSpecs covers every table in .claude/specs/mysql_schema.sql, including
+// the four (statusengine_dbversion, statusengine_nodes, statusengine_tasks,
+// statusengine_users) this worker's pipeline never writes to itself - a
+// shadow-test run showing those as identical (or flagging a real gap) is
+// still useful signal, so they're included rather than assumed irrelevant.
+// None of those four - nor statusengine_perfdata - have a real PRIMARY KEY
+// in the schema, so their pkColumns below are a best-effort composite of
+// columns that make a row unique in practice, not a documented PK.
 var tableSpecs = map[string]tableSpec{
 	"statusengine_hoststatus": {
 		pkColumns: []string{"hostname"},
@@ -115,12 +117,32 @@ var tableSpecs = map[string]tableSpec{
 		pkColumns: []string{"id", "entry_time"},
 		orderBy:   []string{"entry_time", "id"},
 	},
+	"statusengine_dbversion": {
+		pkColumns: []string{"id"},
+		orderBy:   []string{"id"},
+	},
+	"statusengine_nodes": {
+		pkColumns: []string{"node_name"},
+		orderBy:   []string{"node_name"},
+	},
+	"statusengine_perfdata": {
+		pkColumns: []string{"hostname", "service_description", "label", "timestamp", "timestamp_unix"},
+		orderBy:   []string{"timestamp_unix"},
+	},
+	"statusengine_tasks": {
+		pkColumns: []string{"uuid", "entry_time"},
+		orderBy:   []string{"entry_time"},
+	},
+	"statusengine_users": {
+		pkColumns: []string{"username"},
+		orderBy:   []string{"username"},
+	},
 }
 
-// defaultTables is "alle Status-, History-, Notification- und Check-Tabellen" -
-// the -tables flag's default scope, per the requested default. -tables can
-// still name any other key of tableSpecs (e.g. the acknowledgement or
-// scheduled-downtime tables) explicitly.
+// defaultTables intentionally excludes statusengine_dbversion,
+// statusengine_nodes, statusengine_perfdata, statusengine_tasks and
+// statusengine_users from the default run; -tables can still name any of
+// those five explicitly (they stay in tableSpecs).
 var defaultTables = []string{
 	"statusengine_hoststatus",
 	"statusengine_servicestatus",
@@ -134,6 +156,11 @@ var defaultTables = []string{
 	"statusengine_host_notifications_log",
 	"statusengine_service_notifications",
 	"statusengine_service_notifications_log",
+	"statusengine_host_acknowledgements",
+	"statusengine_service_acknowledgements",
+	"statusengine_host_scheduleddowntimes",
+	"statusengine_service_scheduleddowntimes",
+	"statusengine_logentries",
 }
 
 func main() {
@@ -141,7 +168,7 @@ func main() {
 
 	dsnPHP := flag.String("dsn-php", "", "MySQL DSN of the legacy PHP worker's database (go-sql-driver/mysql format, e.g. user:pass@tcp(127.0.0.1:3306)/statusengine_php)")
 	dsnGo := flag.String("dsn-go", "", "MySQL DSN of this Go worker's database")
-	tablesFlag := flag.String("tables", strings.Join(defaultTables, ","), "comma-separated list of tables to verify (default: all Status/Check/History/Notification tables)")
+	tablesFlag := flag.String("tables", strings.Join(defaultTables, ","), "comma-separated list of tables to verify (default: all Status/Check/History/Notification/Acknowledgement/Downtime/Logentries tables)")
 	limit := flag.Int("limit", 5000, "maximum number of most-recent rows to compare per table")
 	flag.Parse()
 
