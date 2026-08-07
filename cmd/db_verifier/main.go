@@ -15,6 +15,7 @@ import (
 	"log/slog"
 	"os"
 	"sort"
+	"strconv"
 	"strings"
 	"time"
 
@@ -116,13 +117,15 @@ var tableSpecs = map[string]tableSpec{
 	},
 }
 
-// defaultTables is "alle Status-, History- und Notification-Tabellen" - the
-// -tables flag's default scope, per the requested default. -tables can
-// still name any other key of tableSpecs (e.g. the check or acknowledgement
-// tables) explicitly.
+// defaultTables is "alle Status-, History-, Notification- und Check-Tabellen" -
+// the -tables flag's default scope, per the requested default. -tables can
+// still name any other key of tableSpecs (e.g. the acknowledgement or
+// scheduled-downtime tables) explicitly.
 var defaultTables = []string{
 	"statusengine_hoststatus",
 	"statusengine_servicestatus",
+	"statusengine_hostchecks",
+	"statusengine_servicechecks",
 	"statusengine_host_statehistory",
 	"statusengine_service_statehistory",
 	"statusengine_host_downtimehistory",
@@ -138,7 +141,7 @@ func main() {
 
 	dsnPHP := flag.String("dsn-php", "", "MySQL DSN of the legacy PHP worker's database (go-sql-driver/mysql format, e.g. user:pass@tcp(127.0.0.1:3306)/statusengine_php)")
 	dsnGo := flag.String("dsn-go", "", "MySQL DSN of this Go worker's database")
-	tablesFlag := flag.String("tables", strings.Join(defaultTables, ","), "comma-separated list of tables to verify (default: all Status/History/Notification tables)")
+	tablesFlag := flag.String("tables", strings.Join(defaultTables, ","), "comma-separated list of tables to verify (default: all Status/Check/History/Notification tables)")
 	limit := flag.Int("limit", 5000, "maximum number of most-recent rows to compare per table")
 	flag.Parse()
 
@@ -267,6 +270,13 @@ func verifyTable(ctx context.Context, phpDB, goDB *sql.DB, table string, spec ta
 		return nil, 0, fmt.Errorf("fetch from go db: %w", err)
 	}
 
+	// Both databases mirror the same schema (see .claude/specs/mysql_schema.sql),
+	// so it's enough to ask either one which columns are DOUBLE/FLOAT.
+	floatCols, err := floatColumns(ctx, phpDB, table)
+	if err != nil {
+		return nil, 0, fmt.Errorf("resolve float columns for %s: %w", table, err)
+	}
+
 	var mismatches []mismatch
 	rowsVerified := 0
 
@@ -286,17 +296,16 @@ func verifyTable(ctx context.Context, phpDB, goDB *sql.DB, table string, spec ta
 
 		rowIdentical := true
 		for _, col := range columns {
-			phpVal := normalize(phpRow[col])
-			goVal := normalize(goRow[col])
-			if phpVal != goVal {
-				mismatches = append(mismatches, mismatch{
-					pk:       pk,
-					column:   col,
-					phpValue: displayValue(phpRow[col]),
-					goValue:  displayValue(goRow[col]),
-				})
-				rowIdentical = false
+			if valuesEqual(phpRow[col], goRow[col], floatCols[col]) {
+				continue
 			}
+			mismatches = append(mismatches, mismatch{
+				pk:       pk,
+				column:   col,
+				phpValue: displayValue(phpRow[col]),
+				goValue:  displayValue(goRow[col]),
+			})
+			rowIdentical = false
 		}
 		if rowIdentical {
 			rowsVerified++
@@ -393,16 +402,78 @@ func unionKeys(a, b map[string]row) []string {
 // known to differ on without it being a real data bug: PHP's mysqli driver
 // and Go's database/sql driver don't always agree on NULL vs. an empty
 // string for optional varchar columns (e.g. author_name, comment_data), so
-// a SQL NULL and a zero-length string compare as equal here. Every other
-// value (numbers, timestamps, non-empty strings) is compared exactly as
-// MySQL's own text protocol formatted it - which is the same formatting
-// regardless of which client originally wrote the row, so no further
-// normalization (e.g. of numeric precision) is needed.
+// a SQL NULL and a zero-length string compare as equal here.
 func normalize(v sql.NullString) string {
 	if !v.Valid {
 		return ""
 	}
 	return v.String
+}
+
+// phpFloatPrecision matches PHP's default `precision` ini setting: PHP's
+// float-to-string conversion (what mysqli sends over the wire for a bound
+// float parameter) keeps only this many significant decimal digits. Go's
+// driver, in contrast, returns MySQL's full round-tripped float64 text for
+// a DOUBLE column. So the same event, persisted correctly by both workers,
+// legitimately ends up stored as two different-looking (but equally
+// correct) DOUBLE values - e.g. PHP's `0.145022` vs Go's
+// `0.14502199999999998`. Rounding both to this same precision before
+// comparing is what makes valuesEqual treat them as identical instead of
+// reporting a false MISMATCH.
+const phpFloatPrecision = 14
+
+// roundLikePHP formats f at phpFloatPrecision significant digits, the same
+// way PHP's string cast would when it originally wrote this value.
+func roundLikePHP(f float64) string {
+	return strconv.FormatFloat(f, 'g', phpFloatPrecision, 64)
+}
+
+// valuesEqual compares one column's PHP-side and Go-side value. Non-float
+// columns (and float columns that fail to parse, e.g. because both sides
+// are NULL) are compared exactly via normalize. Float columns get an extra
+// chance: if the exact strings differ only because of the phpFloatPrecision
+// rounding noise described above, they still count as equal.
+func valuesEqual(phpVal, goVal sql.NullString, isFloatCol bool) bool {
+	a, b := normalize(phpVal), normalize(goVal)
+	if a == b {
+		return true
+	}
+	if !isFloatCol {
+		return false
+	}
+	af, aErr := strconv.ParseFloat(a, 64)
+	bf, bErr := strconv.ParseFloat(b, 64)
+	if aErr != nil || bErr != nil {
+		return false
+	}
+	return roundLikePHP(af) == roundLikePHP(bf)
+}
+
+// floatColumns asks db which of table's columns are DOUBLE/FLOAT, so
+// valuesEqual knows which columns are eligible for PHP-precision rounding.
+// Determined dynamically via INFORMATION_SCHEMA rather than a hardcoded
+// column list, so it stays correct even if the schema changes.
+func floatColumns(ctx context.Context, db *sql.DB, table string) (map[string]bool, error) {
+	rows, err := db.QueryContext(ctx,
+		"SELECT COLUMN_NAME FROM INFORMATION_SCHEMA.COLUMNS WHERE TABLE_SCHEMA = DATABASE() AND TABLE_NAME = ? AND DATA_TYPE IN ('double', 'float')",
+		table)
+	if err != nil {
+		return nil, fmt.Errorf("query information_schema for %s: %w", table, err)
+	}
+	defer rows.Close()
+
+	cols := make(map[string]bool)
+	for rows.Next() {
+		var col string
+		if err := rows.Scan(&col); err != nil {
+			return nil, fmt.Errorf("scan information_schema for %s: %w", table, err)
+		}
+		cols[col] = true
+	}
+	if err := rows.Err(); err != nil {
+		return nil, fmt.Errorf("iterate information_schema for %s: %w", table, err)
+	}
+	return cols, nil
 }
 
 // displayValue renders v the way a human reads a MISMATCH line: SQL NULL as

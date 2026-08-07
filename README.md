@@ -92,6 +92,7 @@ The following queue names are also the WebSocket subscription topics:
 go build -o simulator ./cmd/simulator
 go build -o gearman_publisher ./cmd/gearman_publisher
 go build -o rabbitmq_publisher ./cmd/rabbitmq_publisher
+go build -o db_verifier ./cmd/db_verifier
 go build -o worker ./cmd/app
 ```
 
