@@ -242,7 +242,8 @@ func decodeDowntimeMessage(payload []byte) (types.DowntimeMessage, error) {
 	return msg, nil
 }
 
-// decodeCoreRestart has no envelope at all - just {"object_type": 102}.
+// decodeCoreRestart has no envelope at all - just {"object_type": 102,
+// "timestamp": ...} (see types.CoreRestartMessage.Timestamp).
 func decodeCoreRestart(payload []byte) ([]types.CoreRestartMessage, error) {
 	var msg types.CoreRestartMessage
 	if err := json.Unmarshal(payload, &msg); err != nil {

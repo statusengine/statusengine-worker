@@ -304,18 +304,25 @@ func newNotificationHandler(hub *websocket.Hub, topic string, hostIns, serviceIn
 }
 
 // coreRestartObjectType is the Nagios/Icinga/Naemon broker object type for a
-// monitoring core restart (see .claude/specs/statusngin_core_restart.json,
-// whose only field is {"object_type": 102}). Every other object_type value
-// on this queue is ignored.
+// monitoring core restart (see .claude/specs/statusngin_core_restart.json).
+// Every other object_type value on this queue is ignored.
 const coreRestartObjectType = 102
 
-// hoststatusTruncateQuery/servicestatusTruncateQuery discard every current
-// status row unconditionally: on a core restart, every host/service will
-// report its status again shortly, so stale rows would otherwise linger
-// forever for objects removed from the config in the meantime.
+// hoststatusStaleDeleteQuery/servicestatusStaleDeleteQuery replace what used
+// to be an unconditional TRUNCATE: statusngin_hoststatus/statusngin_servicestatus
+// are consumed on their own separate Gearman/RabbitMQ queues from
+// statusngin_core_restart, with no ordering guarantee between them, so a
+// handful of already-fresh post-restart status events can race ahead and
+// land in the table before this handler's TRUNCATE ran - which a blind
+// TRUNCATE would then wipe right back out, leaving those hosts/services
+// without a row until their next check. Deleting only rows whose
+// status_update_time predates the restart's own cutoff (see
+// newCoreRestartHandler) keeps genuinely stale pre-restart rows gone while
+// letting any row that raced ahead - its status_update_time is at or after
+// the cutoff - survive.
 const (
-	hoststatusTruncateQuery    = "TRUNCATE TABLE statusengine_hoststatus;"
-	servicestatusTruncateQuery = "TRUNCATE TABLE statusengine_servicestatus;"
+	hoststatusStaleDeleteQuery    = "DELETE FROM statusengine_hoststatus WHERE status_update_time < ?"
+	servicestatusStaleDeleteQuery = "DELETE FROM statusengine_servicestatus WHERE status_update_time < ?"
 )
 
 // hoststatusOpenITCockpitDeleteQuery/servicestatusOpenITCockpitDeleteQuery
@@ -342,11 +349,15 @@ type tableCleaner interface {
 
 // newCoreRestartHandler reacts only to object_type 102 (a monitoring core
 // restart): it logs, publishes the event, then clears out stale
-// hoststatus/servicestatus rows - via TRUNCATE, or via the openITCockpit-aware
-// DELETE queries above when enableOpenITCockpitTweaks is set - pausing each
-// BulkInserter for the duration of its own table's cleanup query.
+// hoststatus/servicestatus rows - via the status_update_time-based DELETE
+// above, or via the openITCockpit-aware existence-based DELETE queries when
+// enableOpenITCockpitTweaks is set (that variant needs no cutoff: it never
+// removes a row for a host/service that still exists, fresh or not, so it
+// isn't exposed to the race hoststatusStaleDeleteQuery's cutoff guards
+// against) - pausing each BulkInserter for the duration of its own table's
+// cleanup query.
 func newCoreRestartHandler(hub *websocket.Hub, topic string, sqlDB *sql.DB, hostStatus, serviceStatus tableCleaner, enableOpenITCockpitTweaks bool) Handler {
-	hostQuery, serviceQuery := hoststatusTruncateQuery, servicestatusTruncateQuery
+	hostQuery, serviceQuery := hoststatusStaleDeleteQuery, servicestatusStaleDeleteQuery
 	if enableOpenITCockpitTweaks {
 		hostQuery, serviceQuery = hoststatusOpenITCockpitDeleteQuery, servicestatusOpenITCockpitDeleteQuery
 	}
@@ -362,18 +373,35 @@ func newCoreRestartHandler(hub *websocket.Hub, topic string, sqlDB *sql.DB, host
 				continue
 			}
 
+			// cutoff is captured now, before WithPaused's own Flush-then-pause
+			// sequence runs, so it reflects the moment the restart was
+			// noticed rather than the (slightly later) moment the DELETE
+			// actually executes - see hoststatusStaleDeleteQuery's doc
+			// comment for why that matters. ev.Timestamp lets a future
+			// Naemon that stamps this event override the wall clock
+			// explicitly; today it's always 0 (unset), so the wall clock is
+			// what's actually used.
+			cutoff := ev.Timestamp
+			if cutoff <= 0 {
+				cutoff = time.Now().Unix()
+			}
+			var cleanupArgs []any
+			if !enableOpenITCockpitTweaks {
+				cleanupArgs = []any{cutoff}
+			}
+
 			slog.Info("Catch monitoring restart. Trigger callbacks...")
 			publish(hub, topic, ev)
 
 			if err := hostStatus.WithPaused(ctx, func(ctx context.Context) error {
-				_, err := sqlDB.ExecContext(ctx, hostQuery)
+				_, err := sqlDB.ExecContext(ctx, hostQuery, cleanupArgs...)
 				return err
 			}); err != nil {
 				return fmt.Errorf("queue: %s hoststatus cleanup: %w", topic, err)
 			}
 
 			if err := serviceStatus.WithPaused(ctx, func(ctx context.Context) error {
-				_, err := sqlDB.ExecContext(ctx, serviceQuery)
+				_, err := sqlDB.ExecContext(ctx, serviceQuery, cleanupArgs...)
 				return err
 			}); err != nil {
 				return fmt.Errorf("queue: %s servicestatus cleanup: %w", topic, err)

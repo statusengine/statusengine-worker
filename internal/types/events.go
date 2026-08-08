@@ -405,4 +405,11 @@ type DowntimeMessage struct {
 // statusngin_core_restart queue.
 type CoreRestartMessage struct {
 	ObjectType int `json:"object_type"`
+	// Timestamp is an optional unix timestamp of the restart itself. Naemon
+	// doesn't send this field today - .claude/specs/statusngin_core_restart.json
+	// documents it as 0 - so newCoreRestartHandler treats 0 as "not set" and
+	// falls back to its own wall-clock time as the stale-row cutoff instead.
+	// The field exists now so a future Naemon that does send it needs no
+	// further change here.
+	Timestamp int64 `json:"timestamp"`
 }
