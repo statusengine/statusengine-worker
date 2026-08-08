@@ -55,8 +55,12 @@ func perfdataRow(m perfdataMetric) []any {
 }
 
 // graphiteMetricPath renders a perfdataMetric's dotted Graphite path,
-// sanitizing hostname/service/label so a literal "." or " " in any of them
-// can't inject a bogus path segment.
+// sanitizing hostname/service/label so a literal ".", " " or quote
+// character in any of them can't inject a bogus path segment. Label may
+// carry a leading/trailing "'" (parsePerfData deliberately keeps a quoted
+// metric's quote characters, matching the legacy worker's
+// statusengine_perfdata.label - see perfdata.go), which would otherwise
+// flow into the Graphite path unsanitized.
 func graphiteMetricPath(m perfdataMetric) string {
 	return strings.Join([]string{
 		"statusengine",
@@ -66,7 +70,7 @@ func graphiteMetricPath(m perfdataMetric) string {
 	}, ".")
 }
 
-var graphitePathReplacer = strings.NewReplacer(".", "_", " ", "_")
+var graphitePathReplacer = strings.NewReplacer(".", "_", " ", "_", "'", "_", "\"", "_")
 
 func sanitizeGraphitePathSegment(s string) string {
 	return graphitePathReplacer.Replace(s)

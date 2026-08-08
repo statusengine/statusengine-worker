@@ -27,9 +27,32 @@ func TestParsePerfData(t *testing.T) {
 			},
 		},
 		{
-			name: "quoted label containing spaces",
+			// The legacy worker keeps the quote characters as part of the
+			// label rather than stripping them - see perfdata.go's doc
+			// comment - so statusengine_perfdata.label matches it exactly.
+			name: "single-quoted label containing spaces keeps its quotes",
 			raw:  "'response time'=0.5s;1;2;0",
-			want: []perfDataPoint{{Label: "response time", Value: 0.5, Unit: "s"}},
+			want: []perfDataPoint{{Label: "'response time'", Value: 0.5, Unit: "s"}},
+		},
+		{
+			name: "double-quoted label containing spaces is normalized to single quotes",
+			raw:  `"response time"=0.5s;1;2;0`,
+			want: []perfDataPoint{{Label: "'response time'", Value: 0.5, Unit: "s"}},
+		},
+		{
+			name: "comma decimal separator is normalized to a dot",
+			raw:  "temp=3,7C;;;",
+			want: []perfDataPoint{{Label: "temp", Value: 3.7, Unit: "C"}},
+		},
+		{
+			name: "negative comma decimal separator is normalized to a dot",
+			raw:  "temp=-1,5C;;;",
+			want: []perfDataPoint{{Label: "temp", Value: -1.5, Unit: "C"}},
+		},
+		{
+			name: "doubled percent unit collapses to a single percent",
+			raw:  "pl=0%%;20;60;0",
+			want: []perfDataPoint{{Label: "pl", Value: 0, Unit: "%"}},
 		},
 		{
 			name: "negative and signed values",
