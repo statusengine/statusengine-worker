@@ -621,10 +621,13 @@ func newAcknowledgementHandler(hub *websocket.Hub, topic string, hostIns, servic
 //
 // nodeName is written into every hoststatus/servicestatus row's node_name
 // column (worker-wide "nodename" config option, default "statusengine").
+// graphitePrefix is prepended to every Graphite path NewPerfdataHandler
+// builds (worker-wide "graphite_prefix" config option, default
+// "statusengine") - see processor.go's graphiteMetricPath.
 // enableOpenITCockpitTweaks selects which query newCoreRestartHandler uses
 // to clear hoststatus/servicestatus on a core restart (worker-wide
 // "ENABLE_OPENITCOCKPIT_TWEAKS" config option, default false).
-func NewRouter(sqlDB *sql.DB, hub *websocket.Hub, gc *graphite.Client, perfdataRoute PerfdataRoute, nodeName string, enableOpenITCockpitTweaks bool) (Router, []Runner) {
+func NewRouter(sqlDB *sql.DB, hub *websocket.Hub, gc *graphite.Client, perfdataRoute PerfdataRoute, graphitePrefix, nodeName string, enableOpenITCockpitTweaks bool) (Router, []Runner) {
 	hostStatus := db.NewUpsertBulkInserter(sqlDB, "statusengine_hoststatus",
 		hostStatusColumns, hostStatusUpdateColumns, newHostStatusRow(nodeName))
 
@@ -698,7 +701,7 @@ func NewRouter(sqlDB *sql.DB, hub *websocket.Hub, gc *graphite.Client, perfdataR
 		QueueLogEntries:                NewHandler(hub, QueueLogEntries, logEntries, decodeLogEntry),
 		QueueStateChanges:              newStateChangeHandler(hub, QueueStateChanges, hostStateHistory, serviceStateHistory),
 		QueueAcknowledgements:          newAcknowledgementHandler(hub, QueueAcknowledgements, hostAcks, serviceAcks),
-		QueueServicePerfdata:           NewPerfdataHandler(hub, QueueServicePerfdata, perfdataRoute, perfdata, gc),
+		QueueServicePerfdata:           NewPerfdataHandler(hub, QueueServicePerfdata, perfdataRoute, perfdata, gc, graphitePrefix),
 		QueueHostStatus:                NewHandler(hub, QueueHostStatus, hostStatus, decodeHostStatus),
 		QueueServiceStatus:             NewHandler(hub, QueueServiceStatus, serviceStatus, decodeServiceStatus),
 		QueueContactNotificationMethod: newContactNotificationMethodHandler(hub, QueueContactNotificationMethod, hostNotifications, serviceNotifications),

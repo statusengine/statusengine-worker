@@ -36,6 +36,7 @@ type config struct {
 	listenAddr                string
 	metricsListenAddr         string
 	graphiteAddr              string
+	graphitePrefix            string // prepended to every Graphite path, e.g. "statusengine.<host>.<service>.<metric>"
 	perfdataRoute             string // "mysql", "graphite" or "both"
 	nodeName                  string // written into hoststatus/servicestatus rows' node_name column
 	enableOpenITCockpitTweaks bool   // selects the core-restart hoststatus/servicestatus cleanup query
@@ -60,6 +61,8 @@ func loadConfig() config {
 		"address the Prometheus /metrics HTTP server listens on")
 	flag.StringVar(&cfg.graphiteAddr, "graphite-addr", envOrDefault("STATUSENGINE_GRAPHITE_ADDR", "127.0.0.1:2003"),
 		"Graphite Carbon plaintext receiver address (host:port)")
+	flag.StringVar(&cfg.graphitePrefix, "graphite-prefix", envOrDefault("STATUSENGINE_GRAPHITE_PREFIX", "statusengine"),
+		"prefix prepended to every Graphite metric path (prefix.hostname.service_description.label)")
 	flag.StringVar(&cfg.perfdataRoute, "perfdata-route", envOrDefault("STATUSENGINE_PERFDATA_ROUTE", "mysql"),
 		`where statusngin_service_perfdata metrics are written: "mysql", "graphite" or "both" (CLAUDE.md rule 5)`)
 	flag.StringVar(&cfg.nodeName, "nodename", envOrDefault("STATUSENGINE_NODENAME", "statusengine"),
@@ -196,7 +199,7 @@ func main() {
 	// connection is ever dialed (CLAUDE.md rule 5).
 	gc := graphite.NewClient(cfg.graphiteAddr)
 
-	router, runners := queue.NewRouter(sqlDB, hub, gc, perfdataRoute, cfg.nodeName, cfg.enableOpenITCockpitTweaks)
+	router, runners := queue.NewRouter(sqlDB, hub, gc, perfdataRoute, cfg.graphitePrefix, cfg.nodeName, cfg.enableOpenITCockpitTweaks)
 	for _, r := range runners {
 		wg.Add(1)
 		go func(r queue.Runner) {

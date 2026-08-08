@@ -83,7 +83,7 @@ func TestNewPerfdataHandlerRouteMySQLOnly(t *testing.T) {
 
 	mysqlIns := &fakeEnqueuer[perfdataMetric]{}
 	gc := &fakeGraphiteEnqueuer{}
-	handler := NewPerfdataHandler(hub, QueueServicePerfdata, PerfdataRouteMySQL, mysqlIns, gc)
+	handler := NewPerfdataHandler(hub, QueueServicePerfdata, PerfdataRouteMySQL, mysqlIns, gc, "statusengine")
 
 	if err := handler(ctx, readFixture(t, "statusngin_service_perfdata.json")); err != nil {
 		t.Fatalf("handler: %v", err)
@@ -117,7 +117,7 @@ func TestNewPerfdataHandlerRouteGraphiteOnly(t *testing.T) {
 
 	mysqlIns := &fakeEnqueuer[perfdataMetric]{}
 	gc := &fakeGraphiteEnqueuer{}
-	handler := NewPerfdataHandler(hub, QueueServicePerfdata, PerfdataRouteGraphite, mysqlIns, gc)
+	handler := NewPerfdataHandler(hub, QueueServicePerfdata, PerfdataRouteGraphite, mysqlIns, gc, "statusengine")
 
 	if err := handler(ctx, readFixture(t, "statusngin_service_perfdata.json")); err != nil {
 		t.Fatalf("handler: %v", err)
@@ -143,7 +143,7 @@ func TestNewPerfdataHandlerRouteBoth(t *testing.T) {
 
 	mysqlIns := &fakeEnqueuer[perfdataMetric]{}
 	gc := &fakeGraphiteEnqueuer{}
-	handler := NewPerfdataHandler(hub, QueueServicePerfdata, PerfdataRouteBoth, mysqlIns, gc)
+	handler := NewPerfdataHandler(hub, QueueServicePerfdata, PerfdataRouteBoth, mysqlIns, gc, "statusengine")
 
 	if err := handler(ctx, readFixture(t, "statusngin_service_perfdata.json")); err != nil {
 		t.Fatalf("handler: %v", err)
@@ -157,14 +157,58 @@ func TestNewPerfdataHandlerRouteBoth(t *testing.T) {
 	}
 }
 
-func TestGraphiteMetricPathSanitizesDotsAndSpaces(t *testing.T) {
-	m := perfdataMetric{
-		HostName:           "host.example.com",
-		ServiceDescription: "Disk Usage /var",
-		Label:              "used bytes",
+func TestGraphiteMetricPathSanitizesIllegalCharacters(t *testing.T) {
+	tests := []struct {
+		name   string
+		prefix string
+		m      perfdataMetric
+		want   string
+	}{
+		{
+			// '.' is in the legacy whitelist (see graphiteIllegalCharacters'
+			// doc comment), so a literal dot in e.g. a fully-qualified
+			// hostname passes through unsanitized, same as the legacy
+			// worker - it's the spaces and the slash that get replaced.
+			name:   "spaces and a slash, dot passes through",
+			prefix: "statusengine",
+			m: perfdataMetric{
+				HostName:           "host.example.com",
+				ServiceDescription: "Disk Usage /var",
+				Label:              "used bytes",
+			},
+			want: "statusengine.host.example.com.Disk_Usage__var.used_bytes",
+		},
+		{
+			// Confirms the fix requested for a real Graphite rollout: umlauts
+			// and other non-ASCII characters must never reach Graphite raw.
+			name:   "umlauts and a quoted label",
+			prefix: "statusengine",
+			m: perfdataMetric{
+				HostName:           "groesse-example",
+				ServiceDescription: "Prüfung",
+				Label:              "'response time'",
+			},
+			want: "statusengine.groesse-example.Pr_fung._response_time_",
+		},
+		{
+			// graphite_prefix itself is sanitized too, mirroring the legacy
+			// worker's replaceIllegalCharacters($this->prefix).
+			name:   "illegal characters in the configured prefix",
+			prefix: "my prefix!",
+			m: perfdataMetric{
+				HostName:           "localhost",
+				ServiceDescription: "Ping",
+				Label:              "rta",
+			},
+			want: "my_prefix_.localhost.Ping.rta",
+		},
 	}
-	want := "statusengine.host_example_com.Disk_Usage_/var.used_bytes"
-	if got := graphiteMetricPath(m); got != want {
-		t.Fatalf("graphiteMetricPath() = %q, want %q", got, want)
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			if got := graphiteMetricPath(sanitizeGraphitePathSegment(tt.prefix), tt.m); got != tt.want {
+				t.Fatalf("graphiteMetricPath() = %q, want %q", got, tt.want)
+			}
+		})
 	}
 }

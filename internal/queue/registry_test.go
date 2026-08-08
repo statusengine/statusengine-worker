@@ -38,7 +38,7 @@ func openTestDB(t *testing.T) *sql.DB {
 func TestNewRouterCoversAllQueues(t *testing.T) {
 	sqlDB := openTestDB(t)
 	hub := websocket.NewHub()
-	router, runners := NewRouter(sqlDB, hub, graphite.NewClient("127.0.0.1:2003"), PerfdataRouteMySQL, "statusengine-test", false)
+	router, runners := NewRouter(sqlDB, hub, graphite.NewClient("127.0.0.1:2003"), PerfdataRouteMySQL, "statusengine-test", "statusengine-test", false)
 
 	want := []string{
 		QueueHostStatus, QueueServiceStatus, QueueHostChecks, QueueServiceChecks,
@@ -83,7 +83,7 @@ func runAllAndFlush(t *testing.T, runners []Runner) context.Context {
 func TestHostCheckHandlerPersistsToMySQL(t *testing.T) {
 	sqlDB := openTestDB(t)
 	hub := websocket.NewHub()
-	router, runners := NewRouter(sqlDB, hub, graphite.NewClient("127.0.0.1:2003"), PerfdataRouteMySQL, "statusengine-test", false)
+	router, runners := NewRouter(sqlDB, hub, graphite.NewClient("127.0.0.1:2003"), PerfdataRouteMySQL, "statusengine-test", "statusengine-test", false)
 	ctx := runAllAndFlush(t, runners)
 	go hub.Run(ctx)
 
@@ -145,7 +145,7 @@ func TestHostCheckHandlerPersistsToMySQL(t *testing.T) {
 func TestAcknowledgementHandlerRoutesToHostAndServiceTables(t *testing.T) {
 	sqlDB := openTestDB(t)
 	hub := websocket.NewHub()
-	router, runners := NewRouter(sqlDB, hub, graphite.NewClient("127.0.0.1:2003"), PerfdataRouteMySQL, "statusengine-test", false)
+	router, runners := NewRouter(sqlDB, hub, graphite.NewClient("127.0.0.1:2003"), PerfdataRouteMySQL, "statusengine-test", "statusengine-test", false)
 	ctx := runAllAndFlush(t, runners)
 	go hub.Run(ctx)
 
