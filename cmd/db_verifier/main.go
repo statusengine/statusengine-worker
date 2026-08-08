@@ -140,9 +140,10 @@ var tableSpecs = map[string]tableSpec{
 }
 
 // defaultTables intentionally excludes statusengine_dbversion,
-// statusengine_nodes, statusengine_perfdata, statusengine_tasks and
-// statusengine_users from the default run; -tables can still name any of
-// those five explicitly (they stay in tableSpecs).
+// statusengine_nodes, statusengine_perfdata, statusengine_tasks,
+// statusengine_users and statusengine_logentries from the default run;
+// -tables can still name any of those six explicitly (they stay in
+// tableSpecs).
 var defaultTables = []string{
 	"statusengine_hoststatus",
 	"statusengine_servicestatus",
@@ -160,7 +161,6 @@ var defaultTables = []string{
 	"statusengine_service_acknowledgements",
 	"statusengine_host_scheduleddowntimes",
 	"statusengine_service_scheduleddowntimes",
-	"statusengine_logentries",
 }
 
 func main() {
@@ -168,7 +168,7 @@ func main() {
 
 	dsnPHP := flag.String("dsn-php", "", "MySQL DSN of the legacy PHP worker's database (go-sql-driver/mysql format, e.g. user:pass@tcp(127.0.0.1:3306)/statusengine_php)")
 	dsnGo := flag.String("dsn-go", "", "MySQL DSN of this Go worker's database")
-	tablesFlag := flag.String("tables", strings.Join(defaultTables, ","), "comma-separated list of tables to verify (default: all Status/Check/History/Notification/Acknowledgement/Downtime/Logentries tables)")
+	tablesFlag := flag.String("tables", strings.Join(defaultTables, ","), "comma-separated list of tables to verify (default: all Status/Check/History/Notification/Acknowledgement/Downtime tables)")
 	limit := flag.Int("limit", 5000, "maximum number of most-recent rows to compare per table")
 	flag.Parse()
 
