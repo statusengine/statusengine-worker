@@ -44,6 +44,7 @@ Every queue is wired end-to-end in `internal/queue/registry.go`'s `NewRouter` - 
 - Implement a central WebSocket `Hub` using a publish/subscribe pattern.
 - Connected clients can subscribe to specific event types (e.g., only `statusngin_hoststatus`).
 - Use non-blocking channel writes (`select { case hub.broadcast <- msg: default: }`) or a dropped-message strategy to prevent slow network clients from backpressuring the pipeline.
+- Optional API key authentication on `/ws` (`-api-keys`/`STATUSENGINE_API_KEYS`, empty disables it): real clients send `Authorization: Bearer <key>` or `X-Api-Key`; the `?api_key=` query parameter is accepted too, only for browser clients that can't set headers on a WebSocket handshake (e.g. `web/ws-test-client.html`). See `internal/websocket/auth.go`.
 
 ### 5. Conditional Perfdata Routing
 - Data coming from the `statusngin_service_perfdata` queue contains time-series metrics.

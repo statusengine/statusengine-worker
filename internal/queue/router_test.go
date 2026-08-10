@@ -50,7 +50,7 @@ func dialTopic(t *testing.T, hub *websocket.Hub, topic string) *gorillaws.Conn {
 	t.Helper()
 
 	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-		websocket.ServeWS(hub, w, r)
+		websocket.ServeWS(hub, w, r, nil)
 	}))
 	t.Cleanup(srv.Close)
 

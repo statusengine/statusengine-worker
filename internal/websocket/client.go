@@ -67,7 +67,18 @@ type subscriptionMessage struct {
 // (e.g. "?topics=statusngin_hoststatus,statusngin_servicestatus"); clients
 // can subscribe/unsubscribe further at any time by sending a
 // subscriptionMessage frame.
-func ServeWS(hub *Hub, w http.ResponseWriter, r *http.Request) {
+//
+// If validKeys is non-empty, r must carry one of them (see extractAPIKey)
+// or the request is rejected with 401 before the handshake ever upgrades -
+// an empty/nil validKeys leaves the endpoint open, matching the worker's
+// default (see cfg.apiKeys in cmd/app/main.go).
+func ServeWS(hub *Hub, w http.ResponseWriter, r *http.Request, validKeys map[string]struct{}) {
+	if !authorized(r, validKeys) {
+		http.Error(w, "unauthorized", http.StatusUnauthorized)
+		metrics.PipelineErrorsTotal.WithLabelValues(metrics.ComponentWebSocket).Inc()
+		return
+	}
+
 	conn, err := upgrader.Upgrade(w, r, nil)
 	if err != nil {
 		slog.Error("websocket: upgrade failed", "error", err)

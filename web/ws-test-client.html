@@ -98,6 +98,20 @@
   button:disabled { opacity: 0.5; cursor: not-allowed; }
   button.primary { background: var(--accent); border-color: var(--accent); color: #fff; }
 
+  #apiKeyRow { margin-bottom: 0.4rem; }
+  #apiKey {
+    width: 100%;
+    box-sizing: border-box;
+    padding: 0.4rem 0.5rem;
+    border: 1px solid var(--border);
+    border-radius: 6px;
+    background: var(--bg);
+    color: var(--text);
+    font-family: var(--mono);
+    font-size: 0.85rem;
+  }
+  .hint { margin: 0 0 0.6rem; font-size: 0.78rem; color: var(--muted); }
+
   .status { font-size: 0.85rem; font-weight: 600; }
   .status.disconnected { color: var(--muted); }
   .status.connecting { color: var(--warn); }
@@ -216,6 +230,10 @@
       <button id="connectBtn" class="primary">Verbinden</button>
       <button id="disconnectBtn" disabled>Trennen</button>
     </div>
+    <div id="apiKeyRow">
+      <input id="apiKey" type="password" placeholder="API-Key (nur nötig, wenn -api-keys gesetzt ist)" spellcheck="false" autocomplete="off">
+    </div>
+    <p class="hint">Der Key wird hier als <code>?api_key=</code>-Query-Parameter übertragen - nur zum lokalen Testen gedacht. Echte Clients sollten stattdessen den <code>Authorization: Bearer &lt;key&gt;</code>- oder <code>X-Api-Key</code>-Header verwenden.</p>
     <span id="status" class="status disconnected">● Getrennt</span>
 
     <h2 style="margin-top:1.2rem">Topics</h2>
@@ -270,6 +288,7 @@ const subscriptionInfoEl = document.getElementById("subscriptionInfo");
 const connectBtn = document.getElementById("connectBtn");
 const disconnectBtn = document.getElementById("disconnectBtn");
 const wsUrlInput = document.getElementById("wsUrl");
+const apiKeyInput = document.getElementById("apiKey");
 const autoScrollEl = document.getElementById("autoScroll");
 
 let ws = null;
@@ -383,7 +402,16 @@ function connect() {
   }
 
   const topics = getCheckedTopics();
-  const url = topics.length > 0 ? base + "?topics=" + encodeURIComponent(topics.join(",")) : base;
+  const params = new URLSearchParams();
+  if (topics.length > 0) params.set("topics", topics.join(","));
+  // Query-param auth is a demo-client-only convenience (browser JS can't
+  // set custom headers on a WebSocket handshake) - see ServeWS's doc
+  // comment in internal/websocket/client.go. Real clients should send
+  // Authorization: Bearer <key> or X-Api-Key instead.
+  const apiKey = apiKeyInput.value.trim();
+  if (apiKey) params.set("api_key", apiKey);
+  const query = params.toString();
+  const url = query ? base + "?" + query : base;
 
   setStatus("● Verbinde…", "connecting");
   ws = new WebSocket(url);
@@ -393,6 +421,7 @@ function connect() {
     connectBtn.disabled = true;
     disconnectBtn.disabled = false;
     wsUrlInput.disabled = true;
+    apiKeyInput.disabled = true;
   };
 
   ws.onmessage = (event) => {
@@ -411,6 +440,7 @@ function connect() {
     connectBtn.disabled = false;
     disconnectBtn.disabled = true;
     wsUrlInput.disabled = false;
+    apiKeyInput.disabled = false;
     ws = null;
   };
 

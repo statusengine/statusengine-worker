@@ -39,6 +39,7 @@ type config struct {
 	graphitePrefix            string // prepended to every Graphite path, e.g. "statusengine.<host>.<service>.<metric>"
 	perfdataRoute             string // "mysql", "graphite" or "both"
 	nodeName                  string // written into hoststatus/servicestatus rows' node_name column
+	apiKeys                   string // comma-separated; empty disables /ws authentication entirely
 	enableOpenITCockpitTweaks bool   // selects the core-restart hoststatus/servicestatus cleanup query
 	logLevel                  string // "debug", "info", "warn" or "error"
 	logFormat                 string // "text" or "json"
@@ -67,6 +68,9 @@ func loadConfig() config {
 		`where statusngin_service_perfdata metrics are written: "mysql", "graphite" or "both" (CLAUDE.md rule 5)`)
 	flag.StringVar(&cfg.nodeName, "nodename", envOrDefault("STATUSENGINE_NODENAME", "statusengine"),
 		"node_name value written into statusengine_hoststatus/statusengine_servicestatus rows")
+	flag.StringVar(&cfg.apiKeys, "api-keys", envOrDefault("STATUSENGINE_API_KEYS", ""),
+		"comma-separated API keys accepted by the /ws endpoint (Authorization: Bearer <key> or X-Api-Key header; "+
+			"api_key query parameter also accepted, for browser clients that can't set headers); empty disables auth")
 	flag.BoolVar(&cfg.enableOpenITCockpitTweaks, "enable-openitcockpit-tweaks",
 		envBoolOrDefault("ENABLE_OPENITCOCKPIT_TWEAKS", false),
 		"on a core restart, delete only hoststatus/servicestatus rows for objects openITCockpit no longer "+
@@ -106,6 +110,24 @@ func setupLogger(cfg config) {
 func fatal(msg string, args ...any) {
 	slog.Error(msg, args...)
 	os.Exit(1)
+}
+
+// parseAPIKeys splits raw (the -api-keys flag/STATUSENGINE_API_KEYS value)
+// on commas into the set websocket.ServeWS checks incoming /ws requests
+// against. An empty raw yields an empty (nil) set, which ServeWS treats as
+// "authentication disabled" - the worker's default.
+func parseAPIKeys(raw string) map[string]struct{} {
+	if raw == "" {
+		return nil
+	}
+	keys := make(map[string]struct{})
+	for _, k := range strings.Split(raw, ",") {
+		k = strings.TrimSpace(k)
+		if k != "" {
+			keys[k] = struct{}{}
+		}
+	}
+	return keys
 }
 
 func envOrDefault(key, def string) string {
@@ -157,13 +179,14 @@ func main() {
 		hub.Run(pipelineCtx)
 	}()
 
+	apiKeys := parseAPIKeys(cfg.apiKeys)
 	mux := http.NewServeMux()
 	mux.HandleFunc("/ws", func(w http.ResponseWriter, r *http.Request) {
-		websocket.ServeWS(hub, w, r)
+		websocket.ServeWS(hub, w, r, apiKeys)
 	})
 	httpServer := &http.Server{Addr: cfg.listenAddr, Handler: mux}
 	go func() {
-		slog.Info("websocket: listening", "addr", cfg.listenAddr, "path", "/ws")
+		slog.Info("websocket: listening", "addr", cfg.listenAddr, "path", "/ws", "auth_enabled", len(apiKeys) > 0)
 		if err := httpServer.ListenAndServe(); err != nil && err != http.ErrServerClosed {
 			slog.Error("websocket: http server error", "error", err)
 		}

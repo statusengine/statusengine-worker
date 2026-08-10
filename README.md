@@ -53,6 +53,10 @@ Compared to the legacy PHP worker, this Go implementation focuses on:
 		- `{"subscribe":["statusngin_hoststatus"]}`
 		- `{"unsubscribe":["statusngin_hoststatus"]}`
 - If no topics are set, the client receives all topics.
+- Authentication (optional, off by default - see `-api-keys` below):
+	- Recommended for real clients: `Authorization: Bearer <key>` or `X-Api-Key: <key>` header.
+	- `?api_key=<key>` query parameter also accepted, for browser clients that can't set custom headers on a WebSocket handshake (e.g. `web/ws-test-client.html`).
+	- An unauthorized request is rejected with HTTP 401 before the handshake upgrades.
 
 5. Prometheus Exporter
 - Endpoint: `:9105/metrics`
@@ -109,6 +113,7 @@ Useful flags:
 - `-rabbitmq-url`: AMQP URL
 - `-mysql-dsn`: MySQL DSN
 - `-listen-addr`: WebSocket server listen address (default `:8080`)
+- `-api-keys`: comma-separated API keys accepted by `/ws` (empty disables authentication, the default)
 - `-metrics-listen-addr`: Prometheus server listen address (default `:9105`)
 - `-graphite-addr`: Graphite Carbon address
 - `-perfdata-route`: `mysql`, `graphite`, or `both`
