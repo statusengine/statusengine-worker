@@ -12,6 +12,7 @@ A highly performant, concurrent Go-based event pipeline. It consumes bulk JSON m
 - **Database Schema:** Read `/.claude/specs/mysql_schema.sql`
 - **Queue Payload Examples:** Read JSON dumps in `/.claude/specs/` (Note: Each queue delivers a specific type, but payloads arrive as a JSON bulk array).
 - **Queue Payload Bulk Exceptions:** The Queues `statusngin_acknowledgements`, `statusngin_contactnotificationmethod.json`, `statusngin_core_restart.json` and `statusngin_downtimes` do not use bulk payloads.
+- **WebSocket/Metrics API Reference:** `docs/openapi.yaml` (OpenAPI 3.1, viewable via `docs/index.html` with Scalar) - the `/ws` message envelope and a real captured example for every event topic, including the `statusngin_downtimes` `type`/`attr` lifecycle table.
 
 ## Implementation Status
 Every queue is wired end-to-end in `internal/queue/registry.go`'s `NewRouter` - decoded, persisted to MySQL where applicable (rule 3), and broadcast (rule 4):

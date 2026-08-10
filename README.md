@@ -142,6 +142,18 @@ An interactive test client is included in:
 
 It can connect to `ws://localhost:8080/ws`, select topics, subscribe/unsubscribe dynamically, and display incoming event payloads live.
 
+## API Documentation
+
+An OpenAPI 3.1 description of both HTTP-level endpoints (`/ws`'s handshake, authentication and message protocol, plus `/metrics`) lives in [`docs/openapi.yaml`](docs/openapi.yaml), with a real captured example for every event topic.
+
+To browse it as an interactive reference (rendered with [Scalar](https://github.com/scalar/scalar)), open [`docs/index.html`](docs/index.html) directly in a browser, or serve the `docs/` directory with any static file server, e.g.:
+
+```bash
+python3 -m http.server 8000 --directory docs
+```
+
+then visit `http://localhost:8000`.
+
 ## Testing
 
 ```bash

@@ -1,0 +1,21 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <title>Statusengine Worker API</title>
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+</head>
+<body>
+  <!--
+    Renders docs/openapi.yaml as an interactive API reference using Scalar
+    (https://github.com/scalar/scalar). Open this file directly in a
+    browser, or serve the docs/ directory with any static file server -
+    both work, since openapi.yaml is fetched via a plain relative URL.
+
+    This pulls the Scalar renderer from a public CDN at view time, so it
+    needs network access; there is no local/offline build step.
+  -->
+  <script id="api-reference" data-url="./openapi.yaml"></script>
+  <script src="https://cdn.jsdelivr.net/npm/@scalar/api-reference"></script>
+</body>
+</html>

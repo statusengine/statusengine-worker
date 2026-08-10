@@ -1,0 +1,957 @@
+openapi: 3.1.0
+info:
+  title: Statusengine Worker API
+  version: "1.0.0"
+  description: |
+    Live event stream and operational metrics exposed by the Statusengine Go
+    worker. The worker runs two independent HTTP servers:
+
+    | Server | Default address | Endpoint |
+    |---|---|---|
+    | WebSocket | `-listen-addr` (`STATUSENGINE_LISTEN_ADDR`), default `:8080` | `GET /ws` |
+    | Metrics | `-metrics-listen-addr` (`STATUSENGINE_METRICS_LISTEN_ADDR`), default `:9105` | `GET /metrics` |
+
+    `/metrics` has no authentication of its own - it's meant to be reached
+    only by a trusted Prometheus scraper, typically by keeping that port off
+    any public network rather than by an application-level check.
+
+    ## Authentication (`/ws` only)
+
+    Optional and **off by default**. Enable it with `-api-keys`
+    (`STATUSENGINE_API_KEYS`, comma-separated) or the `api_keys` list in a
+    YAML config file (see `config.example.yaml`). Once at least one key is
+    configured, every `/ws` request must present one of them, using **one**
+    of these three methods:
+
+    | Method | Use for | Example |
+    |---|---|---|
+    | `Authorization: Bearer <key>` header | **Any real client.** | `Authorization: Bearer s3cr3t` |
+    | `X-Api-Key: <key>` header | **Any real client**, equally valid. | `X-Api-Key: s3cr3t` |
+    | `?api_key=<key>` query parameter | **Browser demo client only** (`web/ws-test-client.html`). | `wss://host/ws?api_key=s3cr3t` |
+
+    **A header is always preferred over the query parameter, and real
+    clients should always use one.** The query parameter exists purely as a
+    fallback for the browser-based demo client, since browser JavaScript's
+    `WebSocket` constructor cannot set custom headers on the handshake
+    request. Unlike a header, a value in the URL can leak into access logs,
+    reverse-proxy logs and browser history - avoid it for anything other
+    than quick manual testing in a browser.
+
+    A request without a valid key (when authentication is enabled) is
+    rejected with `401 Unauthorized` before the WebSocket handshake ever
+    upgrades - no connection is established.
+
+    ## The `/ws` protocol
+
+    After a successful handshake, the connection carries two independent
+    message flows:
+
+    - **Server → client:** every event the worker's pipeline processes,
+      wrapped in a small envelope: `{"topic": "<queue name>", "payload":
+      { ... }}`. `topic` is always one of the 12 queue names below;
+      `payload`'s shape depends on which one - see the *Schemas* section
+      and each topic's description below for a real example.
+    - **Client → server:** at any time, a client may send a control frame
+      to change which topics it receives:
+      `{"subscribe": ["statusngin_hoststatus"]}` and/or
+      `{"unsubscribe": ["statusngin_hoststatus"]}` (either or both keys, any
+      number of topic names). The initial subscription can also be set at
+      connect time via the `topics` query parameter (comma-separated). A
+      client that never specifies any topics - neither via `?topics=` nor
+      a `subscribe` frame - receives **every** topic.
+
+    ## Event topics
+
+    Each topic below is also the exact Gearman/RabbitMQ queue name the
+    worker itself consumes from. Click through to each
+    schema for a real captured example.
+
+    | Topic | Payload schema | Notes |
+    |---|---|---|
+    | `statusngin_hoststatus` | [`HostStatusEvent`](#/components/schemas/HostStatusEvent) | One message per host status update. |
+    | `statusngin_servicestatus` | [`ServiceStatusEvent`](#/components/schemas/ServiceStatusEvent) | One message per service status update. |
+    | `statusngin_hostchecks` | [`HostCheckEvent`](#/components/schemas/HostCheckEvent) | One message per completed host check. |
+    | `statusngin_servicechecks` | [`ServiceCheckEvent`](#/components/schemas/ServiceCheckEvent) | One message per completed service check. |
+    | `statusngin_service_perfdata` | [`ServicePerfdataEvent`](#/components/schemas/ServicePerfdataEvent) | Same wire shape as `ServiceCheckEvent`, but only `host_name`, `service_description`, `perf_data` and `start_time` are ever populated - see the schema description. |
+    | `statusngin_statechanges` | [`StateChangeEvent`](#/components/schemas/StateChangeEvent) | Host **and** service state changes share this topic; distinguish them via `statechange_type` (`0` = host, `1` = service). |
+    | `statusngin_logentries` | [`LogEntryEvent`](#/components/schemas/LogEntryEvent) | Raw Naemon/Nagios log lines. |
+    | `statusngin_notifications` | [`NotificationEvent`](#/components/schemas/NotificationEvent) | Only published once a notification has fully completed (`type` `601`, `NEBTYPE_NOTIFICATION_END`) - in-progress notifications aren't broadcast. |
+    | `statusngin_contactnotificationmethod` | [`ContactNotificationMethodEvent`](#/components/schemas/ContactNotificationMethodEvent) | One message per contact actually notified; only published once that delivery has completed (`type` `605`, `NEBTYPE_CONTACTNOTIFICATIONMETHOD_END`). |
+    | `statusngin_acknowledgements` | [`AcknowledgementEvent`](#/components/schemas/AcknowledgementEvent) | One message per acknowledgement set on a host or service. |
+    | `statusngin_downtimes` | [`DowntimeEvent`](#/components/schemas/DowntimeEvent) | Covers a downtime's **entire** lifecycle (add/start/stop/delete) on one topic - see the schema description for how to tell those apart, including the `attr` field for a cancelled vs. naturally-expired downtime. |
+    | `statusngin_core_restart` | [`CoreRestartEvent`](#/components/schemas/CoreRestartEvent) | Fires once when the monitoring core (Naemon/Nagios/Icinga) restarts or reloads its configuration. |
+  contact:
+    name: Statusengine
+    url: https://github.com/statusengine/worker
+
+servers:
+  - url: http://localhost:9105
+    description: Prometheus metrics (default -metrics-listen-addr)
+  - url: http://localhost:8080
+    description: WebSocket handshake (default -listen-addr; use ws:// once upgraded)
+
+security:
+  - {}
+
+components:
+  securitySchemes:
+    BearerAuth:
+      type: http
+      scheme: bearer
+      description: |
+        **Recommended.** `Authorization: Bearer <key>`. Use this for any
+        client that isn't a browser tab.
+    ApiKeyHeader:
+      type: apiKey
+      in: header
+      name: X-Api-Key
+      description: |
+        **Recommended**, equally to `BearerAuth` - pick whichever your HTTP
+        client makes easier. `X-Api-Key: <key>`.
+    ApiKeyQuery:
+      type: apiKey
+      in: query
+      name: api_key
+      description: |
+        **Not recommended for real clients.** Exists only because browser
+        JavaScript's `WebSocket` API can't set custom headers during the
+        handshake (used by the bundled `web/ws-test-client.html` demo
+        client). Prefer `BearerAuth` or `ApiKeyHeader` whenever the client
+        isn't a browser - a query parameter can leak into logs and history
+        in ways a header does not.
+
+  parameters:
+    topics:
+      name: topics
+      in: query
+      required: false
+      description: |
+        Comma-separated list of topics to subscribe to on connect (e.g.
+        `statusngin_hoststatus,statusngin_servicestatus`). Omit or leave
+        empty to receive every topic. Can be changed later at any time via
+        a `{"subscribe": [...]}` / `{"unsubscribe": [...]}` control frame.
+      schema:
+        type: string
+        example: statusngin_hoststatus,statusngin_servicestatus
+    apiKeyQueryParam:
+      name: api_key
+      in: query
+      required: false
+      description: |
+        See the `ApiKeyQuery` security scheme above - browser-client
+        fallback only, prefer a header for real clients.
+      schema:
+        type: string
+
+  schemas:
+    # ---------------------------------------------------------------------
+    # Protocol envelope / control messages
+    # ---------------------------------------------------------------------
+    OutboundMessage:
+      type: object
+      description: |
+        The wire format for every server → client message. `payload`'s
+        shape depends on `topic` - see the topic table in this document's
+        top-level description, or browse the per-topic schemas below.
+      required: [topic, payload]
+      properties:
+        topic:
+          type: string
+          description: The queue name this event came from.
+          example: statusngin_hoststatus
+        payload:
+          type: object
+          description: See the schema matching `topic` (e.g. `HostStatusEvent` for `statusngin_hoststatus`).
+
+    SubscriptionMessage:
+      type: object
+      description: |
+        A client → server control frame that (re)configures which topics
+        this connection receives. Both keys are optional and can be
+        combined in one frame; either can list any number of topic names.
+      properties:
+        subscribe:
+          type: array
+          items: { type: string }
+          example: [statusngin_hoststatus]
+        unsubscribe:
+          type: array
+          items: { type: string }
+          example: [statusngin_servicestatus]
+
+    Envelope:
+      type: object
+      description: |
+        The common header Naemon/Nagios/Icinga's event broker module
+        attaches to most queue messages. Individual topic schemas embed
+        the subset of these fields they actually forward to WebSocket
+        clients (field names/casing may differ slightly per topic - see
+        each schema).
+      properties:
+        type:
+          type: integer
+          description: Broker event type. Meaning depends on the queue - see each topic's schema.
+        flags: { type: integer }
+        attr:
+          type: integer
+          description: Broker event attribute/sub-type. Only meaningful for a few event types - see e.g. DowntimeEvent.
+        timestamp: { type: integer, format: int64, description: Unix seconds. }
+        timestamp_usec: { type: integer, description: Microsecond component alongside timestamp. }
+
+    # ---------------------------------------------------------------------
+    # statusngin_hoststatus
+    # ---------------------------------------------------------------------
+    HostStatusEvent:
+      type: object
+      title: HostStatusEvent (statusngin_hoststatus)
+      description: |
+        A host's full current status, broadcast on every status update
+        Naemon reports for it - not only on a state change. Also written to
+        the `statusengine_hoststatus` table (one row per host, kept up to
+        date via UPSERT).
+      properties:
+        timestamp: { type: integer, format: int64, description: Unix seconds this status was reported at. }
+        name: { type: string, description: Hostname. }
+        plugin_output: { type: string }
+        long_plugin_output: { type: string }
+        event_handler:
+          type: [string, "null"]
+          description: Configured event handler command, or null if none is set.
+        perf_data: { type: string, description: "Raw Nagios/Naemon perfdata string, e.g. \"rta=0.077000ms;3000;5000;0 pl=0%;80;100;0\"." }
+        check_command: { type: string }
+        check_period: { type: string }
+        current_state:
+          type: integer
+          description: "Host state: 0=UP, 1=DOWN, 2=UNREACHABLE."
+        has_been_checked: { type: integer, description: "0 or 1." }
+        should_be_scheduled: { type: integer, description: "0 or 1." }
+        current_attempt: { type: integer }
+        max_attempts: { type: integer }
+        last_check: { type: integer, format: int64 }
+        next_check: { type: integer, format: int64 }
+        check_type: { type: integer, description: "0=active, 1=passive." }
+        last_state_change: { type: integer, format: int64 }
+        last_hard_state_change: { type: integer, format: int64 }
+        last_hard_state: { type: integer, description: "Same coding as current_state." }
+        last_time_up: { type: integer, format: int64 }
+        last_time_down: { type: integer, format: int64 }
+        last_time_unreachable: { type: integer, format: int64 }
+        state_type: { type: integer, description: "0=SOFT, 1=HARD." }
+        last_notification: { type: integer, format: int64 }
+        next_notification: { type: integer, format: int64 }
+        no_more_notifications: { type: integer, description: "0 or 1." }
+        notifications_enabled: { type: integer, description: "0 or 1." }
+        problem_has_been_acknowledged: { type: integer, description: "0 or 1." }
+        acknowledgement_type: { type: integer }
+        current_notification_number: { type: integer }
+        accept_passive_checks: { type: integer, description: "0 or 1." }
+        event_handler_enabled: { type: integer, description: "0 or 1." }
+        checks_enabled: { type: integer, description: "0 or 1." }
+        flap_detection_enabled: { type: integer, description: "0 or 1." }
+        is_flapping: { type: integer, description: "0 or 1." }
+        percent_state_change: { type: number }
+        latency: { type: number }
+        execution_time: { type: number }
+        scheduled_downtime_depth: { type: integer, description: "Number of currently active overlapping downtimes; 0 means none." }
+        process_performance_data: { type: integer, description: "0 or 1." }
+        obsess: { type: integer, description: "0 or 1." }
+        modified_attributes: { type: integer }
+        check_interval: { type: number }
+        retry_interval: { type: number }
+      example:
+        accept_passive_checks: 1
+        acknowledgement_type: 0
+        check_command: check-host-alive
+        check_interval: 5
+        check_period: 24x7
+        check_type: 0
+        checks_enabled: 1
+        current_attempt: 1
+        current_notification_number: 0
+        current_state: 0
+        event_handler: null
+        event_handler_enabled: 1
+        execution_time: 4.113
+        flap_detection_enabled: 1
+        has_been_checked: 1
+        is_flapping: 0
+        last_check: 1785470653
+        last_hard_state: 0
+        last_hard_state_change: 1711613888
+        last_notification: 0
+        last_state_change: 1762725251
+        last_time_down: 1762725251
+        last_time_unreachable: 0
+        last_time_up: 1785470657
+        latency: 0.259
+        long_plugin_output: ""
+        max_attempts: 10
+        modified_attributes: 31
+        name: demo.statusengine.org
+        next_check: 1785470953
+        next_notification: 0
+        no_more_notifications: 0
+        notifications_enabled: 1
+        obsess: 1
+        percent_state_change: 0
+        perf_data: "rta=0.077000ms;3000.000000;5000.000000;0.000000 pl=0%;80;100;0"
+        plugin_output: "PING OK - Packet loss = 0%, RTA = 0.08 ms"
+        problem_has_been_acknowledged: 0
+        process_performance_data: 1
+        retry_interval: 1
+        scheduled_downtime_depth: 0
+        should_be_scheduled: 1
+        state_type: 1
+        timestamp: 1785470659
+
+    # ---------------------------------------------------------------------
+    # statusngin_servicestatus
+    # ---------------------------------------------------------------------
+    ServiceStatusEvent:
+      type: object
+      title: ServiceStatusEvent (statusngin_servicestatus)
+      description: |
+        A service's full current status, broadcast on every status update -
+        the ServiceStatusEvent equivalent of HostStatusEvent. Also written
+        to `statusengine_servicestatus` (one row per host+service, UPSERT).
+      properties:
+        timestamp: { type: integer, format: int64 }
+        host_name: { type: string }
+        description: { type: string, description: Service description/name. }
+        plugin_output: { type: string }
+        long_plugin_output: { type: string }
+        event_handler: { type: [string, "null"] }
+        perf_data: { type: string }
+        check_command: { type: string }
+        check_period: { type: string }
+        current_state:
+          type: integer
+          description: "Service state: 0=OK, 1=WARNING, 2=CRITICAL, 3=UNKNOWN."
+        has_been_checked: { type: integer }
+        should_be_scheduled: { type: integer }
+        current_attempt: { type: integer }
+        max_attempts: { type: integer }
+        last_check: { type: integer, format: int64 }
+        next_check: { type: integer, format: int64 }
+        check_type: { type: integer, description: "0=active, 1=passive." }
+        last_state_change: { type: integer, format: int64 }
+        last_hard_state_change: { type: integer, format: int64 }
+        last_hard_state: { type: integer }
+        last_time_ok: { type: integer, format: int64 }
+        last_time_warning: { type: integer, format: int64 }
+        last_time_critical: { type: integer, format: int64 }
+        last_time_unknown: { type: integer, format: int64 }
+        state_type: { type: integer, description: "0=SOFT, 1=HARD." }
+        last_notification: { type: integer, format: int64 }
+        next_notification: { type: integer, format: int64 }
+        no_more_notifications: { type: integer }
+        notifications_enabled: { type: integer }
+        problem_has_been_acknowledged: { type: integer }
+        acknowledgement_type: { type: integer }
+        current_notification_number: { type: integer }
+        accept_passive_checks: { type: integer }
+        event_handler_enabled: { type: integer }
+        checks_enabled: { type: integer }
+        flap_detection_enabled: { type: integer }
+        is_flapping: { type: integer }
+        percent_state_change: { type: number }
+        latency: { type: number }
+        execution_time: { type: number }
+        scheduled_downtime_depth: { type: integer }
+        process_performance_data: { type: integer }
+        obsess: { type: integer }
+        modified_attributes: { type: integer }
+        check_interval: { type: number }
+        retry_interval: { type: number }
+      example:
+        accept_passive_checks: 1
+        acknowledgement_type: 2
+        check_command: check_local_swap!20!10
+        check_interval: 1
+        check_period: 24x7
+        check_type: 0
+        checks_enabled: 1
+        current_attempt: 4
+        current_notification_number: 1599
+        current_state: 2
+        description: Swap Usage
+        event_handler: null
+        event_handler_enabled: 1
+        execution_time: 0.002
+        flap_detection_enabled: 1
+        has_been_checked: 1
+        host_name: foobar
+        is_flapping: 0
+        last_check: 1785470619
+        last_hard_state: 2
+        last_hard_state_change: 1670265715
+        last_notification: 1676018776
+        last_state_change: 1670265137
+        last_time_critical: 1785470619
+        last_time_ok: 1670265137
+        last_time_unknown: 0
+        last_time_warning: 0
+        latency: 0.941
+        long_plugin_output: ""
+        max_attempts: 4
+        modified_attributes: 19
+        next_check: 1785470729
+        next_notification: 1676022376
+        no_more_notifications: 0
+        notifications_enabled: 1
+        obsess: 1
+        percent_state_change: 0
+        perf_data: "swap=0MB;0;0;0;0"
+        plugin_output: "SWAP CRITICAL - 0% free (0 MB out of 0 MB)"
+        problem_has_been_acknowledged: 1
+        process_performance_data: 1
+        retry_interval: 1
+        scheduled_downtime_depth: 0
+        should_be_scheduled: 1
+        state_type: 1
+        timestamp: 1785470669
+
+    # ---------------------------------------------------------------------
+    # statusngin_hostchecks
+    # ---------------------------------------------------------------------
+    HostCheckEvent:
+      type: object
+      title: HostCheckEvent (statusngin_hostchecks)
+      description: |
+        One completed host check result. Also written to
+        `statusengine_hostchecks` (append-only history, primary key
+        `hostname` + `start_time` + `timestamp_usec`).
+      properties:
+        timestamp_usec: { type: integer, description: Microseconds alongside start_time; part of this row's primary key. }
+        host_name: { type: string }
+        command_line: { type: string }
+        command_name: { type: string }
+        output: { type: string }
+        long_output: { type: string }
+        perf_data: { type: string }
+        check_type: { type: integer, description: "0=active, 1=passive." }
+        current_attempt: { type: integer }
+        max_attempts: { type: integer }
+        state_type: { type: integer, description: "0=SOFT, 1=HARD." }
+        state: { type: integer, description: "0=UP, 1=DOWN, 2=UNREACHABLE." }
+        timeout: { type: integer }
+        start_time: { type: integer, format: int64 }
+        end_time: { type: integer, format: int64 }
+        early_timeout: { type: integer, description: "0 or 1." }
+        execution_time: { type: number }
+        latency: { type: number }
+        return_code: { type: integer }
+      example:
+        check_type: 0
+        command_line: "$USER1$/check_ping -H $HOSTADDRESS$ -w 3000.0,80% -c 5000.0,100% -p 5"
+        command_name: check-host-alive
+        current_attempt: 1
+        early_timeout: 0
+        end_time: 1785470668
+        execution_time: 4.097793
+        host_name: localhost
+        latency: 0.6037200093269348
+        long_output: ""
+        max_attempts: 10
+        output: "PING OK - Packet loss = 0%, RTA = 0.08 ms"
+        perf_data: "rta=0.078000ms;3000.000000;5000.000000;0.000000 pl=0%;80;100;0"
+        return_code: 0
+        start_time: 1785470664
+        state: 0
+        state_type: 1
+        timeout: 30
+        timestamp_usec: 701779
+
+    # ---------------------------------------------------------------------
+    # statusngin_servicechecks
+    # ---------------------------------------------------------------------
+    ServiceCheckEvent:
+      type: object
+      title: ServiceCheckEvent (statusngin_servicechecks)
+      description: |
+        One completed service check result. Also written to
+        `statusengine_servicechecks` (append-only history). This is the
+        same underlying shape as `ServicePerfdataEvent` below - see that
+        schema's description for why `statusngin_service_perfdata` only
+        ever fills in a few of these fields.
+      properties:
+        timestamp_usec: { type: integer, description: Microseconds alongside start_time; part of this row's primary key. }
+        host_name: { type: string }
+        service_description: { type: string }
+        command_line: { type: string }
+        command_name: { type: string }
+        output: { type: string }
+        long_output: { type: string }
+        perf_data: { type: string }
+        check_type: { type: integer, description: "0=active, 1=passive." }
+        current_attempt: { type: integer }
+        max_attempts: { type: integer }
+        state_type: { type: integer, description: "0=SOFT, 1=HARD." }
+        state: { type: integer, description: "0=OK, 1=WARNING, 2=CRITICAL, 3=UNKNOWN." }
+        timeout: { type: integer }
+        start_time: { type: integer, format: int64 }
+        end_time: { type: integer, format: int64 }
+        early_timeout: { type: integer, description: "0 or 1." }
+        execution_time: { type: number }
+        latency: { type: number }
+        return_code: { type: integer }
+      example:
+        command_line: "$USER1$/check_users -w $ARG1$ -c $ARG2$"
+        command_name: "check_local_users!20!50"
+        current_attempt: 1
+        end_time: 1785470660
+        execution_time: 0.002062
+        host_name: localhost
+        latency: 0.6007760167121887
+        max_attempts: 4
+        output: "USERS OK - 0 users currently logged in"
+        perf_data: "users=0;20;50;0"
+        service_description: Current Users
+        start_time: 1785470660
+        state_type: 1
+        timeout: 60
+        timestamp_usec: 603182
+
+    # ---------------------------------------------------------------------
+    # statusngin_service_perfdata
+    # ---------------------------------------------------------------------
+    ServicePerfdataEvent:
+      type: object
+      title: ServicePerfdataEvent (statusngin_service_perfdata)
+      description: |
+        Carries the same object shape as `ServiceCheckEvent` (the worker
+        decodes both queues with the same Go type), but in practice Naemon
+        only ever populates `host_name`, `service_description`, `perf_data`
+        and `start_time` on this queue - every other field is simply
+        absent, not zero. `perf_data` is the raw, unparsed Nagios/Naemon
+        perfdata string (`label=value[unit];warn;crit;min;max`, repeated,
+        space-separated); the worker itself parses it into individual
+        metrics for MySQL/Graphite, but the WebSocket
+        broadcast always carries the original raw string, not the parsed
+        metrics.
+      properties:
+        host_name: { type: string }
+        service_description: { type: string }
+        perf_data: { type: string }
+        start_time: { type: integer, format: int64 }
+      example:
+        host_name: localhost
+        perf_data: "users=0;20;50;0"
+        service_description: Current Users
+        start_time: 1785470660
+
+    # ---------------------------------------------------------------------
+    # statusngin_statechanges
+    # ---------------------------------------------------------------------
+    StateChangeEvent:
+      type: object
+      title: StateChangeEvent (statusngin_statechanges)
+      description: |
+        A host or service state history entry - not necessarily a state
+        *transition* despite the name (Naemon/Nagios historically reuses
+        this event for both a genuine change and periodic re-logging of an
+        unchanged state; use `state`/`last_state` to tell them apart if it
+        matters to your client). Host and service entries share this one
+        topic; `statechange_type` tells them apart. Also written to
+        `statusengine_host_statehistory` / `statusengine_service_statehistory`.
+      properties:
+        timestamp: { type: integer, format: int64 }
+        timestamp_usec: { type: integer }
+        host_name: { type: string }
+        service_description:
+          type: string
+          description: Empty for a host state change (see statechange_type).
+        output: { type: string }
+        long_output: { type: string }
+        statechange_type:
+          type: integer
+          description: "0 = host state change, 1 = service state change."
+        state:
+          type: integer
+          description: Current state; coding depends on statechange_type (host or service - see HostStatusEvent/ServiceStatusEvent's current_state).
+        state_type: { type: integer, description: "0=SOFT, 1=HARD." }
+        current_attempt: { type: integer }
+        max_attempts: { type: integer }
+        last_state: { type: integer }
+        last_hard_state: { type: integer }
+      example:
+        current_attempt: 4
+        host_name: localhost
+        last_hard_state: 1
+        last_state: 1
+        long_output: "Your random value is: 158"
+        max_attempts: 4
+        output: "Your random value is: 158"
+        service_description: Flapping
+        state: 0
+        state_type: 1
+        statechange_type: 1
+        timestamp: 1785470683
+        timestamp_usec: 632628
+
+    # ---------------------------------------------------------------------
+    # statusngin_logentries
+    # ---------------------------------------------------------------------
+    LogEntryEvent:
+      type: object
+      title: LogEntryEvent (statusngin_logentries)
+      description: |
+        One raw Naemon/Nagios log line, as it would appear in the core's
+        own log file. Also written to `statusengine_logentries`.
+      properties:
+        entry_time: { type: integer, format: int64 }
+        data_type:
+          type: integer
+          description: Naemon/Nagios log entry type code (NEBTYPE_LOG*); meaning depends on the specific core in use.
+        data: { type: string, description: The log line's text. }
+      example:
+        data: "Event broker module '/opt/statusengine/lib/libstatusengine.so' initialized successfully."
+        data_type: 262144
+        entry_time: 1785470659
+
+    # ---------------------------------------------------------------------
+    # statusngin_notifications
+    # ---------------------------------------------------------------------
+    NotificationEvent:
+      type: object
+      title: NotificationEvent (statusngin_notifications)
+      description: |
+        A completed notification (the "parent" notification - see
+        `ContactNotificationMethodEvent` for the per-contact deliveries it
+        triggered). Only published once the notification has fully
+        finished; `type` is always `601` (`NEBTYPE_NOTIFICATION_END`) on
+        this topic - in-progress notifications aren't broadcast. Also
+        written to `statusengine_host_notifications_log` /
+        `statusengine_service_notifications_log`.
+      properties:
+        type: { type: integer, description: "Always 601 (NEBTYPE_NOTIFICATION_END) on this topic." }
+        timestamp_usec: { type: integer }
+        host_name: { type: string }
+        service_description:
+          type: string
+          description: Empty for a host notification.
+        output: { type: string }
+        long_output: { type: string }
+        ack_author:
+          type: string
+          description: Set if this notification was triggered by an acknowledgement.
+        ack_data: { type: string }
+        notification_type: { type: integer, description: Naemon/Nagios notification type code. }
+        start_time: { type: integer, format: int64 }
+        end_time: { type: integer, format: int64 }
+        reason_type: { type: integer, description: Naemon/Nagios notification reason code. }
+        state: { type: integer, description: State being notified about; coding depends on host vs. service. }
+        escalated: { type: integer, description: "0 or 1." }
+        contacts_notified: { type: integer, description: How many contacts were actually notified. }
+      example:
+        ack_author: Daniel Z
+        ack_data: Test notification
+        contacts_notified: 1
+        end_time: 1785517089
+        escalated: 0
+        host_name: localhost
+        long_output: "CRITICAL: Agent error: Error response from daemon: client version 1.51 is too new. Maximum supported API version is 1.46"
+        notification_type: 1
+        output: "CRITICAL: Agent error: Error response from daemon: client version 1.51 is too new. Maximum supported API version is 1.46"
+        reason_type: 8
+        service_description: Swap Usage
+        start_time: 1785517089
+        state: 2
+        timestamp_usec: 927750
+        type: 601
+
+    # ---------------------------------------------------------------------
+    # statusngin_contactnotificationmethod
+    # ---------------------------------------------------------------------
+    ContactNotificationMethodEvent:
+      type: object
+      title: ContactNotificationMethodEvent (statusngin_contactnotificationmethod)
+      description: |
+        One contact's actual notification delivery - the per-contact detail
+        behind a `NotificationEvent`. Only published once that delivery has
+        completed; `type` is always `605`
+        (`NEBTYPE_CONTACTNOTIFICATIONMETHOD_END`) on this topic. Also
+        written to `statusengine_host_notifications` /
+        `statusengine_service_notifications`.
+      properties:
+        type: { type: integer, description: "Always 605 (NEBTYPE_CONTACTNOTIFICATIONMETHOD_END) on this topic." }
+        timestamp: { type: integer, format: int64 }
+        timestamp_usec: { type: integer }
+        host_name: { type: string }
+        service_description:
+          type: string
+          description: Empty for a host notification.
+        output: { type: string }
+        ack_author: { type: string }
+        ack_data: { type: string }
+        contact_name: { type: string, description: Which contact this delivery was for. }
+        command_name: { type: string, description: Notification command used to reach this contact. }
+        command_args:
+          type: [string, "null"]
+        reason_type: { type: integer, description: Naemon/Nagios notification reason code. }
+        state: { type: integer }
+        start_time: { type: integer, format: int64 }
+        end_time: { type: integer, format: int64 }
+      example:
+        ack_author: Daniel Z
+        ack_data: Test notification
+        command_args: null
+        command_name: 52c9c3e2-4a00-40a4-8e75-db4649eba846
+        contact_name: 286a2700-006a-4d7d-a6fe-6df5b3533ad2
+        end_time: 1785517089
+        host_name: localhost
+        output: "CRITICAL: Agent error: Error response from daemon: client version 1.51 is too new. Maximum supported API version is 1.46"
+        reason_type: 8
+        service_description: Swap Usage
+        start_time: 1785517089
+        state: 2
+        timestamp: 1785517089
+        timestamp_usec: 927284
+        type: 605
+
+    # ---------------------------------------------------------------------
+    # statusngin_acknowledgements
+    # ---------------------------------------------------------------------
+    AcknowledgementEvent:
+      type: object
+      title: AcknowledgementEvent (statusngin_acknowledgements)
+      description: |
+        A host or service problem being acknowledged. Also written to
+        `statusengine_host_acknowledgements` /
+        `statusengine_service_acknowledgements`.
+      properties:
+        entry_time: { type: integer, format: int64 }
+        entry_time_usec: { type: integer, description: Part of this row's primary key alongside entry_time. }
+        host_name: { type: string }
+        service_description:
+          type: string
+          description: Empty for a host acknowledgement.
+        state: { type: integer, description: The state being acknowledged. }
+        author_name: { type: string }
+        comment_data: { type: string }
+        acknowledgement_type: { type: integer, description: "1=normal, 2=sticky (per the Nagios plugin API)." }
+        is_sticky: { type: integer, description: "0 or 1." }
+        persistent_comment: { type: integer, description: "0 or 1." }
+        notify_contacts: { type: integer, description: "0 or 1 - whether contacts were notified about the acknowledgement itself." }
+      example:
+        acknowledgement_type: 1
+        author_name: Daniel Z
+        comment_data: I will take a look at this
+        entry_time: 1785516972
+        entry_time_usec: 732213
+        host_name: localhost
+        is_sticky: 0
+        notify_contacts: 1
+        persistent_comment: 1
+        service_description: Swap Usage
+        state: 2
+
+    # ---------------------------------------------------------------------
+    # statusngin_downtimes
+    # ---------------------------------------------------------------------
+    DowntimeEvent:
+      type: object
+      title: DowntimeEvent (statusngin_downtimes)
+      description: |
+        Covers a scheduled downtime's entire lifecycle: this topic
+        broadcasts every stage - ADD, START, STOP and DELETE (and LOAD, on
+        a core restart when a still-pending downtime is restored from
+        retention.dat) - for the same `downtime.downtime_id`, so a client
+        must look at `type` (and, for STOP, `attr`) to know what actually
+        happened, not just react to "a downtime message arrived":
+
+        | `type` | Meaning |
+        |---|---|
+        | `1100` | `ADD` - a new downtime was scheduled. |
+        | `1101` | `DELETE` - the downtime was removed (whether it had started or not). |
+        | `1102` | `LOAD` - a still-pending downtime was restored from retention.dat after a core restart. |
+        | `1103` | `START` - the downtime became active. |
+        | `1104` | `STOP` - the downtime ended; see `attr` for **how**. |
+
+        **`attr` only matters when `type` is `1104` (STOP)** - it's the
+        field that tells a normally-expired downtime apart from one a user
+        cancelled early:
+
+        | `attr` (only when type=1104) | Meaning |
+        |---|---|
+        | `1` | `NORMAL` - the downtime ran to its scheduled `end_time`. |
+        | `2` | `CANCELLED` - a user stopped it early. |
+
+        A *deleted* downtime is signalled by `type=1101` (`DELETE`), not by
+        `attr` - `attr` is only meaningful on a STOP event. Also written to
+        `statusengine_host_scheduleddowntimes` /
+        `statusengine_service_scheduleddowntimes` (the currently
+        pending/active downtime) and
+        `statusengine_host_downtimehistory` /
+        `statusengine_service_downtimehistory` (permanent history) - see
+        `.claude/specs/downtime_ablauf.txt` in the repository for the full
+        per-type processing matrix.
+      properties:
+        type:
+          type: integer
+          description: "1100=ADD, 1101=DELETE, 1102=LOAD, 1103=START, 1104=STOP - see the table above."
+        flags: { type: integer }
+        attr:
+          type: integer
+          description: "Only meaningful when type=1104 (STOP): 1=NORMAL (ran to completion), 2=CANCELLED (stopped early). 0 otherwise."
+        timestamp: { type: integer, format: int64 }
+        timestamp_usec: { type: integer }
+        downtime:
+          type: object
+          properties:
+            host_name: { type: string }
+            service_description:
+              type: string
+              description: Empty for a host downtime (see downtime_type).
+            author_name: { type: string }
+            comment_data: { type: string }
+            downtime_type:
+              type: integer
+              description: "1=service, 2=host - note this is the INVERSE of the 0=host/1=service convention used elsewhere (e.g. statechange_type, acknowledgement host/service split)."
+            entry_time: { type: integer, format: int64, description: When the downtime was scheduled. }
+            start_time: { type: integer, format: int64 }
+            end_time: { type: integer, format: int64 }
+            triggered_by:
+              type: integer
+              description: downtime_id of the downtime that triggered this one, or 0 if none.
+            downtime_id: { type: integer }
+            fixed: { type: integer, description: "0 or 1 - fixed (exact start/end) vs. flexible downtime." }
+            duration: { type: integer, description: Seconds; only meaningful for a flexible (fixed=0) downtime. }
+      example:
+        attr: 0
+        downtime:
+          author_name: Daniel Z
+          comment_data: In maintenance
+          downtime_id: 1
+          downtime_type: 1
+          duration: 120
+          end_time: 1785517500
+          entry_time: 1785517314
+          fixed: 1
+          host_name: efb91fa3-2bd4-47a4-a89b-1ffe9ca719b5
+          service_description: 66d42eec-650f-4a98-aeaf-8ee51beaac62
+          start_time: 1785517380
+          triggered_by: 0
+        flags: 0
+        timestamp: 1785517315
+        timestamp_usec: 224439
+        type: 1100
+
+    # ---------------------------------------------------------------------
+    # statusngin_core_restart
+    # ---------------------------------------------------------------------
+    CoreRestartEvent:
+      type: object
+      title: CoreRestartEvent (statusngin_core_restart)
+      description: |
+        Fires once when the monitoring core restarts or reloads its
+        configuration. `object_type` is always `102` - other values are
+        silently ignored by the worker and never reach this topic. On
+        receiving this, the worker also clears out stale
+        `statusengine_hoststatus`/`statusengine_servicestatus` rows (or, if
+        `enable_openitcockpit_tweaks` is set, only rows for objects
+        openITCockpit no longer knows about) so every host/service is
+        rebuilt from the fresh post-restart check results.
+      properties:
+        object_type: { type: integer, description: "Always 102." }
+        timestamp:
+          type: integer
+          format: int64
+          description: |
+            Unix seconds the restart happened at, if the core sends it -
+            currently always 0, since no supported core populates this
+            field yet. When 0, the worker uses its own wall-clock time
+            instead as the cutoff for clearing stale status rows.
+      example:
+        object_type: 102
+        timestamp: 0
+
+paths:
+  /ws:
+    get:
+      operationId: connectWebSocket
+      summary: Open the event WebSocket connection
+      description: |
+        Upgrades to a WebSocket connection and starts streaming events (see
+        this document's top-level description for the full protocol,
+        authentication and topic list). This entry describes the HTTP
+        handshake; once upgraded, the connection follows the WebSocket
+        protocol described above, not further HTTP request/responses.
+      servers:
+        - url: http://localhost:8080
+          description: Use ws:// once upgraded (wss:// behind TLS).
+      security:
+        - {}
+        - BearerAuth: []
+        - ApiKeyHeader: []
+        - ApiKeyQuery: []
+      parameters:
+        - $ref: "#/components/parameters/topics"
+        - $ref: "#/components/parameters/apiKeyQueryParam"
+      responses:
+        "101":
+          description: |
+            Switching Protocols - the connection is now a WebSocket. See
+            this document's top-level description for the message protocol
+            that follows.
+        "401":
+          description: Missing or invalid API key (only returned when authentication is enabled via -api-keys/STATUSENGINE_API_KEYS).
+          content:
+            text/plain:
+              schema:
+                type: string
+              example: unauthorized
+
+  /metrics:
+    get:
+      operationId: getMetrics
+      summary: Prometheus metrics
+      description: |
+        Standard Prometheus text-format exposition of every metric the
+        pipeline records. Unauthenticated by design - see this document's
+        top-level description. Metrics (all under the `statusengine_`
+        namespace):
+
+        | Metric | Type | Labels | Meaning |
+        |---|---|---|---|
+        | `statusengine_queue_messages_received_total` | counter | `queue_name` | Raw messages received per queue, regardless of backend (Gearman/RabbitMQ). |
+        | `statusengine_db_events_written_total` | counter | `table` | Rows successfully persisted per destination table. |
+        | `statusengine_db_batch_flush_duration_seconds` | histogram | - | Duration of each bulk-insert flush to MySQL. |
+        | `statusengine_db_batch_size_at_flush` | histogram | - | Row count of each bulk-insert flush - shows whether flushes are mostly hitting the 100-row batch size or the 250ms ticker. |
+        | `statusengine_websocket_clients_active` | gauge | - | Currently connected WebSocket clients. |
+        | `statusengine_websocket_messages_broadcasted_total` | counter | - | Messages successfully handed to a client's send buffer. |
+        | `statusengine_websocket_messages_dropped_total` | counter | `client_id` | Messages dropped because a client's send buffer was full - non-blocking broadcast. |
+        | `statusengine_pipeline_errors_total` | counter | `component` (`mysql`, `websocket`, `graphite`, `queue`) | Errors encountered anywhere in the pipeline. |
+
+        Plus the standard Go runtime/process metrics `promhttp.Handler()`
+        exposes automatically (`go_*`, `process_*`).
+      servers:
+        - url: http://localhost:9105
+      security: []
+      responses:
+        "200":
+          description: OK
+          content:
+            text/plain; version=0.0.4; charset=utf-8:
+              schema:
+                type: string
+              example: |
+                # HELP statusengine_queue_messages_received_total Total number of messages received per queue.
+                # TYPE statusengine_queue_messages_received_total counter
+                statusengine_queue_messages_received_total{queue_name="statusngin_hoststatus"} 1042
+                # HELP statusengine_db_events_written_total Total number of events successfully written per table.
+                # TYPE statusengine_db_events_written_total counter
+                statusengine_db_events_written_total{table="statusengine_hoststatus"} 1042
+                # HELP statusengine_db_batch_flush_duration_seconds Duration of bulk-insert flushes to MySQL.
+                # TYPE statusengine_db_batch_flush_duration_seconds histogram
+                statusengine_db_batch_flush_duration_seconds_bucket{le="0.005"} 8
+                statusengine_db_batch_flush_duration_seconds_bucket{le="0.01"} 15
+                statusengine_db_batch_flush_duration_seconds_bucket{le="+Inf"} 15
+                statusengine_db_batch_flush_duration_seconds_sum 0.081
+                statusengine_db_batch_flush_duration_seconds_count 15
+                # HELP statusengine_websocket_clients_active Number of currently connected WebSocket clients.
+                # TYPE statusengine_websocket_clients_active gauge
+                statusengine_websocket_clients_active 3
+                # HELP statusengine_pipeline_errors_total Total number of errors encountered per pipeline component.
+                # TYPE statusengine_pipeline_errors_total counter
+                statusengine_pipeline_errors_total{component="mysql"} 0
