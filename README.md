@@ -120,6 +120,12 @@ Useful flags:
 
 Environment variables with matching names are also supported (for example `STATUSENGINE_CONSUMER`, `STATUSENGINE_MYSQL_DSN`).
 
+### Config file
+
+Settings can also be read from a YAML config file via `-config path/to/config.yaml` (or `STATUSENGINE_CONFIG`). See [`config.example.yaml`](config.example.yaml) for every available key, its default and a description.
+
+Precedence for every setting is: explicit CLI flag > environment variable > config file > built-in default. This lets the config file hold your normal settings while flags/environment variables (handy in Docker/CI) can still override anything for a one-off run.
+
 ## Run Simulator
 
 The simulator replays fixture payloads through the same decode/route/persist pipeline (without requiring a live queue backend):

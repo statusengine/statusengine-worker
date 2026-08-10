@@ -10,6 +10,7 @@ require (
 	github.com/mikespook/gearman-go v0.0.0-20220520031403-2a518e866145
 	github.com/prometheus/client_golang v1.24.1
 	github.com/rabbitmq/amqp091-go v1.13.0
+	gopkg.in/yaml.v3 v3.0.1
 )
 
 require (

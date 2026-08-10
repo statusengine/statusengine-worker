@@ -56,7 +56,7 @@ Every queue is wired end-to-end in `internal/queue/registry.go`'s `NewRouter` - 
 
 ## Development Commands
 - **Initialize & Clean:** `go mod tidy`
-- **Run Application:** `go run cmd/app/main.go`
+- **Run Application:** `go run cmd/app/main.go` - every setting can also come from a YAML config file (`-config path/to/config.yaml` or `STATUSENGINE_CONFIG`, see `config.example.yaml`); precedence is CLI flag > env var > config file > built-in default
 - **Test Pipeline:** `go test ./... -v -race`
 - **Build Gearman Test Publisher:** `go build -o bin/gearman_publisher cmd/gearman_publisher/main.go` - standalone CLI that publishes synthetic test events for a single queue to a real Gearman job server (`-queue`, `-count`, `-server`), exercising the full Gearman → Router → BulkInserter path from outside the process; run with `go run cmd/gearman_publisher/main.go -queue statusngin_hoststatus -count 1000 -server localhost:4730`
 - **Build RabbitMQ Test Publisher:** `go build -o bin/rabbitmq_publisher cmd/rabbitmq_publisher/main.go` - the RabbitMQ counterpart of the above (`-queue`, `-count`, `-server`, an amqp:// URL); run with `go run cmd/rabbitmq_publisher/main.go -queue statusngin_hoststatus -count 1000 -server amqp://statusengine:statusengine@127.0.0.1:5672/`

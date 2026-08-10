@@ -1,0 +1,74 @@
+# Example configuration file for the Statusengine Go worker (cmd/app).
+#
+# Usage: go run ./cmd/app -config /path/to/config.yaml
+#        (or STATUSENGINE_CONFIG=/path/to/config.yaml go run ./cmd/app)
+#
+# Every key below is optional - omit anything you don't want to override.
+# Precedence, for every setting, is:
+#
+#   explicit CLI flag  >  environment variable  >  this file  >  built-in default
+#
+# So this file is the place for your "boring", rarely-changing settings,
+# while flags/environment variables (handy in Docker/CI) can still
+# override anything here for a one-off run without editing the file.
+#
+# All values below are shown with their built-in default.
+
+# Queue backend to consume from: "gearman" or "rabbitmq".
+consumer: gearman
+
+# Gearman job server address (host:port). Only used when consumer: gearman.
+gearman_addr: 127.0.0.1:4730
+
+# RabbitMQ broker URL (amqp://user:pass@host:port/vhost). Only used when
+# consumer: rabbitmq.
+rabbitmq_url: amqp://statusengine:statusengine@127.0.0.1:5672/
+
+# MySQL data source name (go-sql-driver/mysql format).
+mysql_dsn: statusengine-dev:statusengine-dev@tcp(127.0.0.1:3306)/statusengine-dev?parseTime=true
+
+# Address the WebSocket HTTP server (/ws) listens on.
+listen_addr: ":8080"
+
+# Address the Prometheus /metrics HTTP server listens on.
+metrics_listen_addr: ":9105"
+
+# Graphite Carbon plaintext receiver address (host:port). Only used when
+# perfdata_route is "graphite" or "both".
+graphite_addr: 127.0.0.1:2003
+
+# Prefix prepended to every Graphite metric path:
+# <graphite_prefix>.<hostname>.<service_description>.<metric_label>
+graphite_prefix: statusengine
+
+# Where statusngin_service_perfdata metrics are written: "mysql",
+# "graphite" or "both".
+perfdata_route: mysql
+
+# node_name value written into statusengine_hoststatus/statusengine_servicestatus rows.
+nodename: statusengine
+
+# API keys accepted by the /ws endpoint. Real clients should send one of
+# these via the "Authorization: Bearer <key>" or "X-Api-Key" header; the
+# browser-based demo client (web/ws-test-client.html) uses the ?api_key=
+# query parameter instead, since browser JavaScript can't set custom
+# headers on a WebSocket handshake. Leave this empty (or omit it) to
+# disable /ws authentication entirely - the default.
+api_keys: []
+# api_keys:
+#   - change-me-to-a-real-secret
+#   - a-second-key-for-another-client
+
+# On a core restart (Naemon/Nagios/Icinga reload), clear out stale
+# hoststatus/servicestatus rows how?
+#   false (default): TRUNCATE both tables outright.
+#   true: delete only rows for objects openITCOCKPIT's own hosts/services
+#         tables no longer know about, so status for objects that still
+#         exist survives the restart instead of needing to be rebuilt.
+enable_openitcockpit_tweaks: false
+
+# Minimum log level: "debug", "info", "warn" or "error".
+log_level: info
+
+# Structured log output format: "text" or "json".
+log_format: text

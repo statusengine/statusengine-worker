@@ -17,6 +17,7 @@ import (
 	"time"
 
 	"github.com/prometheus/client_golang/prometheus/promhttp"
+	"gopkg.in/yaml.v3"
 
 	_ "github.com/go-sql-driver/mysql"
 
@@ -25,10 +26,14 @@ import (
 	"statusengine-worker/internal/websocket"
 )
 
-// config holds every value that can be set via flag or environment
-// variable (flag wins if both are given). Defaults match the local dev
-// setup documented in .claude/specs/ressources.txt.
+// config holds every value that can be set via flag, environment variable
+// or config file. For every setting below, precedence is: an explicitly
+// passed CLI flag wins outright; otherwise an environment variable wins;
+// otherwise a value from -config's YAML file wins; otherwise the
+// hardcoded default below applies. Defaults match the local dev setup
+// documented in .claude/specs/ressources.txt.
 type config struct {
+	configFile                string // path to an optional YAML config file - see config.example.yaml
 	consumerBackend           string // "gearman" or "rabbitmq"
 	gearmanAddr               string
 	rabbitMQURL               string
@@ -45,41 +50,145 @@ type config struct {
 	logFormat                 string // "text" or "json"
 }
 
+// fileConfig mirrors config's fields for -config's optional YAML file (see
+// config.example.yaml for every key, its default and a description). Every
+// key is optional: a zero value (empty string, nil for APIKeys/
+// EnableOpenITCockpitTweaks) means "not set in the file", so it never
+// overrides an environment variable or hardcoded default - see resolveString/
+// resolveBool. EnableOpenITCockpitTweaks is a *bool (rather than bool) for
+// exactly this reason: unlike a missing string, Go can't otherwise tell
+// "the file didn't mention this key" apart from "the file explicitly set
+// it to false".
+type fileConfig struct {
+	Consumer                  string   `yaml:"consumer"`
+	GearmanAddr               string   `yaml:"gearman_addr"`
+	RabbitMQURL               string   `yaml:"rabbitmq_url"`
+	MySQLDSN                  string   `yaml:"mysql_dsn"`
+	ListenAddr                string   `yaml:"listen_addr"`
+	MetricsListenAddr         string   `yaml:"metrics_listen_addr"`
+	GraphiteAddr              string   `yaml:"graphite_addr"`
+	GraphitePrefix            string   `yaml:"graphite_prefix"`
+	PerfdataRoute             string   `yaml:"perfdata_route"`
+	NodeName                  string   `yaml:"nodename"`
+	APIKeys                   []string `yaml:"api_keys"`
+	EnableOpenITCockpitTweaks *bool    `yaml:"enable_openitcockpit_tweaks"`
+	LogLevel                  string   `yaml:"log_level"`
+	LogFormat                 string   `yaml:"log_format"`
+}
+
+// loadFileConfig reads and parses an optional YAML config file. Called
+// only when -config/STATUSENGINE_CONFIG names a path, so both a missing
+// file and invalid YAML are treated as fatal misconfiguration - silently
+// falling back to defaults would leave a typo'd path looking like it
+// worked.
+func loadFileConfig(path string) fileConfig {
+	data, err := os.ReadFile(path)
+	if err != nil {
+		fatal("config: failed to read -config file", "path", path, "error", err)
+	}
+	var fc fileConfig
+	if err := yaml.Unmarshal(data, &fc); err != nil {
+		fatal("config: failed to parse -config file", "path", path, "error", err)
+	}
+	return fc
+}
+
+// resolveString applies config's flag > env > file > default precedence
+// for one string setting. flagVal is the flag's value after Parse() - if
+// flagName wasn't passed explicitly (checked via explicit, built from
+// flag.Visit), flagVal already equals that flag's hardcoded default, so
+// it doubles as the final fallback.
+func resolveString(explicit map[string]bool, flagName, flagVal, envKey, fileVal string) string {
+	if explicit[flagName] {
+		return flagVal
+	}
+	if v := os.Getenv(envKey); v != "" {
+		return v
+	}
+	if fileVal != "" {
+		return fileVal
+	}
+	return flagVal
+}
+
+// resolveBool is resolveString's counterpart for the one bool setting;
+// fileVal is a pointer so a key the file never mentioned (nil) is
+// distinguishable from one explicitly set to false.
+func resolveBool(explicit map[string]bool, flagName string, flagVal bool, envKey string, fileVal *bool) bool {
+	if explicit[flagName] {
+		return flagVal
+	}
+	if v, ok := os.LookupEnv(envKey); ok {
+		if parsed, err := strconv.ParseBool(v); err == nil {
+			return parsed
+		}
+	}
+	if fileVal != nil {
+		return *fileVal
+	}
+	return flagVal
+}
+
 func loadConfig() config {
 	cfg := config{}
 
-	flag.StringVar(&cfg.consumerBackend, "consumer", envOrDefault("STATUSENGINE_CONSUMER", "gearman"),
+	flag.StringVar(&cfg.configFile, "config", envOrDefault("STATUSENGINE_CONFIG", ""),
+		"path to an optional YAML config file (see config.example.yaml); flags and environment variables "+
+			"still take precedence over anything set here")
+	flag.StringVar(&cfg.consumerBackend, "consumer", "gearman",
 		`queue backend to use: "gearman" or "rabbitmq"`)
-	flag.StringVar(&cfg.gearmanAddr, "gearman-addr", envOrDefault("STATUSENGINE_GEARMAN_ADDR", "127.0.0.1:4730"),
+	flag.StringVar(&cfg.gearmanAddr, "gearman-addr", "127.0.0.1:4730",
 		"Gearman job server address (host:port)")
-	flag.StringVar(&cfg.rabbitMQURL, "rabbitmq-url", envOrDefault("STATUSENGINE_RABBITMQ_URL", "amqp://statusengine:statusengine@127.0.0.1:5672/"),
+	flag.StringVar(&cfg.rabbitMQURL, "rabbitmq-url", "amqp://statusengine:statusengine@127.0.0.1:5672/",
 		"RabbitMQ broker URL")
-	flag.StringVar(&cfg.mysqlDSN, "mysql-dsn", envOrDefault("STATUSENGINE_MYSQL_DSN", "statusengine-dev:statusengine-dev@tcp(127.0.0.1:3306)/statusengine-dev?parseTime=true"),
+	flag.StringVar(&cfg.mysqlDSN, "mysql-dsn", "statusengine-dev:statusengine-dev@tcp(127.0.0.1:3306)/statusengine-dev?parseTime=true",
 		"MySQL data source name")
-	flag.StringVar(&cfg.listenAddr, "listen-addr", envOrDefault("STATUSENGINE_LISTEN_ADDR", ":8080"),
+	flag.StringVar(&cfg.listenAddr, "listen-addr", ":8080",
 		"address the WebSocket HTTP server listens on")
-	flag.StringVar(&cfg.metricsListenAddr, "metrics-listen-addr", envOrDefault("STATUSENGINE_METRICS_LISTEN_ADDR", ":9105"),
+	flag.StringVar(&cfg.metricsListenAddr, "metrics-listen-addr", ":9105",
 		"address the Prometheus /metrics HTTP server listens on")
-	flag.StringVar(&cfg.graphiteAddr, "graphite-addr", envOrDefault("STATUSENGINE_GRAPHITE_ADDR", "127.0.0.1:2003"),
+	flag.StringVar(&cfg.graphiteAddr, "graphite-addr", "127.0.0.1:2003",
 		"Graphite Carbon plaintext receiver address (host:port)")
-	flag.StringVar(&cfg.graphitePrefix, "graphite-prefix", envOrDefault("STATUSENGINE_GRAPHITE_PREFIX", "statusengine"),
+	flag.StringVar(&cfg.graphitePrefix, "graphite-prefix", "statusengine",
 		"prefix prepended to every Graphite metric path (prefix.hostname.service_description.label)")
-	flag.StringVar(&cfg.perfdataRoute, "perfdata-route", envOrDefault("STATUSENGINE_PERFDATA_ROUTE", "mysql"),
+	flag.StringVar(&cfg.perfdataRoute, "perfdata-route", "mysql",
 		`where statusngin_service_perfdata metrics are written: "mysql", "graphite" or "both" (CLAUDE.md rule 5)`)
-	flag.StringVar(&cfg.nodeName, "nodename", envOrDefault("STATUSENGINE_NODENAME", "statusengine"),
+	flag.StringVar(&cfg.nodeName, "nodename", "statusengine",
 		"node_name value written into statusengine_hoststatus/statusengine_servicestatus rows")
-	flag.StringVar(&cfg.apiKeys, "api-keys", envOrDefault("STATUSENGINE_API_KEYS", ""),
+	flag.StringVar(&cfg.apiKeys, "api-keys", "",
 		"comma-separated API keys accepted by the /ws endpoint (Authorization: Bearer <key> or X-Api-Key header; "+
 			"api_key query parameter also accepted, for browser clients that can't set headers); empty disables auth")
-	flag.BoolVar(&cfg.enableOpenITCockpitTweaks, "enable-openitcockpit-tweaks",
-		envBoolOrDefault("ENABLE_OPENITCOCKPIT_TWEAKS", false),
+	flag.BoolVar(&cfg.enableOpenITCockpitTweaks, "enable-openitcockpit-tweaks", false,
 		"on a core restart, delete only hoststatus/servicestatus rows for objects openITCockpit no longer "+
 			"knows about instead of truncating both tables outright")
-	flag.StringVar(&cfg.logLevel, "log-level", envOrDefault("STATUSENGINE_LOG_LEVEL", "info"),
+	flag.StringVar(&cfg.logLevel, "log-level", "info",
 		`minimum log level: "debug", "info", "warn" or "error"`)
-	flag.StringVar(&cfg.logFormat, "log-format", envOrDefault("STATUSENGINE_LOG_FORMAT", "text"),
+	flag.StringVar(&cfg.logFormat, "log-format", "text",
 		`structured log output format: "text" or "json"`)
 	flag.Parse()
+
+	explicit := make(map[string]bool)
+	flag.Visit(func(f *flag.Flag) { explicit[f.Name] = true })
+
+	var fc fileConfig
+	if cfg.configFile != "" {
+		fc = loadFileConfig(cfg.configFile)
+	}
+
+	cfg.consumerBackend = resolveString(explicit, "consumer", cfg.consumerBackend, "STATUSENGINE_CONSUMER", fc.Consumer)
+	cfg.gearmanAddr = resolveString(explicit, "gearman-addr", cfg.gearmanAddr, "STATUSENGINE_GEARMAN_ADDR", fc.GearmanAddr)
+	cfg.rabbitMQURL = resolveString(explicit, "rabbitmq-url", cfg.rabbitMQURL, "STATUSENGINE_RABBITMQ_URL", fc.RabbitMQURL)
+	cfg.mysqlDSN = resolveString(explicit, "mysql-dsn", cfg.mysqlDSN, "STATUSENGINE_MYSQL_DSN", fc.MySQLDSN)
+	cfg.listenAddr = resolveString(explicit, "listen-addr", cfg.listenAddr, "STATUSENGINE_LISTEN_ADDR", fc.ListenAddr)
+	cfg.metricsListenAddr = resolveString(explicit, "metrics-listen-addr", cfg.metricsListenAddr, "STATUSENGINE_METRICS_LISTEN_ADDR", fc.MetricsListenAddr)
+	cfg.graphiteAddr = resolveString(explicit, "graphite-addr", cfg.graphiteAddr, "STATUSENGINE_GRAPHITE_ADDR", fc.GraphiteAddr)
+	cfg.graphitePrefix = resolveString(explicit, "graphite-prefix", cfg.graphitePrefix, "STATUSENGINE_GRAPHITE_PREFIX", fc.GraphitePrefix)
+	cfg.perfdataRoute = resolveString(explicit, "perfdata-route", cfg.perfdataRoute, "STATUSENGINE_PERFDATA_ROUTE", fc.PerfdataRoute)
+	cfg.nodeName = resolveString(explicit, "nodename", cfg.nodeName, "STATUSENGINE_NODENAME", fc.NodeName)
+	cfg.apiKeys = resolveString(explicit, "api-keys", cfg.apiKeys, "STATUSENGINE_API_KEYS", strings.Join(fc.APIKeys, ","))
+	cfg.enableOpenITCockpitTweaks = resolveBool(explicit, "enable-openitcockpit-tweaks", cfg.enableOpenITCockpitTweaks, "ENABLE_OPENITCOCKPIT_TWEAKS", fc.EnableOpenITCockpitTweaks)
+	cfg.logLevel = resolveString(explicit, "log-level", cfg.logLevel, "STATUSENGINE_LOG_LEVEL", fc.LogLevel)
+	cfg.logFormat = resolveString(explicit, "log-format", cfg.logFormat, "STATUSENGINE_LOG_FORMAT", fc.LogFormat)
 
 	return cfg
 }
@@ -155,6 +264,9 @@ func envBoolOrDefault(key string, def bool) bool {
 func main() {
 	cfg := loadConfig()
 	setupLogger(cfg)
+	if cfg.configFile != "" {
+		slog.Info("config: loaded settings from file", "path", cfg.configFile)
+	}
 
 	perfdataRoute, err := queue.ParsePerfdataRoute(cfg.perfdataRoute)
 	if err != nil {
