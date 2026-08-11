@@ -22,7 +22,7 @@ func TestRabbitMQConsumerEndToEnd(t *testing.T) {
 		},
 	}
 
-	consumer := NewRabbitMQConsumer(rabbitmqURL, router)
+	consumer := NewRabbitMQConsumer(rabbitmqURL, router, 100)
 	ctx, cancel := context.WithCancel(context.Background())
 	defer cancel()
 
@@ -102,7 +102,7 @@ func TestRabbitMQConsumerReconnectsAfterConnectionDrop(t *testing.T) {
 		},
 	}
 
-	consumer := NewRabbitMQConsumer(rabbitmqURL, router)
+	consumer := NewRabbitMQConsumer(rabbitmqURL, router, 100)
 	ctx, cancel := context.WithCancel(context.Background())
 	defer cancel()
 
@@ -176,7 +176,7 @@ func TestRabbitMQConsumerReconnectsAfterConnectionDrop(t *testing.T) {
 }
 
 func TestRabbitMQConsumerStopWithoutStartIsSafe(t *testing.T) {
-	c := NewRabbitMQConsumer(rabbitmqURL, Router{})
+	c := NewRabbitMQConsumer(rabbitmqURL, Router{}, 100)
 	if err := c.Stop(); err != nil {
 		t.Fatalf("Stop without Start should be a no-op, got: %v", err)
 	}
@@ -186,7 +186,7 @@ func TestRabbitMQConsumerStopWithoutStartIsSafe(t *testing.T) {
 }
 
 func TestRabbitMQConsumerStartFailsFastWhenUnreachable(t *testing.T) {
-	c := NewRabbitMQConsumer("amqp://guest:guest@127.0.0.1:1/", Router{}) // port 1: nothing listens
+	c := NewRabbitMQConsumer("amqp://guest:guest@127.0.0.1:1/", Router{}, 100) // port 1: nothing listens
 	ctx, cancel := context.WithTimeout(context.Background(), 3*time.Second)
 	defer cancel()
 	if _, err := c.Start(ctx); err == nil {
@@ -195,7 +195,7 @@ func TestRabbitMQConsumerStartFailsFastWhenUnreachable(t *testing.T) {
 }
 
 func TestRabbitMQConsumerStartFailsFastOnInvalidURL(t *testing.T) {
-	c := NewRabbitMQConsumer("not-a-valid-amqp-url", Router{})
+	c := NewRabbitMQConsumer("not-a-valid-amqp-url", Router{}, 100)
 	ctx, cancel := context.WithTimeout(context.Background(), 3*time.Second)
 	defer cancel()
 	if _, err := c.Start(ctx); err == nil {

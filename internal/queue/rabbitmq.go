@@ -57,6 +57,10 @@ type RabbitMQConsumer struct {
 	url    string
 	router Router
 
+	// prefetch caps how many unacknowledged deliveries the broker may
+	// push per queue. See NewRabbitMQConsumer.
+	prefetch int
+
 	mu          sync.Mutex
 	conn        *amqp.Connection
 	channels    []*amqp.Channel
@@ -81,11 +85,24 @@ type RabbitMQConsumer struct {
 
 // NewRabbitMQConsumer creates a consumer that will connect to the RabbitMQ
 // broker at rawURL (an amqp:// URI, e.g. amqp://user:pass@host:5672/) and
-// handle every queue name in router.
-func NewRabbitMQConsumer(rawURL string, router Router) *RabbitMQConsumer {
+// handle every queue name in router, letting the broker push at most
+// prefetch unacknowledged deliveries per queue.
+//
+// Without that limit AMQP delivers as fast as it can, and since each
+// queue's consumeLoop handles deliveries one at a time, everything the
+// broker has ends up buffered in this process - the same failure the
+// Gearman consumer's concurrency cap prevents, arriving from the other
+// direction. With it, the surplus stays unacknowledged at the broker,
+// where it survives a worker restart and is visible in the management UI.
+//
+// The limit applies per queue, so the worst-case in-memory backlog is
+// prefetch multiplied by the number of queues in the Router (currently
+// 12). prefetch must be >= 1; 0 means "unlimited" in AMQP.
+func NewRabbitMQConsumer(rawURL string, router Router, prefetch int) *RabbitMQConsumer {
 	return &RabbitMQConsumer{
 		url:       rawURL,
 		router:    router,
+		prefetch:  prefetch,
 		statsDone: make(chan struct{}),
 		stopping:  make(chan struct{}),
 	}
@@ -154,6 +171,14 @@ func (c *RabbitMQConsumer) connect(ctx context.Context, out chan<- Message) erro
 			return fmt.Errorf("rabbitmq: declare queue %q: %w", queueName, err)
 		}
 
+		// Bound the broker's push rate before consuming, not after: this
+		// channel serves exactly one consumer, so a per-consumer limit
+		// (global=false) is the right scope.
+		if err := ch.Qos(c.prefetch, 0, false); err != nil {
+			conn.Close()
+			return fmt.Errorf("rabbitmq: set prefetch for %q: %w", queueName, err)
+		}
+
 		deliveries, err := ch.ConsumeWithContext(ctx, queueName, "", false, false, false, false, nil)
 		if err != nil {
 			conn.Close()
@@ -192,7 +217,7 @@ func (c *RabbitMQConsumer) consumeLoop(ctx context.Context, queueName string, ha
 			// processing on a slow/absent reader.
 		}
 
-		if err := handle(ctx, d.Body); err != nil {
+		if err := observeHandler(ctx, queueName, handle, d.Body); err != nil {
 			c.errors.Add(1)
 			metrics.PipelineErrorsTotal.WithLabelValues(metrics.ComponentQueue).Inc()
 

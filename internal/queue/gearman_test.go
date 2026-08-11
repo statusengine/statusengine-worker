@@ -22,7 +22,7 @@ func TestGearmanConsumerEndToEnd(t *testing.T) {
 		},
 	}
 
-	consumer := NewGearmanConsumer(gearmanAddr, router)
+	consumer := NewGearmanConsumer(gearmanAddr, router, 64)
 	ctx, cancel := context.WithCancel(context.Background())
 	defer cancel()
 
@@ -81,7 +81,7 @@ func TestGearmanConsumerEndToEnd(t *testing.T) {
 }
 
 func TestGearmanConsumerStopWithoutStartIsSafe(t *testing.T) {
-	c := NewGearmanConsumer(gearmanAddr, Router{})
+	c := NewGearmanConsumer(gearmanAddr, Router{}, 64)
 	if err := c.Stop(); err != nil {
 		t.Fatalf("Stop without Start should be a no-op, got: %v", err)
 	}
@@ -91,7 +91,7 @@ func TestGearmanConsumerStopWithoutStartIsSafe(t *testing.T) {
 }
 
 func TestGearmanConsumerStartFailsFastWhenUnreachable(t *testing.T) {
-	c := NewGearmanConsumer("127.0.0.1:1", Router{}) // port 1: nothing listens
+	c := NewGearmanConsumer("127.0.0.1:1", Router{}, 64) // port 1: nothing listens
 	ctx, cancel := context.WithTimeout(context.Background(), 3*time.Second)
 	defer cancel()
 	if _, err := c.Start(ctx); err == nil {

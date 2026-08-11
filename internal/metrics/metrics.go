@@ -32,6 +32,36 @@ var (
 		Help:      "Total number of messages received per queue.",
 	}, []string{"queue_name"})
 
+	// QueueJobsInFlight tracks how many queue messages are being handled
+	// right now, across every queue. It is the metric that shows whether
+	// the consumer's concurrency cap (-gearman-max-concurrent-jobs) is
+	// actually being hit: sitting at the cap means the broker is feeding
+	// faster than the pipeline drains, and the backlog is being held at
+	// the broker rather than piling up in this process.
+	QueueJobsInFlight = promauto.NewGauge(prometheus.GaugeOpts{
+		Namespace: "statusengine",
+		Subsystem: "queue",
+		Name:      "jobs_in_flight",
+		Help:      "Number of queue messages currently being handled.",
+	})
+
+	// QueueHandlerDurationSeconds observes how long handling one message
+	// takes, end to end: decode, WebSocket publish and enqueueing every
+	// decoded item for insertion. Since Enqueue blocks once a
+	// BulkInserter's channel is full, this is where MySQL backpressure
+	// becomes visible from the ingestion side.
+	//
+	// Labeled by queue name, whose cardinality is fixed by the queue list
+	// in registry.go - unlike the per-connection client_id label this
+	// package used to carry on the WebSocket drop counter.
+	QueueHandlerDurationSeconds = promauto.NewHistogramVec(prometheus.HistogramOpts{
+		Namespace: "statusengine",
+		Subsystem: "queue",
+		Name:      "handler_duration_seconds",
+		Help:      "Duration of handling one message, per queue.",
+		Buckets:   prometheus.DefBuckets,
+	}, []string{"queue_name"})
+
 	// DBEventsWrittenTotal counts rows successfully persisted by a bulk
 	// insert, labeled by destination table.
 	DBEventsWrittenTotal = promauto.NewCounterVec(prometheus.CounterOpts{

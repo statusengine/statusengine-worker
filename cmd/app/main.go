@@ -40,7 +40,9 @@ type config struct {
 	configFile                string // path to an optional YAML config file - see config.example.yaml
 	consumerBackend           string // "gearman" or "rabbitmq"
 	gearmanAddr               string
+	gearmanMaxConcurrentJobs  int // cap on simultaneously running Gearman job handlers
 	rabbitMQURL               string
+	rabbitMQPrefetch          int // unacknowledged deliveries the broker may push per queue
 	mysqlDSN                  string
 	mysqlMaxOpenConns         int // upper bound on simultaneously open MySQL connections; also used as the idle limit
 	listenAddr                string
@@ -67,7 +69,9 @@ type config struct {
 type fileConfig struct {
 	Consumer                  string   `yaml:"consumer"`
 	GearmanAddr               string   `yaml:"gearman_addr"`
+	GearmanMaxConcurrentJobs  int      `yaml:"gearman_max_concurrent_jobs"`
 	RabbitMQURL               string   `yaml:"rabbitmq_url"`
+	RabbitMQPrefetch          int      `yaml:"rabbitmq_prefetch"`
 	MySQLDSN                  string   `yaml:"mysql_dsn"`
 	MySQLMaxOpenConns         int      `yaml:"mysql_max_open_conns"`
 	ListenAddr                string   `yaml:"listen_addr"`
@@ -165,8 +169,14 @@ func loadConfig() config {
 		`queue backend to use: "gearman" or "rabbitmq"`)
 	flag.StringVar(&cfg.gearmanAddr, "gearman-addr", "127.0.0.1:4730",
 		"Gearman job server address (host:port)")
+	flag.IntVar(&cfg.gearmanMaxConcurrentJobs, "gearman-max-concurrent-jobs", 64,
+		"maximum number of Gearman job handlers running at once; the cap that keeps a backlog "+
+			"queued at the job server instead of accumulating in this process")
 	flag.StringVar(&cfg.rabbitMQURL, "rabbitmq-url", "amqp://statusengine:statusengine@127.0.0.1:5672/",
 		"RabbitMQ broker URL")
+	flag.IntVar(&cfg.rabbitMQPrefetch, "rabbitmq-prefetch", 100,
+		"maximum unacknowledged deliveries the broker may push per queue; applies per queue, so the "+
+			"worst-case in-memory backlog is this times the number of queues")
 	flag.StringVar(&cfg.mysqlDSN, "mysql-dsn", "statusengine-dev:statusengine-dev@tcp(127.0.0.1:3306)/statusengine-dev?parseTime=true",
 		"MySQL data source name")
 	flag.IntVar(&cfg.mysqlMaxOpenConns, "mysql-max-open-conns", 25,
@@ -207,7 +217,9 @@ func loadConfig() config {
 
 	cfg.consumerBackend = resolveString(explicit, "consumer", cfg.consumerBackend, "STATUSENGINE_CONSUMER", fc.Consumer)
 	cfg.gearmanAddr = resolveString(explicit, "gearman-addr", cfg.gearmanAddr, "STATUSENGINE_GEARMAN_ADDR", fc.GearmanAddr)
+	cfg.gearmanMaxConcurrentJobs = resolveInt(explicit, "gearman-max-concurrent-jobs", cfg.gearmanMaxConcurrentJobs, "STATUSENGINE_GEARMAN_MAX_CONCURRENT_JOBS", fc.GearmanMaxConcurrentJobs)
 	cfg.rabbitMQURL = resolveString(explicit, "rabbitmq-url", cfg.rabbitMQURL, "STATUSENGINE_RABBITMQ_URL", fc.RabbitMQURL)
+	cfg.rabbitMQPrefetch = resolveInt(explicit, "rabbitmq-prefetch", cfg.rabbitMQPrefetch, "STATUSENGINE_RABBITMQ_PREFETCH", fc.RabbitMQPrefetch)
 	cfg.mysqlDSN = resolveString(explicit, "mysql-dsn", cfg.mysqlDSN, "STATUSENGINE_MYSQL_DSN", fc.MySQLDSN)
 	cfg.mysqlMaxOpenConns = resolveInt(explicit, "mysql-max-open-conns", cfg.mysqlMaxOpenConns, "STATUSENGINE_MYSQL_MAX_OPEN_CONNS", fc.MySQLMaxOpenConns)
 	cfg.listenAddr = resolveString(explicit, "listen-addr", cfg.listenAddr, "STATUSENGINE_LISTEN_ADDR", fc.ListenAddr)
@@ -223,6 +235,15 @@ func loadConfig() config {
 
 	if cfg.mysqlMaxOpenConns < 1 {
 		fatal("invalid -mysql-max-open-conns", "value", cfg.mysqlMaxOpenConns, "want", "a positive number")
+	}
+	// Both of these mean "unlimited" at zero in their respective
+	// libraries, which is exactly the unbounded behaviour they exist to
+	// prevent - so zero is rejected rather than passed through.
+	if cfg.gearmanMaxConcurrentJobs < 1 {
+		fatal("invalid -gearman-max-concurrent-jobs", "value", cfg.gearmanMaxConcurrentJobs, "want", "a positive number")
+	}
+	if cfg.rabbitMQPrefetch < 1 {
+		fatal("invalid -rabbitmq-prefetch", "value", cfg.rabbitMQPrefetch, "want", "a positive number")
 	}
 
 	return cfg
@@ -551,9 +572,9 @@ func main() {
 	var consumer queue.Consumer
 	switch strings.ToLower(cfg.consumerBackend) {
 	case "gearman":
-		consumer = queue.NewGearmanConsumer(cfg.gearmanAddr, router)
+		consumer = queue.NewGearmanConsumer(cfg.gearmanAddr, router, cfg.gearmanMaxConcurrentJobs)
 	case "rabbitmq":
-		consumer = queue.NewRabbitMQConsumer(cfg.rabbitMQURL, router)
+		consumer = queue.NewRabbitMQConsumer(cfg.rabbitMQURL, router, cfg.rabbitMQPrefetch)
 	default:
 		fatal("unknown -consumer value", "consumer", cfg.consumerBackend, "want", `"gearman" or "rabbitmq"`)
 	}

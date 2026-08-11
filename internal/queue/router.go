@@ -6,7 +6,9 @@ import (
 	"errors"
 	"fmt"
 	"log/slog"
+	"time"
 
+	"statusengine-worker/internal/metrics"
 	"statusengine-worker/internal/websocket"
 )
 
@@ -33,6 +35,34 @@ func decodeError(topic string, err error) error {
 // the Handler registered for a queue name for every message it receives on
 // that queue.
 type Handler func(ctx context.Context, payload []byte) error
+
+// observeHandler runs handle and records how long it took plus how many
+// handlers are in flight while it does. Both Consumers call it rather than
+// invoking a Handler directly, so the two backends cannot drift into
+// reporting different things.
+//
+// These two numbers are what answer "is the worker keeping up?". A
+// Handler is not a cheap channel write: it decodes the payload and calls
+// Enqueue per item, which blocks once that BulkInserter's channel is full,
+// so its duration is ultimately governed by MySQL. Rising duration
+// together with an in-flight count pinned at the consumer's concurrency
+// cap is the signature of the pipeline falling behind - with the backlog
+// waiting at the broker, which is where it belongs.
+//
+// Two existing signals complement these: DBBatchSizeAtFlush sitting at
+// MaxBatchSize means flushes are batch- rather than ticker-triggered
+// (i.e. saturated), and go_goroutines, which promhttp's default registry
+// exports on its own, shows whether work is accumulating in-process.
+func observeHandler(ctx context.Context, queueName string, handle Handler, payload []byte) error {
+	metrics.QueueJobsInFlight.Inc()
+	defer metrics.QueueJobsInFlight.Dec()
+
+	start := time.Now()
+	err := handle(ctx, payload)
+	metrics.QueueHandlerDurationSeconds.WithLabelValues(queueName).Observe(time.Since(start).Seconds())
+
+	return err
+}
 
 // Router maps a queue name (e.g. "statusngin_hoststatus") to the Handler
 // responsible for decoding and dispatching its messages. Both the Gearman

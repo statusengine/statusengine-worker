@@ -41,7 +41,7 @@ func TestRabbitMQConsumerStopUnderLoadClosesOutputSafely(t *testing.T) {
 		},
 	}
 
-	consumer := NewRabbitMQConsumer(rabbitmqURL, router)
+	consumer := NewRabbitMQConsumer(rabbitmqURL, router, 100)
 	ctx, cancel := context.WithCancel(context.Background())
 	defer cancel()
 
