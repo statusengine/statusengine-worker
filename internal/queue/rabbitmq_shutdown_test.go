@@ -51,6 +51,31 @@ func TestRabbitMQConsumerStopUnderLoadClosesOutputSafely(t *testing.T) {
 	}
 	defer consumer.Stop()
 
+	// This test deliberately stops mid-backlog, so most of the messages it
+	// publishes are still unacked when the connection goes away and the
+	// broker requeues them. Without cleaning up, every run leaves ~200
+	// messages behind on a shared dev broker; after a few dozen runs the
+	// accumulated backlog changes the timing enough to make the test
+	// itself flaky. Delete the queue on the way out, on a connection of
+	// its own since the test's is closed by then.
+	t.Cleanup(func() {
+		conn, err := amqp.Dial(rabbitmqURL)
+		if err != nil {
+			t.Logf("cleanup: dial: %v", err)
+			return
+		}
+		defer conn.Close()
+		ch, err := conn.Channel()
+		if err != nil {
+			t.Logf("cleanup: channel: %v", err)
+			return
+		}
+		defer ch.Close()
+		if _, err := ch.QueueDelete(queueName, false, false, false); err != nil {
+			t.Logf("cleanup: delete %s: %v", queueName, err)
+		}
+	})
+
 	// Drain out exactly the way cmd/app/main.go does, so the send side is
 	// genuinely live when the close happens.
 	drained := make(chan struct{})

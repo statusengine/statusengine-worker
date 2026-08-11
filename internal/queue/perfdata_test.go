@@ -90,3 +90,25 @@ func TestParsePerfData(t *testing.T) {
 		})
 	}
 }
+
+// benchPerfData is a realistic perf_data string: several metrics, a quoted
+// label with a space, an EU decimal separator and a percentage unit - the
+// shapes parsePerfData's doc comment calls out.
+const benchPerfData = `rta=0.069000ms;100.000000;500.000000;0.000000 pl=0%;20;60;0 ` +
+	`'response time'=3,7s;5;10;0 load1=0.42;;;0 load5=0.38;;;0 load15=0.31;;;0`
+
+// BenchmarkParsePerfData tracks the allocation cost of the highest-volume
+// path in the worker: every service check carrying perf_data goes through
+// here. It exists to keep the pre-sizing in parsePerfData/splitGauges
+// honest - both slices used to grow from nil, reallocating and copying
+// several times per check.
+func BenchmarkParsePerfData(b *testing.B) {
+	b.ReportAllocs()
+	b.ResetTimer()
+	for i := 0; i < b.N; i++ {
+		points := parsePerfData(benchPerfData)
+		if len(points) != 6 {
+			b.Fatalf("parsed %d points, want 6", len(points))
+		}
+	}
+}

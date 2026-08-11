@@ -12,7 +12,6 @@ import (
 	"log/slog"
 	"net"
 	"strconv"
-	"strings"
 	"sync/atomic"
 	"time"
 
@@ -57,6 +56,15 @@ type Client struct {
 	buffer []Metric
 	conn   net.Conn
 
+	// writeBuf holds the rendered plaintext lines of the batch currently
+	// being flushed. Kept on the Client and reset with [:0] rather than
+	// built fresh each time, so a flush neither reallocates the whole
+	// batch nor copies it a second time on the way to the socket. It
+	// settles at the size of the largest batch seen - a few KB at
+	// MaxBatchSize lines - and stays there. Owned by Run's goroutine,
+	// like buffer and conn.
+	writeBuf []byte
+
 	// processed is the running total of metrics successfully written,
 	// reported on every flush log line. Only ever incremented from
 	// flushBuffer, which always runs inside Run's single goroutine -
@@ -72,7 +80,13 @@ func NewClient(addr string) *Client {
 		addr:     addr,
 		in:       make(chan Metric, MaxBatchSize),
 		flushReq: make(chan flushRequest),
-		buffer:   make([]Metric, 0, MaxBatchSize),
+		// 2*MaxBatchSize, not MaxBatchSize: drainPending can top up an
+		// almost-full buffer with everything sitting in c.in, which holds
+		// MaxBatchSize itself. Sizing for the real maximum keeps the flush
+		// path free of reallocations - the alternative is a one-time grow
+		// to exactly this size the first time a drain lands on a full
+		// buffer, after which the backing array stays this large anyway.
+		buffer: make([]Metric, 0, 2*MaxBatchSize),
 	}
 }
 
@@ -155,6 +169,11 @@ func (c *Client) Run(ctx context.Context) {
 // drainPending moves any metrics already sitting in the input channel's
 // buffer into c.buffer without blocking, so a shutdown racing with an
 // in-flight Enqueue never silently loses that metric.
+//
+// This deliberately appends past MaxBatchSize: the point is to lose
+// nothing, and the overshoot is bounded by c.in's own capacity, so
+// c.buffer peaks just under 2*MaxBatchSize - which is what NewClient
+// sizes it for.
 func (c *Client) drainPending() {
 	for {
 		select {
@@ -198,19 +217,25 @@ func (c *Client) flushBuffer(ctx context.Context) error {
 		return err
 	}
 
-	var sb strings.Builder
+	// Render straight into the reusable buffer, appending each number in
+	// place rather than going through FormatFloat/FormatInt, which would
+	// allocate a throwaway string per metric. 'f' with precision -1 is the
+	// shortest representation that round-trips, and never exponent
+	// notation - Carbon does not accept that.
+	buf := c.writeBuf[:0]
 	for _, m := range c.buffer {
-		sb.WriteString(m.Path)
-		sb.WriteByte(' ')
-		sb.WriteString(strconv.FormatFloat(m.Value, 'f', -1, 64))
-		sb.WriteByte(' ')
-		sb.WriteString(strconv.FormatInt(m.Timestamp, 10))
-		sb.WriteByte('\n')
+		buf = append(buf, m.Path...)
+		buf = append(buf, ' ')
+		buf = strconv.AppendFloat(buf, m.Value, 'f', -1, 64)
+		buf = append(buf, ' ')
+		buf = strconv.AppendInt(buf, m.Timestamp, 10)
+		buf = append(buf, '\n')
 	}
+	c.writeBuf = buf
 
 	start := time.Now()
 	c.conn.SetWriteDeadline(time.Now().Add(writeTimeout))
-	_, err := c.conn.Write([]byte(sb.String()))
+	_, err := c.conn.Write(buf)
 	duration := time.Since(start)
 
 	if err != nil {

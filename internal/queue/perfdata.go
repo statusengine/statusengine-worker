@@ -41,9 +41,14 @@ type perfDataPoint struct {
 // Tokens that are malformed or whose value doesn't parse as a float are
 // skipped rather than failing the whole batch over one bad metric.
 func parsePerfData(raw string) []perfDataPoint {
-	var points []perfDataPoint
+	// One point per gauge at most - tokens that don't parse are skipped
+	// below - so this capacity is exact for well-formed input and an upper
+	// bound otherwise. Worth sizing: this runs for every service check
+	// carrying perf_data, the highest-volume path in the worker.
+	gauges := splitGauges(raw)
+	points := make([]perfDataPoint, 0, len(gauges))
 
-	for _, gauge := range splitGauges(raw) {
+	for _, gauge := range gauges {
 		label, rawValue, unit, ok := parseGauge(gauge)
 		if !ok {
 			continue
@@ -63,7 +68,10 @@ func parsePerfData(raw string) []perfDataPoint {
 // normalizing a double quote to a single quote as it goes - a port of
 // PerfdataParser::splitGauges().
 func splitGauges(raw string) []string {
-	var gauges []string
+	// Gauges are space-separated, so the number of spaces plus one is a
+	// true upper bound. A quoted label containing spaces makes it an
+	// overestimate, which costs nothing.
+	gauges := make([]string, 0, strings.Count(raw, " ")+1)
 	var cur []byte
 	inQuotes := false
 

@@ -112,7 +112,13 @@ func NewBulkInserter[T any](db *sql.DB, table string, columns []string, toRow Ro
 		in:             make(chan T, MaxBatchSize),
 		flushReq:       make(chan flushRequest),
 		pauseReq:       make(chan pauseRequest),
-		buffer:         make([]T, 0, MaxBatchSize),
+		// 2*MaxBatchSize, not MaxBatchSize: drainPending can top up an
+		// almost-full buffer with everything sitting in b.in, which holds
+		// MaxBatchSize itself. Sizing for the real maximum keeps the flush
+		// path free of reallocations - the alternative is a one-time grow
+		// to exactly this size the first time a drain lands on a full
+		// buffer, after which the backing array stays this large anyway.
+		buffer: make([]T, 0, 2*MaxBatchSize),
 	}
 }
 
@@ -296,6 +302,11 @@ func (b *BulkInserter[T]) Run(ctx context.Context) {
 // drainPending moves any items already sitting in the input channel's
 // buffer into b.buffer without blocking, so a shutdown racing with an
 // in-flight Enqueue never silently loses that item.
+//
+// This deliberately appends past MaxBatchSize - CLAUDE.md rule 3 governs
+// when a flush is triggered, not how large a single rescued batch may be.
+// The overshoot is bounded by b.in's own capacity, so b.buffer peaks just
+// under 2*MaxBatchSize, which is what NewBulkInserter sizes it for.
 func (b *BulkInserter[T]) drainPending() {
 	for {
 		select {

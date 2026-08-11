@@ -57,17 +57,23 @@ func perfdataRow(m perfdataMetric, dst []any) []any {
 
 // graphiteMetricPath renders a perfdataMetric's dotted Graphite path as
 // prefix.hostname.service_description.label (e.g.
-// "statusengine.localhost.Ping.RTA"), sanitizing every segment - including
-// prefix itself, mirroring the legacy worker's
-// replaceIllegalCharacters($this->prefix) - so a literal ".", " ", quote or
-// locale-specific character (e.g. an umlaut) in any of them can't inject a
-// bogus path segment or otherwise confuse Graphite. Label may carry a
-// leading/trailing "'" (parsePerfData deliberately keeps a quoted metric's
-// quote characters, matching the legacy worker's statusengine_perfdata.label
-// - see perfdata.go), which is exactly the kind of character this sanitizes.
-func graphiteMetricPath(prefix string, m perfdataMetric) string {
+// "statusengine.localhost.Ping.RTA"), sanitizing hostname, service and
+// label - so a literal ".", " ", quote or locale-specific character (e.g.
+// an umlaut) in any of them can't inject a bogus path segment or otherwise
+// confuse Graphite. Label may carry a leading/trailing "'" (parsePerfData
+// deliberately keeps a quoted metric's quote characters, matching the
+// legacy worker's statusengine_perfdata.label - see perfdata.go), which is
+// exactly the kind of character this sanitizes.
+//
+// sanitizedPrefix must already have been through
+// sanitizeGraphitePathSegment - it is process configuration rather than
+// event data, so it is cleaned once when the Handler is built (see
+// NewPerfdataHandler) instead of on every metric. Sanitizing is
+// idempotent, so doing it here too would be harmless but would put a
+// regex pass per metric on the highest-volume path in the worker.
+func graphiteMetricPath(sanitizedPrefix string, m perfdataMetric) string {
 	return strings.Join([]string{
-		sanitizeGraphitePathSegment(prefix),
+		sanitizedPrefix,
 		sanitizeGraphitePathSegment(m.HostName),
 		sanitizeGraphitePathSegment(m.ServiceDescription),
 		sanitizeGraphitePathSegment(m.Label),

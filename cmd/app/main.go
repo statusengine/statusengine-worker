@@ -16,6 +16,7 @@ import (
 	"strconv"
 	"strings"
 	"sync"
+	"sync/atomic"
 	"syscall"
 	"time"
 
@@ -392,6 +393,47 @@ func newMetricsServer(addr string, h http.Handler) *http.Server {
 	}
 }
 
+// shutdownFlushTimeout is the budget for draining every runner's buffer on
+// shutdown. Because flushRunners runs them concurrently, this is the wall
+// clock the whole flush gets - not a budget that the first runners can
+// spend on behalf of the rest.
+const shutdownFlushTimeout = 10 * time.Second
+
+// flushRunners drains every runner's buffer, concurrently, and returns how
+// many failed. Errors are logged rather than returned: at this point in the
+// shutdown there is nothing left to abort, and one wedged table must not
+// stop the other fourteen from being written.
+//
+// Concurrently, because sequentially they shared a single deadline: a slow
+// MySQL let the first runners spend the entire budget, after which every
+// remaining one was handed an already-expired context, returned ctx.Err()
+// immediately and produced an error line for something it never got a
+// chance to do. No data was lost (each runner's own finalFlush retries on a
+// background context), but the shutdown log said otherwise.
+//
+// This means up to len(runners) statements in flight at once, which is
+// what -mysql-max-open-conns must accommodate; the default of 25 covers the
+// current 15 runners comfortably. Setting it below the runner count is
+// safe - the pool simply serializes the flushes again.
+func flushRunners(ctx context.Context, runners []queue.Runner) int {
+	var wg sync.WaitGroup
+	var failed atomic.Int64
+
+	for _, r := range runners {
+		wg.Add(1)
+		go func(r queue.Runner) {
+			defer wg.Done()
+			if err := r.Flush(ctx); err != nil {
+				failed.Add(1)
+				slog.Error("error flushing runner on shutdown", "error", err)
+			}
+		}(r)
+	}
+	wg.Wait()
+
+	return int(failed.Load())
+}
+
 // connMaxLifetime caps how long a pooled MySQL connection is reused.
 // database/sql cannot tell a connection silently dropped by a proxy, a
 // failover or the server's own wait_timeout from a healthy one until it
@@ -543,14 +585,11 @@ func main() {
 
 	// 6b. Flush every BulkInserter's remaining buffer immediately.
 	flushStart := time.Now()
-	flushCtx, cancelFlush := context.WithTimeout(context.Background(), 10*time.Second)
-	for _, r := range runners {
-		if err := r.Flush(flushCtx); err != nil {
-			slog.Error("error flushing runner on shutdown", "error", err)
-		}
-	}
+	flushCtx, cancelFlush := context.WithTimeout(context.Background(), shutdownFlushTimeout)
+	failed := flushRunners(flushCtx, runners)
 	cancelFlush()
-	slog.Info("shutdown flush complete", "duration", time.Since(flushStart), "runners", len(runners))
+	slog.Info("shutdown flush complete",
+		"duration", time.Since(flushStart), "runners", len(runners), "failed", failed)
 
 	// 6c. Close the DB connection and the WebSocket hub cleanly.
 	cancelPipeline() // stops the (now-empty) BulkInserters' Run loops and the Hub, closing all client connections

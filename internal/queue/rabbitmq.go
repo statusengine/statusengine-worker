@@ -380,7 +380,22 @@ func (c *RabbitMQConsumer) Stop() error {
 			_ = ch.Close()
 		}
 		if conn != nil {
-			err = conn.Close()
+			// A mid-flight shutdown routinely races the delivery loops:
+			// one of them acks on a channel whose connection is already on
+			// its way out, the broker answers with a connection-level
+			// error and closes it, and this Close then reports that the
+			// connection is not open. The connection being gone is the
+			// goal, so that is not a failure - only a Close that leaves it
+			// open is. Reporting the former had cmd/app log "error
+			// stopping consumer" on every shutdown that happened to catch
+			// a backlog.
+			if closeErr := conn.Close(); closeErr != nil {
+				if conn.IsClosed() {
+					slog.Debug("rabbitmq: connection was already closed on shutdown", "error", closeErr)
+				} else {
+					err = closeErr
+				}
+			}
 		}
 
 		// Closing the connection above closed every consumeLoop's
