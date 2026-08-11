@@ -3,6 +3,7 @@ package db
 import (
 	"context"
 	"reflect"
+	"strings"
 	"testing"
 	"time"
 
@@ -14,7 +15,7 @@ type row struct {
 	name string
 }
 
-func toRow(r row) []any { return []any{r.id, r.name} }
+func toRow(r row, dst []any) []any { return append(dst, r.id, r.name) }
 
 func TestBuildInsert(t *testing.T) {
 	b := NewBulkInserter[row](nil, "mytable", []string{"id", "name"}, toRow)
@@ -277,4 +278,40 @@ func TestShutdownFlushesRemainingBuffer(t *testing.T) {
 	}
 
 	waitForExpectations(t, mock, 100*time.Millisecond)
+}
+
+// TestFlushRefusesMismatchedRowValues covers the guard that the append-style
+// RowFunc makes necessary: a RowFunc contributing the wrong number of
+// values misaligns every placeholder after it, and MySQL reports that as
+// one opaque complaint about a statement built from thirteen different
+// RowFuncs. The batch must be rejected here, with a message that names the
+// table and the mismatch, rather than sent and blamed on the database.
+func TestFlushRefusesMismatchedRowValues(t *testing.T) {
+	mockDB, mock, err := sqlmock.New()
+	if err != nil {
+		t.Fatalf("sqlmock: %v", err)
+	}
+	defer mockDB.Close()
+
+	// Two columns declared, three values appended.
+	shortRow := func(r row, dst []any) []any { return append(dst, r.id, r.name, "surplus") }
+	inserter := NewBulkInserter[row](mockDB, "events", []string{"id", "name"}, shortRow)
+	inserter.buffer = append(inserter.buffer, row{1, "a"})
+
+	err = inserter.flushBuffer(context.Background())
+	if err == nil {
+		t.Fatal("expected a mismatched row to be rejected, got no error")
+	}
+	if got := err.Error(); !strings.Contains(got, "events") || !strings.Contains(got, "want 2") {
+		t.Fatalf("error %q should name the table and the expected count", got)
+	}
+
+	// The batch must be cleared, not retried forever against a broken RowFunc.
+	if len(inserter.buffer) != 0 {
+		t.Fatalf("buffer still holds %d rows after a rejected flush", len(inserter.buffer))
+	}
+	// And nothing may have reached the database.
+	if err := mock.ExpectationsWereMet(); err != nil {
+		t.Fatalf("a statement was executed despite the mismatch: %v", err)
+	}
 }

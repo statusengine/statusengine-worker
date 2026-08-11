@@ -51,8 +51,8 @@ type perfdataMetric struct {
 // (hostname, service_description, label, timestamp, timestamp_unix,
 // value, unit); timestamp and timestamp_unix both carry the same Unix
 // second, mirroring how the legacy worker populates this table.
-func perfdataRow(m perfdataMetric) []any {
-	return []any{m.HostName, m.ServiceDescription, m.Label, m.Timestamp * 1000, m.Timestamp, m.Value, m.Unit}
+func perfdataRow(m perfdataMetric, dst []any) []any {
+	return append(dst, m.HostName, m.ServiceDescription, m.Label, m.Timestamp*1000, m.Timestamp, m.Value, m.Unit)
 }
 
 // graphiteMetricPath renders a perfdataMetric's dotted Graphite path as

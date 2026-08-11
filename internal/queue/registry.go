@@ -94,9 +94,9 @@ var serviceStatusUpdateColumns = serviceStatusColumns[2:]
 // event itself (CLAUDE.md: worker-wide "nodename" option, default
 // "statusengine").
 func newHostStatusRow(nodeName string) db.RowFunc[hostStatusEvent] {
-	return func(ev hostStatusEvent) []any {
+	return func(ev hostStatusEvent, dst []any) []any {
 		p := ev.HostStatusPayload
-		return []any{
+		return append(dst,
 			p.Name, ev.Timestamp, p.PluginOutput, p.LongPluginOutput, p.PerfData, p.CurrentState,
 			p.CurrentAttempt, p.MaxAttempts, p.LastCheck, p.NextCheck, isPassiveCheck(p.CheckType),
 			p.LastStateChange, p.LastHardStateChange, p.LastHardState, isHardState(p.StateType),
@@ -106,16 +106,16 @@ func newHostStatusRow(nodeName string) db.RowFunc[hostStatusEvent] {
 			p.ProcessPerformanceData, p.Obsess, int(p.CheckInterval), int(p.RetryInterval),
 			p.CheckPeriod, nodeName, p.LastTimeUp, p.LastTimeDown, p.LastTimeUnreachable,
 			p.CurrentNotificationNumber, p.PercentStateChange, p.EventHandler, p.CheckCommand,
-		}
+		)
 	}
 }
 
 // newServiceStatusRow is the statusengine_servicestatus equivalent of
 // newHostStatusRow.
 func newServiceStatusRow(nodeName string) db.RowFunc[serviceStatusEvent] {
-	return func(ev serviceStatusEvent) []any {
+	return func(ev serviceStatusEvent, dst []any) []any {
 		p := ev.ServiceStatusPayload
-		return []any{
+		return append(dst,
 			p.HostName, p.Description, ev.Timestamp, p.PluginOutput, p.LongPluginOutput, p.PerfData,
 			p.CurrentState, p.CurrentAttempt, p.MaxAttempts, p.LastCheck, p.NextCheck,
 			isPassiveCheck(p.CheckType), p.LastStateChange, p.LastHardStateChange, p.LastHardState,
@@ -126,24 +126,24 @@ func newServiceStatusRow(nodeName string) db.RowFunc[serviceStatusEvent] {
 			int(p.RetryInterval), p.CheckPeriod, nodeName, p.LastTimeOk, p.LastTimeWarning,
 			p.LastTimeCritical, p.LastTimeUnknown, p.CurrentNotificationNumber, p.PercentStateChange,
 			p.EventHandler, p.CheckCommand,
-		}
+		)
 	}
 }
 
-func hostCheckRow(ev hostCheckEvent) []any {
-	return []any{
+func hostCheckRow(ev hostCheckEvent, dst []any) []any {
+	return append(dst,
 		ev.HostName, ev.StartTime, ev.TimestampUsec, ev.State, isHardState(ev.StateType), ev.EndTime,
 		ev.Output, ev.LongOutput, ev.Timeout, ev.EarlyTimeout, ev.Latency,
 		ev.ExecutionTime, ev.PerfData, ev.CommandLine, ev.CurrentAttempt, ev.MaxAttempts,
-	}
+	)
 }
 
-func serviceCheckRow(ev serviceCheckEvent) []any {
-	return []any{
+func serviceCheckRow(ev serviceCheckEvent, dst []any) []any {
+	return append(dst,
 		ev.ServiceDescription, ev.StartTime, ev.TimestampUsec, ev.HostName, ev.State, isHardState(ev.StateType), ev.EndTime,
 		ev.Output, ev.LongOutput, ev.Timeout, ev.EarlyTimeout, ev.Latency,
 		ev.ExecutionTime, ev.PerfData, ev.CommandLine, ev.CurrentAttempt, ev.MaxAttempts,
-	}
+	)
 }
 
 // newLogEntryRow returns a RowFunc for statusengine_logentries, closing over
@@ -151,13 +151,13 @@ func serviceCheckRow(ev serviceCheckEvent) []any {
 // itself (CLAUDE.md: worker-wide "nodename" option) - the logentry payload
 // carries no node identifier of its own (see .claude/specs/statusngin_logentries.json).
 func newLogEntryRow(nodeName string) db.RowFunc[types.LogEntryPayload] {
-	return func(p types.LogEntryPayload) []any {
-		return []any{p.EntryTime, p.DataType, p.Data, nodeName}
+	return func(p types.LogEntryPayload, dst []any) []any {
+		return append(dst, p.EntryTime, p.DataType, p.Data, nodeName)
 	}
 }
 
-func hostStateHistoryRow(ev stateChangeEvent) []any {
-	return []any{
+func hostStateHistoryRow(ev stateChangeEvent, dst []any) []any {
+	return append(dst,
 		ev.HostName, ev.Timestamp, ev.TimestampUsec,
 		// NOTE: Unlike standard NDOUtils where 'state_change' indicates a state transition occurrence,
 		// Statusengine repurposes this field to differentiate between Host (0) and Service (1) state history.
@@ -167,11 +167,11 @@ func hostStateHistoryRow(ev stateChangeEvent) []any {
 		ev.StateChangeType,
 		ev.State, isHardState(ev.StateType),
 		ev.CurrentAttempt, ev.MaxAttempts, ev.LastState, ev.LastHardState, ev.Output, ev.LongOutput,
-	}
+	)
 }
 
-func serviceStateHistoryRow(ev stateChangeEvent) []any {
-	return []any{
+func serviceStateHistoryRow(ev stateChangeEvent, dst []any) []any {
+	return append(dst,
 		ev.ServiceDescription, ev.Timestamp, ev.TimestampUsec, ev.HostName,
 		// NOTE: Unlike standard NDOUtils where 'state_change' indicates a state transition occurrence,
 		// Statusengine repurposes this field to differentiate between Host (0) and Service (1) state history.
@@ -181,21 +181,21 @@ func serviceStateHistoryRow(ev stateChangeEvent) []any {
 		ev.StateChangeType,
 		ev.State, isHardState(ev.StateType),
 		ev.CurrentAttempt, ev.MaxAttempts, ev.LastState, ev.LastHardState, ev.Output, ev.LongOutput,
-	}
+	)
 }
 
-func hostAcknowledgementRow(ev acknowledgementEvent) []any {
-	return []any{
+func hostAcknowledgementRow(ev acknowledgementEvent, dst []any) []any {
+	return append(dst,
 		ev.HostName, ev.EntryTime, ev.EntryTimeUsec, ev.State, ev.AuthorName, ev.CommentData,
 		ev.AcknowledgementType, ev.IsSticky, ev.PersistentComment, ev.NotifyContacts,
-	}
+	)
 }
 
-func serviceAcknowledgementRow(ev acknowledgementEvent) []any {
-	return []any{
+func serviceAcknowledgementRow(ev acknowledgementEvent, dst []any) []any {
+	return append(dst,
 		ev.ServiceDescription, ev.EntryTime, ev.EntryTimeUsec, ev.HostName, ev.State, ev.AuthorName, ev.CommentData,
 		ev.AcknowledgementType, ev.IsSticky, ev.PersistentComment, ev.NotifyContacts,
-	}
+	)
 }
 
 // notificationTypeContactNotificationMethodEnd is the Nagios/Icinga/Naemon
@@ -206,18 +206,18 @@ func serviceAcknowledgementRow(ev acknowledgementEvent) []any {
 // other type value on this queue is discarded immediately.
 const notificationTypeContactNotificationMethodEnd = 605
 
-func hostNotificationRow(ev notificationMethodEvent) []any {
-	return []any{
+func hostNotificationRow(ev notificationMethodEvent, dst []any) []any {
+	return append(dst,
 		ev.HostName, ev.Timestamp, ev.TimestampUsec, ev.ContactName, ev.CommandName, ev.CommandArgs,
 		ev.State, ev.EndTime, ev.ReasonType, ev.Output, ev.AckAuthor, ev.AckData,
-	}
+	)
 }
 
-func serviceNotificationRow(ev notificationMethodEvent) []any {
-	return []any{
+func serviceNotificationRow(ev notificationMethodEvent, dst []any) []any {
+	return append(dst,
 		ev.ServiceDescription, ev.Timestamp, ev.TimestampUsec, ev.HostName, ev.ContactName, ev.CommandName,
 		ev.CommandArgs, ev.State, ev.EndTime, ev.ReasonType, ev.Output, ev.AckAuthor, ev.AckData,
-	}
+	)
 }
 
 // newContactNotificationMethodHandler filters out every event whose type
@@ -257,20 +257,20 @@ func newContactNotificationMethodHandler(hub *websocket.Hub, topic string, hostI
 // and only once it actually reached at least one contact.
 const notificationTypeEnd = 601
 
-func hostNotificationLogRow(ev notificationLogEvent) []any {
+func hostNotificationLogRow(ev notificationLogEvent, dst []any) []any {
 	// long_output is identical to output in this context, so it is skipped to save database space.
-	return []any{
+	return append(dst,
 		ev.HostName, ev.StartTime, ev.TimestampUsec, ev.EndTime, ev.State, ev.ReasonType,
 		ev.Escalated, ev.ContactsNotified, ev.Output, ev.AckAuthor, ev.AckData,
-	}
+	)
 }
 
-func serviceNotificationLogRow(ev notificationLogEvent) []any {
+func serviceNotificationLogRow(ev notificationLogEvent, dst []any) []any {
 	// long_output is identical to output in this context, so it is skipped to save database space.
-	return []any{
+	return append(dst,
 		ev.HostName, ev.ServiceDescription, ev.StartTime, ev.TimestampUsec, ev.EndTime, ev.State,
 		ev.ReasonType, ev.Escalated, ev.ContactsNotified, ev.Output, ev.AckAuthor, ev.AckData,
-	}
+	)
 }
 
 // newNotificationHandler discards every event that isn't

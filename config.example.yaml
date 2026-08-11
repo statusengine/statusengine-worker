@@ -33,8 +33,12 @@ mysql_dsn: statusengine-dev:statusengine-dev@tcp(127.0.0.1:3306)/statusengine-de
 # max_connections, and remember it applies per worker process.
 mysql_max_open_conns: 25
 
-# Address the WebSocket HTTP server (/ws) listens on.
-listen_addr: ":8080"
+# Address the WebSocket HTTP server (/ws) listens on. Loopback-only by
+# default: the /ws stream carries every monitoring event the worker sees,
+# so exposing it on the network is an explicit decision, not something
+# that happens by leaving a setting alone. Set ":8080" to listen on all
+# interfaces - and set api_keys below to a real secret if you do.
+listen_addr: 127.0.0.1:8080
 
 # Address the Prometheus /metrics HTTP server listens on.
 metrics_listen_addr: ":9105"
@@ -58,8 +62,13 @@ nodename: statusengine
 # these via the "Authorization: Bearer <key>" or "X-Api-Key" header; the
 # browser-based demo client (web/ws-test-client.html) uses the ?api_key=
 # query parameter instead, since browser JavaScript can't set custom
-# headers on a WebSocket handshake. Leave this empty (or omit it) to
-# disable /ws authentication entirely - the default.
+# headers on a WebSocket handshake.
+#
+# Leaving this empty does NOT disable authentication: the worker then
+# generates a random key at startup and logs it as a warning. That is a
+# safety net so an unconfigured worker is never an open event stream - it
+# changes on every restart, so configure a real key here for anything
+# that has to reconnect on its own.
 api_keys: []
 # api_keys:
 #   - change-me-to-a-real-secret

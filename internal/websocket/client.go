@@ -25,7 +25,25 @@ const (
 var upgrader = websocket.Upgrader{
 	ReadBufferSize:  1024,
 	WriteBufferSize: 1024,
-	// TODO: restrict to known origins once frontend deployment is fixed.
+
+	// Origin is deliberately not checked, and this is not an oversight to
+	// be "fixed" later.
+	//
+	// An origin check defends against a web page in an operator's browser
+	// opening this endpoint behind their back - a WebSocket handshake is
+	// exempt from the same-origin policy and triggers no CORS preflight,
+	// so any page can try. That attack only pays off against an endpoint
+	// that authenticates ambiently (cookies) or not at all. Neither
+	// applies here: /ws is never served unauthenticated (cmd/app's
+	// resolveAPIKeys generates a key when none is configured), the key
+	// travels in a header or an explicit query parameter rather than
+	// ambiently, and the listener binds to loopback unless someone opts
+	// out. A page that cannot produce the key gets a 401 whatever Origin
+	// it claims.
+	//
+	// Checking origins instead would mean maintaining an allowlist for
+	// every dashboard deployment while adding nothing an attacker who
+	// already has the key couldn't bypass.
 	CheckOrigin: func(r *http.Request) bool { return true },
 }
 
@@ -99,7 +117,18 @@ func ServeWS(hub *Hub, w http.ResponseWriter, r *http.Request, validKeys map[str
 		topics: parseTopics(r.URL.Query().Get("topics")),
 	}
 
-	client.hub.register <- client
+	// Registration is the one send that happens before either pump is
+	// running, so a Hub that has already stopped would leave this
+	// connection with no reader, no writer and nobody to close it. Bail
+	// out and clean up here instead. A connection arriving during
+	// shutdown is ordinary, not an error, so it is not counted as one.
+	select {
+	case client.hub.register <- client:
+	case <-client.hub.done:
+		slog.Debug("websocket: refusing connection, hub is stopped", "client_id", client.id)
+		conn.Close()
+		return
+	}
 
 	go client.writePump()
 	go client.readPump()
@@ -133,7 +162,14 @@ func (c *Client) wantsTopic(topic string) bool {
 // client-initiated close).
 func (c *Client) readPump() {
 	defer func() {
-		c.hub.unregister <- c
+		// If the Hub has already stopped it has closed this client
+		// itself (see closeAll), so there is nothing to unregister and
+		// nobody reading the channel - go straight to closing the
+		// connection rather than parking here forever.
+		select {
+		case c.hub.unregister <- c:
+		case <-c.hub.done:
+		}
 		c.conn.Close()
 	}()
 
@@ -157,7 +193,12 @@ func (c *Client) readPump() {
 		if err := json.Unmarshal(message, &sub); err != nil {
 			continue // ignore malformed control frames, keep the connection alive
 		}
-		c.hub.updateSubscription <- subscriptionUpdate{client: c, sub: sub}
+		select {
+		case c.hub.updateSubscription <- subscriptionUpdate{client: c, sub: sub}:
+		case <-c.hub.done:
+			// Hub is gone; this connection is being torn down anyway.
+			return
+		}
 	}
 }
 

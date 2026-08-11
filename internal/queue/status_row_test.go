@@ -24,7 +24,7 @@ func TestNewHostStatusRowMatchesColumns(t *testing.T) {
 		t.Fatalf("decode: %v", err)
 	}
 
-	row := newHostStatusRow("statusengine-test")(items[0])
+	row := newHostStatusRow("statusengine-test")(items[0], nil)
 	if len(row) != len(hostStatusColumns) {
 		t.Fatalf("row has %d values, want %d matching hostStatusColumns", len(row), len(hostStatusColumns))
 	}
@@ -60,7 +60,7 @@ func TestNewServiceStatusRowMatchesColumns(t *testing.T) {
 		t.Fatalf("decode: %v", err)
 	}
 
-	row := newServiceStatusRow("statusengine-test")(items[0])
+	row := newServiceStatusRow("statusengine-test")(items[0], nil)
 	if len(row) != len(serviceStatusColumns) {
 		t.Fatalf("row has %d values, want %d matching serviceStatusColumns", len(row), len(serviceStatusColumns))
 	}

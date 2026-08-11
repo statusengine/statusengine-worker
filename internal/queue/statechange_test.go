@@ -79,7 +79,7 @@ func TestHostStateHistoryRowAndServiceStateHistoryRowColumns(t *testing.T) {
 	}
 	ev := items[0]
 
-	hostRow := hostStateHistoryRow(ev)
+	hostRow := hostStateHistoryRow(ev, nil)
 	if len(hostRow) != 12 {
 		t.Fatalf("hostStateHistoryRow has %d values, want 12", len(hostRow))
 	}
@@ -88,7 +88,7 @@ func TestHostStateHistoryRowAndServiceStateHistoryRowColumns(t *testing.T) {
 			hostRow[0:4], ev.HostName, ev.Timestamp, ev.TimestampUsec, ev.StateChangeType)
 	}
 
-	serviceRow := serviceStateHistoryRow(ev)
+	serviceRow := serviceStateHistoryRow(ev, nil)
 	if len(serviceRow) != 13 {
 		t.Fatalf("serviceStateHistoryRow has %d values, want 13", len(serviceRow))
 	}

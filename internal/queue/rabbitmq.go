@@ -31,6 +31,12 @@ const reconnectDelay = 2 * time.Second
 // it, burning a CPU core and filling the log for the entire outage.
 const requeueDelay = 250 * time.Millisecond
 
+// stopDrainTimeout bounds how long Stop waits for Handlers still in flight
+// before giving up on them. Generous enough that a normal in-flight batch
+// always finishes, short enough that a wedged Handler can't turn a
+// graceful shutdown into a hang.
+const stopDrainTimeout = 5 * time.Second
+
 // RabbitMQConsumer implements queue.Consumer against a RabbitMQ broker. It
 // opens one channel and consumer per queue name present in its Router;
 // each delivery's body is decoded and dispatched by the matching Handler,
@@ -346,8 +352,20 @@ func (c *RabbitMQConsumer) logStatsPeriodically(ctx context.Context) {
 // Stop closes the current connection (and, before that, every channel
 // opened on it), which causes every consumeLoop's deliveries channel to
 // close and its goroutine to exit, and signals superviseReconnects to stop
-// retrying rather than treat this as a drop to recover from. Safe to call
-// multiple times and safe to call without a prior Start.
+// retrying rather than treat this as a drop to recover from. It then waits
+// for any Handler still in flight to return, so that once Stop has
+// returned, nothing is being enqueued into the pipeline any more. Safe to
+// call multiple times and safe to call without a prior Start.
+//
+// That wait is what makes cmd/app/main.go's shutdown order sound: step 6a
+// stops the consumer "so no new data comes in", then step 6b flushes every
+// BulkInserter. Returning while Handlers were still running meant rows
+// enqueued after their inserter had already flushed, which are then lost -
+// on every shutdown under load. The Gearman consumer has always waited on
+// its handlers here (see handlerWG); this is the same guarantee.
+//
+// The wait is bounded: a shutdown must never hang outright, so after
+// stopDrainTimeout it gives up and says so rather than blocking forever.
 func (c *RabbitMQConsumer) Stop() error {
 	var err error
 	c.stopOnce.Do(func() {
@@ -365,11 +383,47 @@ func (c *RabbitMQConsumer) Stop() error {
 			err = conn.Close()
 		}
 
+		// Closing the connection above closed every consumeLoop's
+		// deliveries channel, so the loops are already on their way out.
+		// The only things one can still be blocked on are its Handler's
+		// Enqueue (which selects on ctx, and whose BulkInserter is still
+		// draining - cmd/app/main.go doesn't cancel the pipeline until
+		// step 6c) and pauseBeforeRequeue (which selects on c.stopping,
+		// closed just above). Sends to out are non-blocking. So this
+		// terminates on its own; the timeout is a backstop, not the plan.
+		if !waitTimeout(&c.consumerWG, stopDrainTimeout) {
+			slog.Warn("rabbitmq: gave up waiting for in-flight handlers",
+				"timeout", stopDrainTimeout,
+				"note", "buffered rows enqueued after this point may not be flushed")
+		}
+
 		slog.Info("rabbitmq: consumer stopped",
 			"processed", c.processed.Load(), "errors", c.errors.Load(),
 			"dropped", c.dropped.Load(), "reconnects", c.reconnects.Load())
 	})
 	return err
+}
+
+// waitTimeout waits for wg, reporting false if d elapsed first. The
+// spawned goroutine outlives a timed-out call until the WaitGroup does
+// drain, which is acceptable precisely because the only caller is a
+// shutdown path that is about to end the process anyway.
+func waitTimeout(wg *sync.WaitGroup, d time.Duration) bool {
+	done := make(chan struct{})
+	go func() {
+		wg.Wait()
+		close(done)
+	}()
+
+	timer := time.NewTimer(d)
+	defer timer.Stop()
+
+	select {
+	case <-done:
+		return true
+	case <-timer.C:
+		return false
+	}
 }
 
 // redactURL masks an amqp:// URL's password before it ever reaches a log

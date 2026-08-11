@@ -86,7 +86,7 @@ func TestHostNotificationLogRowAndServiceNotificationLogRowColumns(t *testing.T)
 	}
 	ev := items[0]
 
-	hostRow := hostNotificationLogRow(ev)
+	hostRow := hostNotificationLogRow(ev, nil)
 	if len(hostRow) != 11 {
 		t.Fatalf("hostNotificationLogRow has %d values, want 11", len(hostRow))
 	}
@@ -94,7 +94,7 @@ func TestHostNotificationLogRowAndServiceNotificationLogRowColumns(t *testing.T)
 		t.Fatalf("hostNotificationLogRow[0:3] = %v, want [%v %v %v]", hostRow[0:3], ev.HostName, ev.StartTime, ev.TimestampUsec)
 	}
 
-	serviceRow := serviceNotificationLogRow(ev)
+	serviceRow := serviceNotificationLogRow(ev, nil)
 	if len(serviceRow) != 12 {
 		t.Fatalf("serviceNotificationLogRow has %d values, want 12", len(serviceRow))
 	}

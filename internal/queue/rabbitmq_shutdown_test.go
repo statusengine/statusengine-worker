@@ -2,6 +2,7 @@ package queue
 
 import (
 	"context"
+	"sync/atomic"
 	"testing"
 	"time"
 
@@ -22,10 +23,20 @@ func TestRabbitMQConsumerStopUnderLoadClosesOutputSafely(t *testing.T) {
 	queueName := "queue_pkg_test_stop_under_load"
 
 	// A handler slow enough that Stop reliably lands while several delivery
-	// loops are still inside one.
+	// loops are still inside one. inFlight tracks how many are mid-handler
+	// at any moment, so the test can also assert what Stop promises: that
+	// nothing is still enqueueing into the pipeline once it has returned.
+	var inFlight atomic.Int64
 	router := Router{
 		queueName: func(_ context.Context, _ []byte) error {
-			time.Sleep(5 * time.Millisecond)
+			inFlight.Add(1)
+			defer inFlight.Add(-1)
+			// Long enough that Stop reliably lands inside a handler rather
+			// than between two. Only one handler per queue is ever in
+			// flight (the loop is serial, and closing the connection stops
+			// it after the current one), so this doesn't scale with the
+			// message count.
+			time.Sleep(25 * time.Millisecond)
 			return nil
 		},
 	}
@@ -75,6 +86,14 @@ func TestRabbitMQConsumerStopUnderLoadClosesOutputSafely(t *testing.T) {
 	time.Sleep(50 * time.Millisecond)
 	if err := consumer.Stop(); err != nil {
 		t.Fatalf("stop: %v", err)
+	}
+
+	// cmd/app/main.go flushes every BulkInserter immediately after this
+	// returns, on the strength of "the consumer is stopped, so no new data
+	// comes in". A Handler still running here would enqueue rows after
+	// their inserter had already flushed, and those rows are lost.
+	if running := inFlight.Load(); running != 0 {
+		t.Fatalf("Stop returned with %d handler(s) still running; rows they enqueue now are lost", running)
 	}
 
 	select {

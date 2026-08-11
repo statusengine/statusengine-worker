@@ -24,9 +24,13 @@ func extractAPIKey(r *http.Request) string {
 
 // authorized reports whether r carries one of validKeys. An empty/nil
 // validKeys disables authentication entirely - every request is
-// authorized - which is the worker's default (opt in via the -api-keys
-// flag/STATUSENGINE_API_KEYS env var), consistent with every other
-// security-relevant CLAUDE.md option (e.g. enableOpenITCockpitTweaks).
+// authorized.
+//
+// The running worker never takes that branch: cmd/app's resolveAPIKeys
+// always hands ServeWS a non-empty set, generating a random per-run key
+// when none is configured, so /ws is not served unauthenticated. The
+// branch remains for tests, which pass nil to exercise the Hub without
+// building a key set for every case.
 func authorized(r *http.Request, validKeys map[string]struct{}) bool {
 	if len(validKeys) == 0 {
 		return true

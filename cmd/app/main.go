@@ -4,8 +4,11 @@ package main
 
 import (
 	"context"
+	"crypto/rand"
 	"database/sql"
+	"encoding/hex"
 	"flag"
+	"fmt"
 	"log/slog"
 	"net/http"
 	"os"
@@ -168,8 +171,9 @@ func loadConfig() config {
 	flag.IntVar(&cfg.mysqlMaxOpenConns, "mysql-max-open-conns", 25,
 		"maximum number of open MySQL connections (also used as the idle-connection limit); "+
 			"must stay below the server's max_connections")
-	flag.StringVar(&cfg.listenAddr, "listen-addr", ":8080",
-		"address the WebSocket HTTP server listens on")
+	flag.StringVar(&cfg.listenAddr, "listen-addr", "127.0.0.1:8080",
+		"address the WebSocket HTTP server listens on; loopback-only by default, "+
+			"pass an explicit interface (e.g. \":8080\") to expose it on the network")
 	flag.StringVar(&cfg.metricsListenAddr, "metrics-listen-addr", ":9105",
 		"address the Prometheus /metrics HTTP server listens on")
 	flag.StringVar(&cfg.graphiteAddr, "graphite-addr", "127.0.0.1:2003",
@@ -253,8 +257,8 @@ func fatal(msg string, args ...any) {
 
 // parseAPIKeys splits raw (the -api-keys flag/STATUSENGINE_API_KEYS value)
 // on commas into the set websocket.ServeWS checks incoming /ws requests
-// against. An empty raw yields an empty (nil) set, which ServeWS treats as
-// "authentication disabled" - the worker's default.
+// against. An empty raw yields an empty (nil) set; resolveAPIKeys, not
+// this function, decides what that means.
 func parseAPIKeys(raw string) map[string]struct{} {
 	if raw == "" {
 		return nil
@@ -267,6 +271,56 @@ func parseAPIKeys(raw string) map[string]struct{} {
 		}
 	}
 	return keys
+}
+
+// resolveAPIKeys turns the configured -api-keys value into the key set
+// /ws is guarded with, generating a random one when nothing was
+// configured. The /ws stream carries every monitoring event the worker
+// sees, so it is never served unauthenticated: an unconfigured worker
+// gets a per-run key rather than an open endpoint.
+//
+// This matters more than it looks. A WebSocket handshake is not subject to
+// the same-origin policy and triggers no CORS preflight, so an open /ws on
+// any address a browser can reach - including a loopback or RFC1918 one -
+// can be opened by any web page the operator happens to visit, which then
+// receives the whole event stream. Loopback-only binding (see
+// -listen-addr's default) narrows who can reach the port; the key is what
+// makes reaching it useless.
+//
+// The generated key changes on every restart, so it is a safety net, not
+// the intended production setup: configure -api-keys/STATUSENGINE_API_KEYS
+// for a stable one.
+func resolveAPIKeys(raw string) map[string]struct{} {
+	if keys := parseAPIKeys(raw); len(keys) > 0 {
+		return keys
+	}
+
+	generated, err := generateAPIKey()
+	if err != nil {
+		// crypto/rand failing is not something to paper over with a
+		// weaker key - without a usable secret, refusing to start beats
+		// serving the event stream to anyone who asks.
+		fatal("websocket: could not generate an API key", "error", err)
+	}
+
+	// Warn rather than Info: this is the one startup line an operator has
+	// to actually read. Note that -log-level error suppresses it - that is
+	// the operator opting out of warnings, and -api-keys is the answer.
+	slog.Warn("websocket: no API key configured, generated a random one for this run",
+		"api_key", generated,
+		"hint", "set -api-keys/STATUSENGINE_API_KEYS (or api_keys in the config file) for a stable key")
+
+	return map[string]struct{}{generated: {}}
+}
+
+// generateAPIKey returns a 256-bit random key, hex-encoded so it survives
+// being pasted into a URL, a header or a config file unescaped.
+func generateAPIKey() (string, error) {
+	buf := make([]byte, 32)
+	if _, err := rand.Read(buf); err != nil {
+		return "", fmt.Errorf("read random bytes: %w", err)
+	}
+	return hex.EncodeToString(buf), nil
 }
 
 func envOrDefault(key, def string) string {
@@ -289,6 +343,53 @@ func envBoolOrDefault(key string, def bool) bool {
 		return def
 	}
 	return parsed
+}
+
+// HTTP server timeouts. Without them a client that opens a connection and
+// then dribbles (or never finishes) its request headers keeps a goroutine
+// and a file descriptor for as long as it likes - the Slowloris shape, and
+// what gosec flags as G112 on a bare &http.Server{}.
+const (
+	// wsReadHeaderTimeout bounds the WebSocket handshake's header phase.
+	wsReadHeaderTimeout = 10 * time.Second
+	// wsIdleTimeout bounds a kept-alive connection that never upgrades.
+	wsIdleTimeout = 120 * time.Second
+
+	metricsReadHeaderTimeout = 5 * time.Second
+	metricsReadTimeout       = 10 * time.Second
+	metricsWriteTimeout      = 30 * time.Second
+	metricsIdleTimeout       = 60 * time.Second
+)
+
+// newWebsocketServer builds the /ws server.
+//
+// It deliberately sets no ReadTimeout or WriteTimeout. Those are whole-
+// request deadlines, and a WebSocket connection is a request that is
+// meant to last hours: they would apply to the pre-upgrade handshake and
+// then be inherited by the hijacked connection, where the read and write
+// pumps manage their own deadlines instead (see writeWait/pongWait in
+// internal/websocket/client.go). Header and idle timeouts cover the phase
+// the server still owns, which is the phase Slowloris attacks.
+func newWebsocketServer(addr string, h http.Handler) *http.Server {
+	return &http.Server{
+		Addr:              addr,
+		Handler:           h,
+		ReadHeaderTimeout: wsReadHeaderTimeout,
+		IdleTimeout:       wsIdleTimeout,
+	}
+}
+
+// newMetricsServer builds the /metrics server. Unlike /ws this serves
+// ordinary short-lived requests, so it gets the full set of timeouts.
+func newMetricsServer(addr string, h http.Handler) *http.Server {
+	return &http.Server{
+		Addr:              addr,
+		Handler:           h,
+		ReadHeaderTimeout: metricsReadHeaderTimeout,
+		ReadTimeout:       metricsReadTimeout,
+		WriteTimeout:      metricsWriteTimeout,
+		IdleTimeout:       metricsIdleTimeout,
+	}
 }
 
 // connMaxLifetime caps how long a pooled MySQL connection is reused.
@@ -350,12 +451,12 @@ func main() {
 		hub.Run(pipelineCtx)
 	}()
 
-	apiKeys := parseAPIKeys(cfg.apiKeys)
+	apiKeys := resolveAPIKeys(cfg.apiKeys)
 	mux := http.NewServeMux()
 	mux.HandleFunc("/ws", func(w http.ResponseWriter, r *http.Request) {
 		websocket.ServeWS(hub, w, r, apiKeys)
 	})
-	httpServer := &http.Server{Addr: cfg.listenAddr, Handler: mux}
+	httpServer := newWebsocketServer(cfg.listenAddr, mux)
 	go func() {
 		slog.Info("websocket: listening", "addr", cfg.listenAddr, "path", "/ws", "auth_enabled", len(apiKeys) > 0)
 		if err := httpServer.ListenAndServe(); err != nil && err != http.ErrServerClosed {
@@ -367,7 +468,7 @@ func main() {
 	// shares a listener (or its request queue) with the WebSocket server.
 	metricsMux := http.NewServeMux()
 	metricsMux.Handle("/metrics", promhttp.Handler())
-	metricsServer := &http.Server{Addr: cfg.metricsListenAddr, Handler: metricsMux}
+	metricsServer := newMetricsServer(cfg.metricsListenAddr, metricsMux)
 	go func() {
 		slog.Info("metrics: listening", "addr", cfg.metricsListenAddr, "path", "/metrics")
 		if err := metricsServer.ListenAndServe(); err != nil && err != http.ErrServerClosed {

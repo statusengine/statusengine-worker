@@ -7,6 +7,7 @@ import (
 	"context"
 	"encoding/json"
 	"log/slog"
+	"sync"
 	"sync/atomic"
 	"time"
 
@@ -63,11 +64,28 @@ type subscriptionUpdate struct {
 // All Hub state (clients map, per-client topic sets) is only ever touched
 // from within Run's goroutine, so no locking is required - registration,
 // unsubscription and dispatch are simply serialized through channels.
+//
+// A Hub is single-use. Once Run returns, the Hub is permanently stopped:
+// every client has been closed and the lifecycle channels below have no
+// reader, so anything still trying to register, unregister or resubscribe
+// gives up via done instead of blocking forever on a channel nobody will
+// ever read. A restart or config reload therefore builds a *new* Hub and
+// swaps it in (e.g. behind an atomic.Pointer the /ws handler reads),
+// rather than restarting this one - which is why done is created once and
+// never replaced.
 type Hub struct {
 	broadcast          chan Event
 	register           chan *Client
 	unregister         chan *Client
 	updateSubscription chan subscriptionUpdate
+
+	// done is closed when Run returns, whatever the reason. It is the
+	// escape hatch for every send on the three lifecycle channels above:
+	// they are unbuffered, so without it a client arriving during or
+	// after shutdown parks a goroutine (and its connection's file
+	// descriptor) for the rest of the process's life.
+	done     chan struct{}
+	doneOnce sync.Once
 
 	clients map[*Client]struct{}
 
@@ -106,6 +124,7 @@ func NewHub() *Hub {
 		register:           make(chan *Client),
 		unregister:         make(chan *Client),
 		updateSubscription: make(chan subscriptionUpdate),
+		done:               make(chan struct{}),
 		clients:            make(map[*Client]struct{}),
 		topicPrefix:        make(map[string][]byte),
 	}
@@ -140,8 +159,17 @@ func (h *Hub) Publish(topic string, payload []byte) {
 
 // Run processes client (de)registrations, subscription updates and
 // broadcasts until ctx is cancelled, at which point it closes every
-// connected client. It must run in exactly one goroutine.
+// connected client. It must run in exactly one goroutine, and only once
+// per Hub - see the type comment.
 func (h *Hub) Run(ctx context.Context) {
+	// Closed on every return path, not just the ctx.Done() one, so a Hub
+	// that stops for any reason still releases whoever is waiting to
+	// register or unregister. sync.Once rather than a bare close: a
+	// second Run call is a programming error, but turning it into a
+	// "close of closed channel" panic during shutdown - the one place a
+	// new panic is least welcome - helps nobody.
+	defer h.doneOnce.Do(func() { close(h.done) })
+
 	statsTicker := time.NewTicker(statsLogInterval)
 	defer statsTicker.Stop()
 
