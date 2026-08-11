@@ -2,6 +2,7 @@ package queue
 
 import (
 	"context"
+	"errors"
 	"fmt"
 	"log/slog"
 	"net/url"
@@ -22,6 +23,13 @@ import (
 // redial itself to satisfy CLAUDE.md rule 6 ("reconnect automatically to
 // MySQL/Queues on connection drops").
 const reconnectDelay = 2 * time.Second
+
+// requeueDelay is how long a delivery loop pauses before requeueing a
+// message its Handler failed on for a retryable reason. Without it, a
+// failure that persists for any length of time (MySQL restarting, say)
+// makes the broker redeliver the same message as fast as the loop can nack
+// it, burning a CPU core and filling the log for the entire outage.
+const requeueDelay = 250 * time.Millisecond
 
 // RabbitMQConsumer implements queue.Consumer against a RabbitMQ broker. It
 // opens one channel and consumer per queue name present in its Router;
@@ -53,11 +61,15 @@ type RabbitMQConsumer struct {
 	consumerWG sync.WaitGroup
 	statsDone  chan struct{}
 
-	// processed/errors/reconnects count activity since Start, for the
-	// periodic stats log and the final stop-summary line. Incremented from
-	// per-queue delivery-loop goroutines and the supervisor, hence atomic.
+	// processed/errors/dropped/reconnects count activity since Start, for
+	// the periodic stats log and the final stop-summary line. Incremented
+	// from per-queue delivery-loop goroutines and the supervisor, hence
+	// atomic. dropped counts messages discarded as permanently
+	// unprocessable (see consumeLoop) - a non-zero value means data was
+	// thrown away and belongs in an alert.
 	processed  atomic.Uint64
 	errors     atomic.Uint64
+	dropped    atomic.Uint64
 	reconnects atomic.Uint64
 }
 
@@ -177,7 +189,35 @@ func (c *RabbitMQConsumer) consumeLoop(ctx context.Context, queueName string, ha
 		if err := handle(ctx, d.Body); err != nil {
 			c.errors.Add(1)
 			metrics.PipelineErrorsTotal.WithLabelValues(metrics.ComponentQueue).Inc()
-			slog.Warn("rabbitmq: handler failed", "queue", queueName, "error", err)
+
+			// A permanent failure (an undecodable payload) produces the
+			// exact same error on every redelivery, so requeueing it just
+			// spins this loop at full speed and blocks every healthy
+			// message behind it. Drop it instead - to the queue's
+			// dead-letter exchange if one is configured, otherwise for
+			// good - and log it loudly, since discarding data is not
+			// something that should pass unnoticed.
+			if errors.Is(err, ErrPermanent) {
+				c.dropped.Add(1)
+				slog.Error("rabbitmq: dropping unprocessable message",
+					"queue", queueName, "bytes", len(d.Body), "error", err)
+				if nackErr := d.Nack(false, false); nackErr != nil {
+					slog.Warn("rabbitmq: nack failed", "queue", queueName, "error", nackErr)
+				}
+				continue
+			}
+
+			// Anything else (MySQL down, buffer full, context cancelled)
+			// is worth retrying, so requeue - but pause first, otherwise a
+			// broker-side outage of any length turns this loop into a busy
+			// wait against the same message. The pause is interruptible so
+			// it never delays a graceful shutdown.
+			slog.Warn("rabbitmq: handler failed, requeueing", "queue", queueName, "error", err)
+			if !c.pauseBeforeRequeue(ctx) {
+				// Shutting down: leave the message unacked so the broker
+				// redelivers it to whoever consumes next.
+				return
+			}
 			if nackErr := d.Nack(false, true); nackErr != nil {
 				slog.Warn("rabbitmq: nack failed", "queue", queueName, "error", nackErr)
 			}
@@ -190,6 +230,24 @@ func (c *RabbitMQConsumer) consumeLoop(ctx context.Context, queueName string, ha
 	}
 }
 
+// pauseBeforeRequeue waits requeueDelay before a retryable message is
+// nacked back onto the queue, returning false if the consumer is shutting
+// down instead - in which case the caller must stop rather than requeue, so
+// shutdown is never held up by a retry backoff.
+func (c *RabbitMQConsumer) pauseBeforeRequeue(ctx context.Context) bool {
+	timer := time.NewTimer(requeueDelay)
+	defer timer.Stop()
+
+	select {
+	case <-timer.C:
+		return true
+	case <-ctx.Done():
+		return false
+	case <-c.stopping:
+		return false
+	}
+}
+
 // superviseReconnects watches the current generation's connection for an
 // unexpected close and redials with reconnectDelay between attempts until
 // one succeeds, ctx is cancelled or Stop is called - closing out only once
@@ -199,7 +257,21 @@ func (c *RabbitMQConsumer) consumeLoop(ctx context.Context, queueName string, ha
 // also fires closeNotify; c.stopping distinguishes that from a real drop so
 // a clean shutdown never triggers a pointless reconnect attempt.
 func (c *RabbitMQConsumer) superviseReconnects(ctx context.Context, out chan<- Message) {
-	defer close(out)
+	// out belongs to the consumeLoop goroutines that send on it, so it must
+	// not be closed while any of them is still running: a send racing this
+	// close is an unrecoverable "send on closed channel" panic (it happens
+	// in another goroutine, where a recover here can't reach it). Every
+	// return path below reaches this only after ctx was cancelled or Stop
+	// was called, both of which close the connection and so close every
+	// generation's deliveries channel, which is what makes the loops exit -
+	// so this Wait always terminates. This is the sole owner of the close;
+	// the WaitGroup is only ever Added to from connect, which runs either
+	// synchronously before this goroutine starts or from this goroutine
+	// itself, so no Add can ever race this Wait.
+	defer func() {
+		c.consumerWG.Wait()
+		close(out)
+	}()
 
 	for {
 		c.mu.Lock()
@@ -261,7 +333,8 @@ func (c *RabbitMQConsumer) logStatsPeriodically(ctx context.Context) {
 		select {
 		case <-ticker.C:
 			slog.Info("rabbitmq: consumer stats",
-				"processed", c.processed.Load(), "errors", c.errors.Load(), "reconnects", c.reconnects.Load())
+				"processed", c.processed.Load(), "errors", c.errors.Load(),
+				"dropped", c.dropped.Load(), "reconnects", c.reconnects.Load())
 		case <-c.statsDone:
 			return
 		case <-ctx.Done():
@@ -293,7 +366,8 @@ func (c *RabbitMQConsumer) Stop() error {
 		}
 
 		slog.Info("rabbitmq: consumer stopped",
-			"processed", c.processed.Load(), "errors", c.errors.Load(), "reconnects", c.reconnects.Load())
+			"processed", c.processed.Load(), "errors", c.errors.Load(),
+			"dropped", c.dropped.Load(), "reconnects", c.reconnects.Load())
 	})
 	return err
 }

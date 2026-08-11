@@ -34,11 +34,9 @@ type Client struct {
 	hub  *Hub
 	conn *websocket.Conn
 
-	// id uniquely identifies this client for the lifetime of the process -
-	// used only as the "client_id" label on
-	// metrics.WebsocketMessagesDroppedTotal, so a slow client can be told
-	// apart from the rest without exposing anything about the connection
-	// itself (e.g. remote address).
+	// id uniquely identifies this client for the lifetime of the process,
+	// so a slow client can be told apart from the rest in the log without
+	// exposing anything about the connection itself (e.g. remote address).
 	id string
 
 	// send is this client's outbound message buffer. The Hub writes to it
@@ -48,6 +46,13 @@ type Client struct {
 	// topics is the set of event topics (queue names) this client wants to
 	// receive. An empty set means "subscribe to everything".
 	topics map[string]struct{}
+
+	// dropped counts messages the Hub could not hand to this client
+	// because its send buffer was full, reported once when it
+	// disconnects. Only ever touched from the Hub's Run goroutine (both
+	// dispatch and removeClient run there), so it needs no
+	// synchronization - see the Hub type comment.
+	dropped uint64
 }
 
 // nextClientID hands out a unique id per Client, process-wide.

@@ -3,11 +3,30 @@ package queue
 import (
 	"context"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"log/slog"
 
 	"statusengine-worker/internal/websocket"
 )
+
+// ErrPermanent marks a Handler failure that will fail again identically no
+// matter how often the same payload is redelivered - a malformed or
+// structurally unexpected message, as opposed to a transient failure like
+// MySQL being briefly unreachable. Consumers use errors.Is(err,
+// ErrPermanent) to decide whether redelivering is worth anything: without
+// that distinction a single undecodable message is nacked-and-requeued
+// forever, spinning a CPU core, flooding the log and starving every healthy
+// message behind it in the same queue.
+var ErrPermanent = errors.New("permanent handler failure")
+
+// decodeError wraps a decode failure so it satisfies errors.Is(err,
+// ErrPermanent) while still carrying the topic and the original error for
+// the log line. Every Handler that decodes a payload reports its decode
+// failures through this one helper.
+func decodeError(topic string, err error) error {
+	return fmt.Errorf("queue: decode %s: %w: %w", topic, ErrPermanent, err)
+}
 
 // Handler decodes one raw queue payload and dispatches every item it
 // contains to persistence and/or WebSocket subscribers. A Consumer calls
@@ -48,7 +67,7 @@ func NewHandler[P any](hub *websocket.Hub, topic string, ins enqueuer[P], decode
 	return func(ctx context.Context, payload []byte) error {
 		items, err := decode(payload)
 		if err != nil {
-			return fmt.Errorf("queue: decode %s: %w", topic, err)
+			return decodeError(topic, err)
 		}
 
 		for _, item := range items {
@@ -70,7 +89,7 @@ func NewBroadcastHandler[P any](hub *websocket.Hub, topic string, decode func([]
 	return func(_ context.Context, payload []byte) error {
 		items, err := decode(payload)
 		if err != nil {
-			return fmt.Errorf("queue: decode %s: %w", topic, err)
+			return decodeError(topic, err)
 		}
 
 		for _, item := range items {
@@ -83,7 +102,18 @@ func NewBroadcastHandler[P any](hub *websocket.Hub, topic string, decode func([]
 // publish JSON-encodes item and publishes it to hub under topic, logging
 // (rather than failing the whole dispatch) on encode errors - a single
 // unencodable event must never take down the surrounding batch.
+//
+// Encoding is skipped entirely when no client is connected. This sits on
+// the hottest path in the worker - it runs once per decoded event, for
+// every queue - and a production worker normally has nobody attached to
+// /ws at all, so without this check every ingested event pays for a full
+// reflection-driven marshal (and the garbage that comes with it) to
+// produce bytes that are then immediately discarded by Publish.
 func publish[P any](hub *websocket.Hub, topic string, item P) {
+	if !hub.HasClients() {
+		return
+	}
+
 	raw, err := json.Marshal(item)
 	if err != nil {
 		slog.Error("queue: failed to encode event for websocket", "topic", topic, "error", err)

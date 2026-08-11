@@ -34,11 +34,21 @@ type Event struct {
 }
 
 // outboundMessage is the wire format a client receives: the topic the
-// message was published under alongside its raw payload.
+// message was published under alongside its raw payload. It is the
+// authoritative definition of that format (and what the tests decode
+// into), but the hot path does not marshal through it - see encode.
 type outboundMessage struct {
 	Topic   string          `json:"topic"`
 	Payload json.RawMessage `json:"payload"`
 }
+
+// topicKey and payloadKey are outboundMessage's field encodings, spelled
+// out so encode can assemble a frame without reflection. They must stay in
+// step with the struct tags above.
+const (
+	topicKey   = `{"topic":`
+	payloadKey = `,"payload":`
+)
 
 // subscriptionUpdate carries a client's requested subscribe/unsubscribe
 // changes into the Hub's single-goroutine state owner.
@@ -61,12 +71,23 @@ type Hub struct {
 
 	clients map[*Client]struct{}
 
+	// topicPrefix caches the encoded {"topic":"...","payload": prefix of
+	// each topic's wire frame, keyed by topic. Bounded by the number of
+	// distinct queue names the pipeline publishes (a compile-time constant
+	// set, see queue.NewRouter), so it never grows without limit. Owned by
+	// Run's goroutine, like clients above.
+	topicPrefix map[string][]byte
+
 	// publishDropped counts events dropped by Publish because the
 	// broadcast buffer was full. Publish is called from arbitrary
 	// ingestion goroutines (not Run's), so this one counter is atomic;
 	// every other stat below is only ever touched from within Run and
 	// needs no synchronization.
 	publishDropped atomic.Uint64
+
+	// clientCount mirrors len(clients) for HasClients to read from
+	// ingestion goroutines without touching the map itself.
+	clientCount atomic.Int64
 
 	// received/dispatched/dropped track broadcast throughput for the
 	// periodic stats log. dropped counts per-client sends skipped because
@@ -86,7 +107,22 @@ func NewHub() *Hub {
 		unregister:         make(chan *Client),
 		updateSubscription: make(chan subscriptionUpdate),
 		clients:            make(map[*Client]struct{}),
+		topicPrefix:        make(map[string][]byte),
 	}
+}
+
+// HasClients reports whether any client is currently connected. It exists
+// so callers can skip the cost of encoding an event nobody can receive -
+// the normal state of a production worker, where the ingestion pipeline
+// runs flat out and a dashboard attaches only occasionally.
+//
+// The answer is inherently a snapshot: a client connecting immediately
+// after a false may miss the event that was skipped. That is the same
+// guarantee the Hub already gives (events published before a client
+// registers are never replayed), and it is why this must never be used to
+// gate anything but best-effort broadcasting.
+func (h *Hub) HasClients() bool {
+	return h.clientCount.Load() > 0
 }
 
 // Publish enqueues an event for broadcasting to subscribed clients. It
@@ -117,6 +153,7 @@ func (h *Hub) Run(ctx context.Context) {
 
 		case client := <-h.register:
 			h.clients[client] = struct{}{}
+			h.clientCount.Add(1)
 			metrics.WebsocketClientsActive.Inc()
 
 		case client := <-h.unregister:
@@ -149,18 +186,21 @@ func (h *Hub) logStats() {
 }
 
 // dispatch fans an event out to every currently subscribed client, never
-// blocking on a slow client's send buffer.
+// blocking on a slow client's send buffer. The wire message is built lazily
+// on the first client that actually wants the topic, so an event nobody
+// subscribed to costs nothing beyond the map walk.
 func (h *Hub) dispatch(event Event) {
-	msg, err := json.Marshal(outboundMessage{Topic: event.Topic, Payload: event.Payload})
-	if err != nil {
-		slog.Error("websocket: failed to encode event", "topic", event.Topic, "error", err)
-		metrics.PipelineErrorsTotal.WithLabelValues(metrics.ComponentWebSocket).Inc()
-		return
-	}
+	var msg []byte
 
 	for client := range h.clients {
 		if !client.wantsTopic(event.Topic) {
 			continue
+		}
+
+		if msg == nil {
+			if msg = h.encode(event); msg == nil {
+				return
+			}
 		}
 
 		select {
@@ -172,18 +212,66 @@ func (h *Hub) dispatch(event Event) {
 			// instead of blocking the dispatch loop (and, transitively,
 			// the ingestion pipeline behind Publish's buffered channel).
 			// Counted, not logged per-drop, for the same reason as Publish
-			// above.
+			// above; the per-client total is reported on disconnect.
 			h.dropped++
-			metrics.WebsocketMessagesDroppedTotal.WithLabelValues(client.id).Inc()
+			client.dropped++
+			metrics.WebsocketMessagesDroppedTotal.Inc()
 		}
 	}
+}
+
+// encode builds one client-bound frame, {"topic":...,"payload":...},
+// returning nil if the topic itself cannot be encoded.
+//
+// The payload is appended verbatim rather than re-marshalled through
+// outboundMessage: it is already the output of a json.Marshal (see
+// queue.publish), so re-encoding it as a json.RawMessage would mean a
+// second reflection-driven pass over every single event on the hot
+// dispatch path, purely to reproduce bytes that are already correct. Only
+// the topic needs real encoding, and since topics are a small fixed set of
+// queue names, its encoded prefix is cached after first use. Both the cache
+// and the counters it feeds are exclusive to Run's goroutine (see the Hub
+// type comment), so neither needs a lock.
+func (h *Hub) encode(event Event) []byte {
+	prefix, ok := h.topicPrefix[event.Topic]
+	if !ok {
+		encodedTopic, err := json.Marshal(event.Topic)
+		if err != nil {
+			slog.Error("websocket: failed to encode event topic", "topic", event.Topic, "error", err)
+			metrics.PipelineErrorsTotal.WithLabelValues(metrics.ComponentWebSocket).Inc()
+			return nil
+		}
+		prefix = make([]byte, 0, len(encodedTopic)+len(topicKey)+len(payloadKey))
+		prefix = append(prefix, topicKey...)
+		prefix = append(prefix, encodedTopic...)
+		prefix = append(prefix, payloadKey...)
+		h.topicPrefix[event.Topic] = prefix
+	}
+
+	msg := make([]byte, 0, len(prefix)+len(event.Payload)+1)
+	msg = append(msg, prefix...)
+	msg = append(msg, event.Payload...)
+	return append(msg, '}')
 }
 
 func (h *Hub) removeClient(client *Client) {
 	if _, ok := h.clients[client]; ok {
 		delete(h.clients, client)
 		close(client.send)
+		h.clientCount.Add(-1)
 		metrics.WebsocketClientsActive.Dec()
+		h.logClientGone(client)
+	}
+}
+
+// logClientGone reports a disconnecting client's drop count - the
+// per-client attribution deliberately kept out of the Prometheus metric's
+// labels (see metrics.WebsocketMessagesDroppedTotal). Silent for the
+// overwhelmingly common case of a client that kept up.
+func (h *Hub) logClientGone(client *Client) {
+	if client.dropped > 0 {
+		slog.Warn("websocket: client disconnected after dropped messages",
+			"client_id", client.id, "dropped", client.dropped)
 	}
 }
 
@@ -203,6 +291,8 @@ func (h *Hub) closeAll() {
 	for client := range h.clients {
 		delete(h.clients, client)
 		close(client.send)
+		h.clientCount.Add(-1)
 		metrics.WebsocketClientsActive.Dec()
+		h.logClientGone(client)
 	}
 }

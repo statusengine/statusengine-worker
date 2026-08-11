@@ -2,6 +2,7 @@ package queue
 
 import (
 	"context"
+	"errors"
 	"fmt"
 	"log/slog"
 	"sync"
@@ -37,8 +38,20 @@ type GearmanConsumer struct {
 	out    chan Message
 
 	stopOnce  sync.Once
-	handlerWG sync.WaitGroup
 	statsDone chan struct{}
+
+	// handlerWG counts job handlers currently in flight, so Stop can wait
+	// for them before closing out (which they send on). stoppedMu/stopped
+	// guard the WaitGroup itself: sync.WaitGroup forbids an Add that runs
+	// concurrently with a Wait once the counter has reached zero, and job
+	// handlers - which run on the library's own agent goroutines - would
+	// otherwise Add at exactly the moment Stop Waits. Handlers take the
+	// read lock to Add; Stop takes the write lock to publish stopped=true,
+	// which both establishes the happens-before Wait needs and guarantees
+	// no further Add can start.
+	stoppedMu sync.RWMutex
+	stopped   bool
+	handlerWG sync.WaitGroup
 
 	// processed/errors count jobs handled since Start, for the periodic
 	// stats log. Incremented from per-connection job-handler goroutines,
@@ -72,7 +85,12 @@ func (c *GearmanConsumer) Start(ctx context.Context) (<-chan Message, error) {
 	for queueName, handle := range c.router {
 		queueName, handle := queueName, handle // capture per-iteration values for the closure
 		err := w.AddFunc(queueName, func(job gearman.Job) ([]byte, error) {
-			c.handlerWG.Add(1)
+			if !c.beginHandler() {
+				// Stop already ran: out may be closed, so this handler
+				// must not touch it. Report the job as failed rather than
+				// silently succeeding - it was genuinely not processed.
+				return nil, errConsumerStopped
+			}
 			defer c.handlerWG.Done()
 
 			payload := job.Data()
@@ -123,6 +141,24 @@ func (c *GearmanConsumer) Start(ctx context.Context) (<-chan Message, error) {
 	return out, nil
 }
 
+// errConsumerStopped is returned to the Gearman job server for a job that
+// arrives after Stop has begun tearing the consumer down.
+var errConsumerStopped = errors.New("gearman: consumer is shutting down")
+
+// beginHandler registers one in-flight job handler, reporting false if the
+// consumer has already been stopped and the handler must not run. See the
+// stoppedMu field comment for why the Add is lock-guarded.
+func (c *GearmanConsumer) beginHandler() bool {
+	c.stoppedMu.RLock()
+	defer c.stoppedMu.RUnlock()
+
+	if c.stopped {
+		return false
+	}
+	c.handlerWG.Add(1)
+	return true
+}
+
 // logStatsPeriodically emits one structured summary line of messages
 // processed/errored every statsLogInterval, until ctx is cancelled or Stop
 // closes statsDone - message counts rather than per-message logging, so
@@ -151,17 +187,27 @@ func (c *GearmanConsumer) logStatsPeriodically(ctx context.Context) {
 // in progress. Safe to call multiple times and safe to call without a
 // prior Start.
 //
-// KNOWN ISSUE: github.com/mikespook/gearman-go's Worker.Close() has an
-// unsynchronized close of its internal job channel (worker.in) against the
-// per-connection agent goroutines that send to it - confirmed with
-// `go test -race`, independent of anything this package does; there is no
-// public API to wait for those goroutines first, and a panic inside them
-// cannot be recovered from here (recover only works within the panicking
-// goroutine). In practice the race window is narrow and only reachable
-// during shutdown, but a "send on closed channel" panic there is possible.
-// Until upstream fixes this (see github.com/mikespook/gearman-go/issues/88,
-// which fixed a related but distinct race in 2019) or this consumer is
-// pointed at a patched fork, treat Gearman shutdown as best-effort.
+// KNOWN ISSUE, upstream only - this consumer's own handler bookkeeping is
+// synchronized, see beginHandler. github.com/mikespook/gearman-go's
+// Worker.Close() closes its internal job channel (worker.in, worker.go:231)
+// without synchronizing against the per-connection agent goroutines that
+// send to it (agent.go:101), so shutting down while a packet is in flight
+// is a genuine data race: reproducible with `go test -race` in roughly
+// three of five runs, independent of anything this package does. There is
+// no exported way to wait for those goroutines first.
+//
+// The blast radius is smaller than the race report suggests: agent.work
+// recovers its own panics (agent.go:47) and routes them to the worker's
+// ErrorHandler, so a losing race shows up as a logged
+// "send on closed channel" and one dead agent goroutine during shutdown -
+// not a crashed worker. What it does cost is the race detector's value as
+// a CI gate, since the report lands on whichever test happens to be
+// running when it fires.
+//
+// Fixing it properly means a patched fork behind a go.mod replace (see
+// github.com/mikespook/gearman-go/issues/88, which fixed a related but
+// distinct race in 2019). Until then, treat Gearman shutdown as
+// best-effort.
 func (c *GearmanConsumer) Stop() error {
 	c.stopOnce.Do(func() {
 		close(c.statsDone)
@@ -175,6 +221,16 @@ func (c *GearmanConsumer) Stop() error {
 		}
 
 		w.Close() // stops Work() and further job dispatch
+
+		// Close the gate before waiting: after this write lock is
+		// released, beginHandler can only ever return false, so the
+		// WaitGroup counter can no longer rise and Wait is safe. Doing it
+		// after Close (rather than before) keeps the window in which a
+		// legitimately dispatched job gets rejected as small as possible.
+		c.stoppedMu.Lock()
+		c.stopped = true
+		c.stoppedMu.Unlock()
+
 		c.handlerWG.Wait()
 
 		if out != nil {

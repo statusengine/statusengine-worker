@@ -38,6 +38,7 @@ type config struct {
 	gearmanAddr               string
 	rabbitMQURL               string
 	mysqlDSN                  string
+	mysqlMaxOpenConns         int // upper bound on simultaneously open MySQL connections; also used as the idle limit
 	listenAddr                string
 	metricsListenAddr         string
 	graphiteAddr              string
@@ -64,6 +65,7 @@ type fileConfig struct {
 	GearmanAddr               string   `yaml:"gearman_addr"`
 	RabbitMQURL               string   `yaml:"rabbitmq_url"`
 	MySQLDSN                  string   `yaml:"mysql_dsn"`
+	MySQLMaxOpenConns         int      `yaml:"mysql_max_open_conns"`
 	ListenAddr                string   `yaml:"listen_addr"`
 	MetricsListenAddr         string   `yaml:"metrics_listen_addr"`
 	GraphiteAddr              string   `yaml:"graphite_addr"`
@@ -111,6 +113,26 @@ func resolveString(explicit map[string]bool, flagName, flagVal, envKey, fileVal 
 	return flagVal
 }
 
+// resolveInt is resolveString's counterpart for integer settings. A
+// fileVal of 0 means "the file didn't set this key" - every integer
+// setting here is a positive count, so 0 is not a meaningful value anyway;
+// an explicitly configured 0 is rejected in loadConfig rather than
+// silently treated as absent.
+func resolveInt(explicit map[string]bool, flagName string, flagVal int, envKey string, fileVal int) int {
+	if explicit[flagName] {
+		return flagVal
+	}
+	if v, ok := os.LookupEnv(envKey); ok {
+		if parsed, err := strconv.Atoi(v); err == nil {
+			return parsed
+		}
+	}
+	if fileVal != 0 {
+		return fileVal
+	}
+	return flagVal
+}
+
 // resolveBool is resolveString's counterpart for the one bool setting;
 // fileVal is a pointer so a key the file never mentioned (nil) is
 // distinguishable from one explicitly set to false.
@@ -143,6 +165,9 @@ func loadConfig() config {
 		"RabbitMQ broker URL")
 	flag.StringVar(&cfg.mysqlDSN, "mysql-dsn", "statusengine-dev:statusengine-dev@tcp(127.0.0.1:3306)/statusengine-dev?parseTime=true",
 		"MySQL data source name")
+	flag.IntVar(&cfg.mysqlMaxOpenConns, "mysql-max-open-conns", 25,
+		"maximum number of open MySQL connections (also used as the idle-connection limit); "+
+			"must stay below the server's max_connections")
 	flag.StringVar(&cfg.listenAddr, "listen-addr", ":8080",
 		"address the WebSocket HTTP server listens on")
 	flag.StringVar(&cfg.metricsListenAddr, "metrics-listen-addr", ":9105",
@@ -179,6 +204,7 @@ func loadConfig() config {
 	cfg.gearmanAddr = resolveString(explicit, "gearman-addr", cfg.gearmanAddr, "STATUSENGINE_GEARMAN_ADDR", fc.GearmanAddr)
 	cfg.rabbitMQURL = resolveString(explicit, "rabbitmq-url", cfg.rabbitMQURL, "STATUSENGINE_RABBITMQ_URL", fc.RabbitMQURL)
 	cfg.mysqlDSN = resolveString(explicit, "mysql-dsn", cfg.mysqlDSN, "STATUSENGINE_MYSQL_DSN", fc.MySQLDSN)
+	cfg.mysqlMaxOpenConns = resolveInt(explicit, "mysql-max-open-conns", cfg.mysqlMaxOpenConns, "STATUSENGINE_MYSQL_MAX_OPEN_CONNS", fc.MySQLMaxOpenConns)
 	cfg.listenAddr = resolveString(explicit, "listen-addr", cfg.listenAddr, "STATUSENGINE_LISTEN_ADDR", fc.ListenAddr)
 	cfg.metricsListenAddr = resolveString(explicit, "metrics-listen-addr", cfg.metricsListenAddr, "STATUSENGINE_METRICS_LISTEN_ADDR", fc.MetricsListenAddr)
 	cfg.graphiteAddr = resolveString(explicit, "graphite-addr", cfg.graphiteAddr, "STATUSENGINE_GRAPHITE_ADDR", fc.GraphiteAddr)
@@ -189,6 +215,10 @@ func loadConfig() config {
 	cfg.enableOpenITCockpitTweaks = resolveBool(explicit, "enable-openitcockpit-tweaks", cfg.enableOpenITCockpitTweaks, "ENABLE_OPENITCOCKPIT_TWEAKS", fc.EnableOpenITCockpitTweaks)
 	cfg.logLevel = resolveString(explicit, "log-level", cfg.logLevel, "STATUSENGINE_LOG_LEVEL", fc.LogLevel)
 	cfg.logFormat = resolveString(explicit, "log-format", cfg.logFormat, "STATUSENGINE_LOG_FORMAT", fc.LogFormat)
+
+	if cfg.mysqlMaxOpenConns < 1 {
+		fatal("invalid -mysql-max-open-conns", "value", cfg.mysqlMaxOpenConns, "want", "a positive number")
+	}
 
 	return cfg
 }
@@ -261,6 +291,35 @@ func envBoolOrDefault(key string, def bool) bool {
 	return parsed
 }
 
+// connMaxLifetime caps how long a pooled MySQL connection is reused.
+// database/sql cannot tell a connection silently dropped by a proxy, a
+// failover or the server's own wait_timeout from a healthy one until it
+// tries to use it, so connections are retired periodically instead. Well
+// below MySQL's 8h default wait_timeout, and short enough that a failed-over
+// primary is picked up without a restart.
+const connMaxLifetime = 5 * time.Minute
+
+// configureDBPool sizes the shared *sql.DB every BulkInserter flushes
+// through. Without this, database/sql applies its defaults - unlimited open
+// connections but only *two* idle ones - which is the pathological case
+// here: the pipeline runs a BulkInserter per queue, all flushing on the same
+// 250ms ticker (CLAUDE.md rule 3), so all but two connections are torn down
+// and redialed on every single tick. That shows up as MySQL latency in
+// DBBatchFlushDurationSeconds while actually being connection setup,
+// TLS handshakes and server-side thread churn.
+//
+// maxIdle is deliberately equal to maxOpen: a pool that closes idle
+// connections between ticks recreates exactly the churn this exists to
+// avoid, and an idle MySQL connection is cheap.
+func configureDBPool(db *sql.DB, maxOpen int) {
+	db.SetMaxOpenConns(maxOpen)
+	db.SetMaxIdleConns(maxOpen)
+	db.SetConnMaxLifetime(connMaxLifetime)
+
+	slog.Info("mysql: connection pool configured",
+		"max_open_conns", maxOpen, "max_idle_conns", maxOpen, "conn_max_lifetime", connMaxLifetime)
+}
+
 func main() {
 	cfg := loadConfig()
 	setupLogger(cfg)
@@ -321,6 +380,8 @@ func main() {
 	if err != nil {
 		fatal("mysql: open failed", "error", err)
 	}
+	configureDBPool(sqlDB, cfg.mysqlMaxOpenConns)
+
 	pingCtx, cancelPing := context.WithTimeout(context.Background(), 5*time.Second)
 	if err := sqlDB.PingContext(pingCtx); err != nil {
 		cancelPing()

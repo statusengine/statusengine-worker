@@ -81,13 +81,22 @@ var (
 
 	// WebsocketMessagesDroppedTotal counts messages dropped because a
 	// client's send buffer was full (the Hub's non-blocking-select
-	// strategy, CLAUDE.md rule 4), labeled by the client that was too slow.
-	WebsocketMessagesDroppedTotal = promauto.NewCounterVec(prometheus.CounterOpts{
+	// strategy, CLAUDE.md rule 4).
+	//
+	// Deliberately unlabeled: labeling by client id looks tempting, but a
+	// client id is unique per connection, so every reconnect mints a
+	// permanent new time series - in this process's registry and, worse,
+	// in the scraping Prometheus's TSDB, where deleting the label here
+	// wouldn't help. A dashboard that reconnects every few minutes is
+	// enough to turn one metric into six figures' worth of series. Which
+	// client was too slow is answered instead by the per-client
+	// "dropped" count the Hub logs when that client disconnects.
+	WebsocketMessagesDroppedTotal = promauto.NewCounter(prometheus.CounterOpts{
 		Namespace: "statusengine",
 		Subsystem: "websocket",
 		Name:      "messages_dropped_total",
-		Help:      "Total number of messages dropped for a slow WebSocket client.",
-	}, []string{"client_id"})
+		Help:      "Total number of messages dropped for slow WebSocket clients.",
+	})
 
 	// PipelineErrorsTotal counts errors encountered anywhere in the
 	// pipeline, labeled by the component that hit them (ComponentMySQL,

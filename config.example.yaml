@@ -27,6 +27,12 @@ rabbitmq_url: amqp://statusengine:statusengine@127.0.0.1:5672/
 # MySQL data source name (go-sql-driver/mysql format).
 mysql_dsn: statusengine-dev:statusengine-dev@tcp(127.0.0.1:3306)/statusengine-dev?parseTime=true
 
+# Maximum number of open MySQL connections, also used as the idle-connection
+# limit so the pool doesn't tear down and redial connections between the
+# bulk-inserters' 250ms flush ticks. Keep this below the server's
+# max_connections, and remember it applies per worker process.
+mysql_max_open_conns: 25
+
 # Address the WebSocket HTTP server (/ws) listens on.
 listen_addr: ":8080"
 

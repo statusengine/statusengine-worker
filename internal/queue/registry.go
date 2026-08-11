@@ -229,7 +229,7 @@ func newContactNotificationMethodHandler(hub *websocket.Hub, topic string, hostI
 	return func(ctx context.Context, payload []byte) error {
 		events, err := decodeContactNotificationMethod(payload)
 		if err != nil {
-			return fmt.Errorf("queue: decode %s: %w", topic, err)
+			return decodeError(topic, err)
 		}
 
 		for _, ev := range events {
@@ -281,7 +281,7 @@ func newNotificationHandler(hub *websocket.Hub, topic string, hostIns, serviceIn
 	return func(ctx context.Context, payload []byte) error {
 		events, err := decodeNotificationLog(payload)
 		if err != nil {
-			return fmt.Errorf("queue: decode %s: %w", topic, err)
+			return decodeError(topic, err)
 		}
 
 		for _, ev := range events {
@@ -365,7 +365,7 @@ func newCoreRestartHandler(hub *websocket.Hub, topic string, sqlDB *sql.DB, host
 	return func(ctx context.Context, payload []byte) error {
 		events, err := decodeCoreRestart(payload)
 		if err != nil {
-			return fmt.Errorf("queue: decode %s: %w", topic, err)
+			return decodeError(topic, err)
 		}
 
 		for _, ev := range events {
@@ -512,7 +512,7 @@ func newDowntimeHandler(hub *websocket.Hub, topic string, sqlDB *sql.DB, nodeNam
 	return func(ctx context.Context, payload []byte) error {
 		msg, err := decodeDowntimeMessage(payload)
 		if err != nil {
-			return fmt.Errorf("queue: decode %s: %w", topic, err)
+			return decodeError(topic, err)
 		}
 
 		publish(hub, topic, msg)
@@ -538,7 +538,7 @@ func newStateChangeHandler(hub *websocket.Hub, topic string, hostIns, serviceIns
 	return func(ctx context.Context, payload []byte) error {
 		events, err := decodeStateChange(payload)
 		if err != nil {
-			return fmt.Errorf("queue: decode %s: %w", topic, err)
+			return decodeError(topic, err)
 		}
 
 		for _, ev := range events {
@@ -563,7 +563,7 @@ func newAcknowledgementHandler(hub *websocket.Hub, topic string, hostIns, servic
 	return func(ctx context.Context, payload []byte) error {
 		events, err := decodeAcknowledgement(payload)
 		if err != nil {
-			return fmt.Errorf("queue: decode %s: %w", topic, err)
+			return decodeError(topic, err)
 		}
 
 		for _, ev := range events {

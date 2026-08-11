@@ -110,7 +110,7 @@ func NewPerfdataHandler(hub *websocket.Hub, topic string, route PerfdataRoute, m
 	return func(ctx context.Context, payload []byte) error {
 		events, err := decodePerfdata(payload)
 		if err != nil {
-			return fmt.Errorf("queue: decode %s: %w", topic, err)
+			return decodeError(topic, err)
 		}
 
 		for _, ev := range events {
