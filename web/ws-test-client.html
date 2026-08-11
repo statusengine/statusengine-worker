@@ -226,13 +226,18 @@
   <section class="panel" id="connectionPanel">
     <h2>Verbindung</h2>
     <div id="connectRow">
-      <input id="wsUrl" value="ws://localhost:8080/ws" spellcheck="false">
+      <!-- 127.0.0.1 rather than localhost on purpose: the worker binds
+           127.0.0.1:8080 by default, and a listener on the IPv4 loopback
+           does not accept connections to ::1 - which is what browsers
+           often resolve "localhost" to first. -->
+      <input id="wsUrl" value="ws://127.0.0.1:8080/ws" spellcheck="false">
       <button id="connectBtn" class="primary">Verbinden</button>
       <button id="disconnectBtn" disabled>Trennen</button>
     </div>
     <div id="apiKeyRow">
-      <input id="apiKey" type="password" placeholder="API-Key (nur nötig, wenn -api-keys gesetzt ist)" spellcheck="false" autocomplete="off">
+      <input id="apiKey" type="password" placeholder="API-Key (erforderlich)" spellcheck="false" autocomplete="off">
     </div>
+    <p class="hint">Ein Key ist <strong>immer</strong> nötig - <code>/ws</code> wird nie ohne Authentifizierung ausgeliefert. Ist keiner über <code>-api-keys</code> konfiguriert, erzeugt der Worker beim Start einen zufälligen und gibt ihn als Warnung aus (<code>websocket: no API key configured…</code>); dieser ändert sich bei jedem Neustart.</p>
     <p class="hint">Der Key wird hier als <code>?api_key=</code>-Query-Parameter übertragen - nur zum lokalen Testen gedacht. Echte Clients sollten stattdessen den <code>Authorization: Bearer &lt;key&gt;</code>- oder <code>X-Api-Key</code>-Header verwenden.</p>
     <span id="status" class="status disconnected">● Getrennt</span>
 
@@ -401,22 +406,37 @@ function connect() {
     return;
   }
 
-  const topics = getCheckedTopics();
-  const params = new URLSearchParams();
-  if (topics.length > 0) params.set("topics", topics.join(","));
   // Query-param auth is a demo-client-only convenience (browser JS can't
   // set custom headers on a WebSocket handshake) - see ServeWS's doc
   // comment in internal/websocket/client.go. Real clients should send
   // Authorization: Bearer <key> or X-Api-Key instead.
+  //
+  // Checked here rather than left to the server: a rejected handshake
+  // reaches the browser as a bare 401 that the WebSocket API does not
+  // expose, so connecting without a key would just fail with no reason
+  // given. /ws is never served unauthenticated, so an empty field can
+  // only ever fail.
   const apiKey = apiKeyInput.value.trim();
-  if (apiKey) params.set("api_key", apiKey);
-  const query = params.toString();
-  const url = query ? base + "?" + query : base;
+  if (!apiKey) {
+    alert("Bitte einen API-Key angeben - /ws akzeptiert keine Verbindung ohne Key.\n\n" +
+          "Ist keiner konfiguriert, steht der beim Start erzeugte Key in der Log-Zeile " +
+          "\"websocket: no API key configured, generated a random one for this run\".");
+    apiKeyInput.focus();
+    return;
+  }
+
+  const topics = getCheckedTopics();
+  const params = new URLSearchParams();
+  if (topics.length > 0) params.set("topics", topics.join(","));
+  params.set("api_key", apiKey);
+  const url = base + "?" + params.toString();
 
   setStatus("● Verbinde…", "connecting");
+  let opened = false;
   ws = new WebSocket(url);
 
   ws.onopen = () => {
+    opened = true;
     setStatus("● Verbunden", "connected");
     connectBtn.disabled = true;
     disconnectBtn.disabled = false;
@@ -436,7 +456,16 @@ function connect() {
   };
 
   ws.onclose = () => {
-    setStatus("● Getrennt", "disconnected");
+    // A handshake the server rejected and a connection that dropped later
+    // both arrive here identically - the browser exposes neither the HTTP
+    // status nor a reason. Distinguishing them by whether onopen ever
+    // fired is the only signal available, and it covers the two things
+    // that actually go wrong: a wrong key and a wrong address.
+    if (!opened) {
+      setStatus("● Verbindung abgelehnt - Key oder Adresse prüfen", "disconnected");
+    } else {
+      setStatus("● Getrennt", "disconnected");
+    }
     connectBtn.disabled = false;
     disconnectBtn.disabled = true;
     wsUrlInput.disabled = false;
