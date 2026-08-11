@@ -221,44 +221,19 @@ func (c *GearmanConsumer) logStatsPeriodically(ctx context.Context) {
 // in progress. Safe to call multiple times and safe to call without a
 // prior Start.
 //
-// KNOWN ISSUE, upstream only - this consumer's own handler bookkeeping is
-// synchronized, see beginHandler. github.com/mikespook/gearman-go's
-// Worker.Close() closes its internal job channel (worker.in, worker.go:231)
-// without synchronizing against the per-connection agent goroutines that
-// send to it (agent.go:101), so shutting down while a packet is in flight
-// is a genuine data race: reproducible with `go test -race` in about half
-// of all runs (5 of 10, measured August 2026), independent of anything
-// this package does. There is no exported way to wait for those
-// goroutines first.
+// The data race this used to warn about is fixed in the patched fork
+// this module points at (see go.mod's replace directive): upstream's
+// Worker.Close closed worker.in while the per-connection agent
+// goroutines were still sending on it, and worker.running was written
+// under the worker mutex but read from exec without it. The fork waits
+// on a WaitGroup covering those goroutines before closing the channel,
+// and makes running an atomic.Bool. Shutdown is no longer best-effort,
+// and the full suite runs under -race with nothing skipped.
 //
-// The blast radius is smaller than the race report suggests: agent.work
-// recovers its own panics (agent.go:47) and routes them to the worker's
-// ErrorHandler, so a losing race shows up as a logged
-// "send on closed channel" and one dead agent goroutine during shutdown -
-// not a crashed worker. That is the observed outcome, not a guaranteed
-// one: a data race is undefined behaviour, and the recovered panic is
-// simply how the runtime happens to react to closechan racing chansend.
-// What it does cost for certain is the race detector's value as a CI
-// gate, since the report lands on whichever test happens to be running
-// when it fires - hence the -skip in CLAUDE.md's test command.
-//
-// DECIDED, August 2026: not forked. Fixing it properly means a patched
-// fork behind a go.mod replace (see
-// github.com/mikespook/gearman-go/issues/88, which fixed a related but
-// distinct race in 2019), and a permanent maintenance obligation for a
-// ~10-line patch is out of proportion to a shutdown-only race the
-// library already contains. Treat Gearman shutdown as best-effort.
-//
-// When revisiting, check in this order:
-//   - Has mikespook/gearman-go moved at all? It has been untouched since
-//     v0.0.0-20220520031403 (May 2022), so any new commit is news.
-//   - Is there a maintained fork worth pointing a replace directive at?
-//   - Does the -skip above still reproduce? If upstream fixed it, the
-//     skip should go.
-//
-// gearmand 2.0.0 is explicitly NOT a reason to act: it changes no wire
-// protocol, so this client stays compatible and a fork would not have to
-// grow to cover it (see CLAUDE.md rule 1). No need to research that again.
+// If the replace directive is ever dropped, expect
+// TestGearmanConsumerEndToEnd to fail under -race in about half of all
+// runs, with the report attaching to whichever test happens to be
+// running when it fires.
 func (c *GearmanConsumer) Stop() error {
 	c.stopOnce.Do(func() {
 		close(c.statsDone)

@@ -13,7 +13,12 @@ import (
 const gearmanAddr = "127.0.0.1:4730"
 
 func TestGearmanConsumerEndToEnd(t *testing.T) {
-	received := make(chan []byte, 1)
+	// Buffered generously, not 1: this runs against a shared dev job
+	// server, so a leftover job from an earlier run can be delivered
+	// alongside the one this test submits. With a buffer of 1 that second
+	// handler blocks forever, Stop's handlerWG.Wait never returns, and the
+	// test hangs rather than failing.
+	received := make(chan []byte, 64)
 	fnName := "queue_pkg_test_fn"
 	router := Router{
 		fnName: func(_ context.Context, payload []byte) error {

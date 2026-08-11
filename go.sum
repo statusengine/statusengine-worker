@@ -19,10 +19,10 @@ github.com/klauspost/compress v1.19.1 h1:VsB4HPswih7mmZ8WleSFQ75c/Ui1M4trX5oAsJn
 github.com/klauspost/compress v1.19.1/go.mod h1:cwPg85FWrGar70rWktvGQj8/hthj3wpl0PGDogxkrSQ=
 github.com/kylelemons/godebug v1.1.0 h1:RPNrshWIDI6G2gRW9EHilWtl7Z6Sb1BR0xunSBf0SNc=
 github.com/kylelemons/godebug v1.1.0/go.mod h1:9/0rRGxNHcop5bhtWyNeEfOS8JIWk580+fNqagV/RAw=
-github.com/mikespook/gearman-go v0.0.0-20220520031403-2a518e866145 h1:6kTCi6p3Hd6JYROnq+1UOdewoXj90zKKDQPlsHYTSEs=
-github.com/mikespook/gearman-go v0.0.0-20220520031403-2a518e866145/go.mod h1:77Th6O6AZfMU6i5hLJnjN5xxUBoio7LN0aOyxGhqV1U=
 github.com/munnerz/goautoneg v0.0.0-20191010083416-a7dc8b61c822 h1:C3w9PqII01/Oq1c1nUAm88MOHcQC9l5mIlSMApZMrHA=
 github.com/munnerz/goautoneg v0.0.0-20191010083416-a7dc8b61c822/go.mod h1:+n7T8mK8HuQTcFwEeznm/DIxMOiR9yIdICNftLE1DvQ=
+github.com/nook24/gearman-go v0.0.0-20260811181307-aeb5ea97124e h1:kgB0n0v+gMej+CEUuboFiSIqHTiwJZbLP41fHiaAugc=
+github.com/nook24/gearman-go v0.0.0-20260811181307-aeb5ea97124e/go.mod h1:oi/mCR1Cs08pEcpcIfHcU9v0GrUMKEI/Xn5ojHP0fTg=
 github.com/pmezard/go-difflib v1.0.0 h1:4DBwDE0NGyQoBHbLQYPwSUPoCMWR5BEzIk/f1lZbAQM=
 github.com/pmezard/go-difflib v1.0.0/go.mod h1:iKH77koFhYxTK1pcRnkKkqfTogsbg7gZNVY4sRDYZ/4=
 github.com/prometheus/client_golang v1.24.1 h1:JnJkREXzWxUdCuPFpIWZiPispT9xVV59uiuyR2bPlnU=
