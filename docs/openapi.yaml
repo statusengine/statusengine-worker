@@ -8,8 +8,13 @@ info:
 
     | Server | Default address | Endpoint |
     |---|---|---|
-    | WebSocket | `-listen-addr` (`STATUSENGINE_LISTEN_ADDR`), default `:8080` | `GET /ws` |
+    | WebSocket | `-listen-addr` (`STATUSENGINE_LISTEN_ADDR`), default `127.0.0.1:8080` | `GET /ws` |
     | Metrics | `-metrics-listen-addr` (`STATUSENGINE_METRICS_LISTEN_ADDR`), default `:9105` | `GET /metrics` |
+
+    The WebSocket server binds to loopback by default: the `/ws` stream
+    carries every monitoring event the worker sees, so exposing it on the
+    network is a deliberate `-listen-addr` decision rather than something
+    that happens by leaving a setting alone.
 
     `/metrics` has no authentication of its own - it's meant to be reached
     only by a trusted Prometheus scraper, typically by keeping that port off
@@ -17,11 +22,20 @@ info:
 
     ## Authentication (`/ws` only)
 
-    Optional and **off by default**. Enable it with `-api-keys`
-    (`STATUSENGINE_API_KEYS`, comma-separated) or the `api_keys` list in a
-    YAML config file (see `config.example.yaml`). Once at least one key is
-    configured, every `/ws` request must present one of them, using **one**
-    of these three methods:
+    **Always on.** `/ws` is never served unauthenticated. Configure the
+    accepted keys with `-api-keys` (`STATUSENGINE_API_KEYS`,
+    comma-separated) or the `api_keys` list in a YAML config file (see
+    `config.example.yaml`).
+
+    Leaving that empty does **not** disable authentication: the worker
+    generates a random key at startup instead and logs it as a warning
+    (`websocket: no API key configured, generated a random one for this
+    run`). That is a safety net so an unconfigured worker is never an open
+    event stream - it changes on every restart, so configure a real key for
+    any client that has to reconnect on its own.
+
+    Every `/ws` request must present a valid key, using **one** of these
+    three methods:
 
     | Method | Use for | Example |
     |---|---|---|
@@ -37,9 +51,16 @@ info:
     reverse-proxy logs and browser history - avoid it for anything other
     than quick manual testing in a browser.
 
-    A request without a valid key (when authentication is enabled) is
-    rejected with `401 Unauthorized` before the WebSocket handshake ever
-    upgrades - no connection is established.
+    A request without a valid key is rejected with `401 Unauthorized`
+    before the WebSocket handshake ever upgrades - no connection is
+    established.
+
+    The handshake's `Origin` header is deliberately **not** checked. That
+    check defends against a web page opening this endpoint behind an
+    operator's back, which only pays off against an endpoint that
+    authenticates ambiently (cookies) or not at all - neither applies here,
+    since the key travels explicitly and the listener is loopback-only
+    unless someone opts out.
 
     ## The `/ws` protocol
 
@@ -87,11 +108,15 @@ info:
 servers:
   - url: http://localhost:9105
     description: Prometheus metrics (default -metrics-listen-addr)
-  - url: http://localhost:8080
-    description: WebSocket handshake (default -listen-addr; use ws:// once upgraded)
+  - url: http://127.0.0.1:8080
+    description: WebSocket handshake (default -listen-addr, loopback-only; use ws:// once upgraded)
 
+# The API's default is authenticated; /metrics opts out explicitly with
+# `security: []`, which is the one unauthenticated endpoint.
 security:
-  - {}
+  - BearerAuth: []
+  - ApiKeyHeader: []
+  - ApiKeyQuery: []
 
 components:
   securitySchemes:
@@ -878,10 +903,11 @@ paths:
         handshake; once upgraded, the connection follows the WebSocket
         protocol described above, not further HTTP request/responses.
       servers:
-        - url: http://localhost:8080
+        - url: http://127.0.0.1:8080
           description: Use ws:// once upgraded (wss:// behind TLS).
+      # No `- {}` alternative: /ws is never served unauthenticated, so an
+      # anonymous request is not a valid way to call this operation.
       security:
-        - {}
         - BearerAuth: []
         - ApiKeyHeader: []
         - ApiKeyQuery: []
@@ -895,7 +921,11 @@ paths:
             this document's top-level description for the message protocol
             that follows.
         "401":
-          description: Missing or invalid API key (only returned when authentication is enabled via -api-keys/STATUSENGINE_API_KEYS).
+          description: |
+            Missing or invalid API key. Authentication cannot be turned off -
+            if no key is configured, the worker generates one at startup and
+            logs it, so this is also what an otherwise correct client gets
+            after a restart changed that generated key.
           content:
             text/plain:
               schema:
@@ -915,16 +945,34 @@ paths:
         | Metric | Type | Labels | Meaning |
         |---|---|---|---|
         | `statusengine_queue_messages_received_total` | counter | `queue_name` | Raw messages received per queue, regardless of backend (Gearman/RabbitMQ). |
+        | `statusengine_queue_jobs_in_flight` | gauge | - | Messages currently being handled, across all queues. |
+        | `statusengine_queue_handler_duration_seconds` | histogram | `queue_name` | Time to handle one message end to end: decode, WebSocket publish and enqueueing every decoded item for insertion. |
         | `statusengine_db_events_written_total` | counter | `table` | Rows successfully persisted per destination table. |
         | `statusengine_db_batch_flush_duration_seconds` | histogram | - | Duration of each bulk-insert flush to MySQL. |
         | `statusengine_db_batch_size_at_flush` | histogram | - | Row count of each bulk-insert flush - shows whether flushes are mostly hitting the 100-row batch size or the 250ms ticker. |
         | `statusengine_websocket_clients_active` | gauge | - | Currently connected WebSocket clients. |
         | `statusengine_websocket_messages_broadcasted_total` | counter | - | Messages successfully handed to a client's send buffer. |
-        | `statusengine_websocket_messages_dropped_total` | counter | `client_id` | Messages dropped because a client's send buffer was full - non-blocking broadcast. |
+        | `statusengine_websocket_messages_dropped_total` | counter | - | Messages dropped because a client's send buffer was full - non-blocking broadcast. Deliberately unlabeled: a client id is unique per connection, so labeling by it would mint a permanent new time series on every reconnect. Which client was too slow is logged when that client disconnects. |
         | `statusengine_pipeline_errors_total` | counter | `component` (`mysql`, `websocket`, `graphite`, `queue`) | Errors encountered anywhere in the pipeline. |
 
         Plus the standard Go runtime/process metrics `promhttp.Handler()`
         exposes automatically (`go_*`, `process_*`).
+
+        ### Is the worker keeping up?
+
+        Three of these answer that together. `queue_jobs_in_flight` sitting
+        at the consumer's concurrency cap (`-gearman-max-concurrent-jobs`,
+        default 64, or `-rabbitmq-prefetch` per queue) means the broker is
+        feeding faster than the pipeline drains - which is working as
+        intended, since the surplus then waits at the broker rather than
+        accumulating in this process. `queue_handler_duration_seconds`
+        shows where that time goes: a handler blocks in the bulk-insert
+        buffer once it is full, so this is where MySQL backpressure becomes
+        visible from the ingestion side. `db_batch_size_at_flush` pinned at
+        100 means flushes are triggered by the batch size rather than the
+        250ms ticker - the same saturation seen from the database side.
+        `go_goroutines` staying flat under a backlog confirms the cap is
+        holding.
       servers:
         - url: http://localhost:9105
       security: []
@@ -939,6 +987,16 @@ paths:
                 # HELP statusengine_queue_messages_received_total Total number of messages received per queue.
                 # TYPE statusengine_queue_messages_received_total counter
                 statusengine_queue_messages_received_total{queue_name="statusngin_hoststatus"} 1042
+                # HELP statusengine_queue_jobs_in_flight Number of queue messages currently being handled.
+                # TYPE statusengine_queue_jobs_in_flight gauge
+                statusengine_queue_jobs_in_flight 0
+                # HELP statusengine_queue_handler_duration_seconds Duration of handling one message, per queue.
+                # TYPE statusengine_queue_handler_duration_seconds histogram
+                statusengine_queue_handler_duration_seconds_bucket{queue_name="statusngin_hoststatus",le="0.01"} 2
+                statusengine_queue_handler_duration_seconds_bucket{queue_name="statusngin_hoststatus",le="0.025"} 3
+                statusengine_queue_handler_duration_seconds_bucket{queue_name="statusngin_hoststatus",le="+Inf"} 3
+                statusengine_queue_handler_duration_seconds_sum{queue_name="statusngin_hoststatus"} 0.03264118
+                statusengine_queue_handler_duration_seconds_count{queue_name="statusngin_hoststatus"} 3
                 # HELP statusengine_db_events_written_total Total number of events successfully written per table.
                 # TYPE statusengine_db_events_written_total counter
                 statusengine_db_events_written_total{table="statusengine_hoststatus"} 1042
@@ -952,6 +1010,9 @@ paths:
                 # HELP statusengine_websocket_clients_active Number of currently connected WebSocket clients.
                 # TYPE statusengine_websocket_clients_active gauge
                 statusengine_websocket_clients_active 3
+                # HELP statusengine_websocket_messages_dropped_total Total number of messages dropped for slow WebSocket clients.
+                # TYPE statusengine_websocket_messages_dropped_total counter
+                statusengine_websocket_messages_dropped_total 0
                 # HELP statusengine_pipeline_errors_total Total number of errors encountered per pipeline component.
                 # TYPE statusengine_pipeline_errors_total counter
                 statusengine_pipeline_errors_total{component="mysql"} 0
