@@ -102,3 +102,82 @@ log_level: info
 
 # Structured log output format: "text" or "json".
 log_format: text
+
+
+###############################################################################
+# DATA RETENTION (cmd/db_cleanup only)
+#
+# Everything below is read by the cleanup tool, not by the worker - the
+# worker ignores these keys, just as the cleanup tool ignores everything
+# above except mysql_dsn, log_level and log_format. Both binaries share
+# this one file:
+#
+#   go run ./cmd/db_cleanup -config /path/to/config.yaml
+#
+# Run it from cron or a systemd timer, once a day is plenty. In a cluster,
+# run it on exactly one node - or on several at clearly different times.
+#
+# Every value is a number of DAYS of history to keep, configured
+# separately for hosts and services. The key names are the ones the legacy
+# PHP worker uses, so an existing config.yml can be carried over value for
+# value - including its convention:
+#
+#   0 disables cleanup of that table entirely.
+#
+# A missing key falls back to the built-in default shown here; only an
+# explicit 0 switches a table off.
+###############################################################################
+
+# Every executed check. By far the largest tables - these two are the
+# reason the cleanup exists.
+#   statusengine_hostchecks.start_time / statusengine_servicechecks.start_time
+age_hostchecks: 5
+age_servicechecks: 5
+
+# Acknowledgements.
+#   statusengine_host_acknowledgements.entry_time / statusengine_service_acknowledgements.entry_time
+age_host_acknowledgements: 60
+age_service_acknowledgements: 60
+
+# Notifications, one row per notified contact.
+#   statusengine_host_notifications.start_time / statusengine_service_notifications.start_time
+age_host_notifications: 60
+age_service_notifications: 60
+
+# Notification log, one row per notification event.
+#   statusengine_host_notifications_log.start_time / statusengine_service_notifications_log.start_time
+age_host_notifications_log: 60
+age_service_notifications_log: 60
+
+# State changes. Kept far longer than checks because availability reports
+# are computed from these.
+#   statusengine_host_statehistory.state_time / statusengine_service_statehistory.state_time
+age_host_statehistory: 365
+age_service_statehistory: 365
+
+# Past downtimes. Despite the legacy key name, this cleans the *history*
+# tables - currently scheduled downtimes are never touched.
+#   statusengine_host_downtimehistory.entry_time / statusengine_service_downtimehistory.entry_time
+age_host_downtimes: 60
+age_service_downtimes: 60
+
+# Naemon/Nagios log entries.
+#   statusengine_logentries.entry_time
+age_logentries: 5
+
+# Performance data. Only relevant when perfdata_route above writes to
+# MySQL; with Graphite, its own retention applies instead.
+#   statusengine_perfdata.timestamp_unix
+age_perfdata: 90
+
+# Rows deleted per DELETE statement. Each batch is its own transaction, so
+# a smaller value holds locks for shorter, keeps the undo log small and
+# produces binlog events replicas can digest - at the cost of more
+# round-trips. Must be >= 1.
+cleanup_batch_size: 5000
+
+# Pause between two batches of the same table, as a duration string
+# ("50ms", "1s"). The default of no pause deletes as fast as the database
+# allows, which is usually right for a nightly run on an idle system; set
+# a pause if the cleanup competes with live check results.
+cleanup_batch_pause: 0s

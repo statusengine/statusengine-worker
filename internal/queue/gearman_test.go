@@ -75,13 +75,24 @@ func TestGearmanConsumerEndToEnd(t *testing.T) {
 	if err := consumer.Stop(); err != nil {
 		t.Fatalf("stop: %v", err)
 	}
-	select {
-	case _, ok := <-out:
-		if ok {
-			t.Fatal("expected output channel to be closed after Stop")
+
+	// Drain rather than expecting the very next receive to be the close.
+	// Same reason the channel above is buffered to 64: this runs against
+	// a shared dev job server, so a leftover background job from an
+	// earlier (killed) run gets delivered alongside this test's own and
+	// sits in out's buffer. Asserting on a single receive would then read
+	// that message and report "not closed" for a consumer that closed the
+	// channel perfectly well. What matters is that out *becomes* closed.
+	deadline := time.After(2 * time.Second)
+	for {
+		select {
+		case _, ok := <-out:
+			if !ok {
+				return
+			}
+		case <-deadline:
+			t.Fatal("output channel was not closed after Stop")
 		}
-	case <-time.After(time.Second):
-		t.Fatal("output channel was not closed after Stop")
 	}
 }
 

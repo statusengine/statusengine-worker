@@ -97,6 +97,7 @@ go build -o simulator ./cmd/simulator
 go build -o gearman_publisher ./cmd/gearman_publisher
 go build -o rabbitmq_publisher ./cmd/rabbitmq_publisher
 go build -o db_verifier ./cmd/db_verifier
+go build -o db_cleanup ./cmd/db_cleanup
 go build -o worker ./cmd/app
 ```
 
@@ -113,7 +114,7 @@ Useful flags:
 - `-rabbitmq-url`: AMQP URL
 - `-mysql-dsn`: MySQL DSN
 - `-listen-addr`: WebSocket server listen address (default `:8080`)
-- `-api-keys`: comma-separated API keys accepted by `/ws` (empty disables authentication, the default)
+- `-api-keys`: comma-separated API keys accepted by `/ws`. Leaving this empty does **not** disable authentication — the worker generates a random key at startup and logs it as a warning instead, so an unconfigured worker is never an open event stream
 - `-metrics-listen-addr`: Prometheus server listen address (default `:9105`)
 - `-graphite-addr`: Graphite Carbon address
 - `-perfdata-route`: `mysql`, `graphite`, or `both`
@@ -125,6 +126,41 @@ Environment variables with matching names are also supported (for example `STATU
 Settings can also be read from a YAML config file via `-config path/to/config.yaml` (or `STATUSENGINE_CONFIG`). See [`config.example.yaml`](config.example.yaml) for every available key, its default and a description.
 
 Precedence for every setting is: explicit CLI flag > environment variable > config file > built-in default. This lets the config file hold your normal settings while flags/environment variables (handy in Docker/CI) can still override anything for a one-off run.
+
+## Run Database Cleanup
+
+The worker only ever appends to the history tables. `cmd/db_cleanup` is the counterpart that enforces retention: it deletes rows older than a configured number of days and exits, so it belongs in cron or a systemd timer rather than next to the worker.
+
+```bash
+go run ./cmd/db_cleanup -config /etc/statusengine/config.yaml
+```
+
+It reads **the same config file as the worker** — both binaries ignore each other's keys — and shares `mysql_dsn`, `log_level` and `log_format` with it. Retention is configured per table, in days, separately for hosts and services, using the legacy PHP worker's key names so an existing `config.yml` can be carried over value for value:
+
+| Key | Table | Default |
+|---|---|---|
+| `age_hostchecks` / `age_servicechecks` | `statusengine_hostchecks` / `statusengine_servicechecks` | 5 |
+| `age_host_acknowledgements` / `age_service_acknowledgements` | `statusengine_*_acknowledgements` | 60 |
+| `age_host_notifications` / `age_service_notifications` | `statusengine_*_notifications` | 60 |
+| `age_host_notifications_log` / `age_service_notifications_log` | `statusengine_*_notifications_log` | 60 |
+| `age_host_statehistory` / `age_service_statehistory` | `statusengine_*_statehistory` | 365 |
+| `age_host_downtimes` / `age_service_downtimes` | `statusengine_*_downtimehistory` | 60 |
+| `age_logentries` | `statusengine_logentries` | 5 |
+| `age_perfdata` | `statusengine_perfdata` | 90 |
+
+**`0` disables cleanup of that table entirely** (also the legacy convention). Currently scheduled downtimes and the `hoststatus`/`servicestatus` tables are never touched.
+
+Two more knobs: `cleanup_batch_size` (default 5000) is how many rows each `DELETE` removes — every batch is its own transaction, so smaller values hold locks for shorter and keep replication lag down — and `cleanup_batch_pause` (default `0s`) inserts a pause between batches if the cleanup has to share the database with live check results.
+
+`SIGTERM` and Ctrl-C stop the run cleanly between two batches; whatever was deleted stays deleted and the next run continues from there. The exit code is non-zero only if a table actually failed, so a timer reports real problems and stays quiet otherwise.
+
+Example crontab, nightly at 03:20:
+
+```cron
+20 3 * * * /usr/bin/db_cleanup -config /etc/statusengine/config.yaml
+```
+
+In a cluster, run this on **exactly one node** — or on several at clearly different times. Simultaneous runs are not dangerous, but they compete for the same locks and finish no sooner.
 
 ## Run Simulator
 

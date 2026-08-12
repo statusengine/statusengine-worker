@@ -4,3 +4,4 @@
 /worker
 /db_verifier
 cmd/app/__debug_bin*
+/db_cleanup
