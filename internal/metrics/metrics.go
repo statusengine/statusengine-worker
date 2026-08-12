@@ -21,6 +21,61 @@ const (
 	ComponentQueue     = "queue"
 )
 
+// Components lists every value that appears in PipelineErrorsTotal's
+// "component" label.
+var Components = []string{ComponentMySQL, ComponentWebSocket, ComponentGraphite, ComponentQueue}
+
+// Why the Init* functions below exist:
+//
+// A labeled metric has no time series until some label combination is
+// used for the first time. An unlabeled Counter shows up in /metrics as 0
+// immediately, but statusengine_pipeline_errors_total{component="mysql"}
+// simply does not exist until MySQL has actually failed once. For a
+// dashboard that is the difference between a panel reading "0" and one
+// reading "No data", and for an alert it is the difference between
+// rate(...) == 0 and an expression that never evaluates. The healthy
+// state is exactly the state that produces no data, which is precisely
+// when someone is looking at the dashboard to confirm things are fine.
+//
+// Pre-creating the child with WithLabelValues (and discarding it) is the
+// documented way to fix that: the series is registered at 0 and starts
+// counting from there.
+//
+// This is only safe because every label here is drawn from a small, fixed
+// set - queue names, destination tables, the four components above. It
+// must not be extended to a label whose values are open-ended (a client
+// id, a hostname), where pre-creating would be indistinguishable from a
+// cardinality leak.
+
+// InitQueue pre-creates the three per-queue series for queueName, so a
+// worker that has not yet received a message on that queue still reports
+// zeros for it rather than nothing at all. Called from queue.NewRouter
+// for every queue it wires up.
+func InitQueue(queueName string) {
+	QueueMessagesReceivedTotal.WithLabelValues(queueName)
+	QueuePayloadsRepairedTotal.WithLabelValues(queueName)
+	QueueHandlerDurationSeconds.WithLabelValues(queueName)
+}
+
+// InitTable pre-creates the per-table series on DBEventsWrittenTotal.
+// Called from db.NewBulkInserter, so every table this worker can write to
+// is covered automatically - including one added later, which is the
+// point of putting the call in the constructor rather than in a list that
+// would have to be kept in sync by hand.
+func InitTable(table string) {
+	DBEventsWrittenTotal.WithLabelValues(table)
+}
+
+// init pre-creates the per-component series on PipelineErrorsTotal. Unlike
+// queue names and table names, this package owns the full set of values
+// itself, so there is nothing for a caller to pass in and no way for a
+// caller to get it right that this package could not.
+func init() {
+	for _, component := range Components {
+		PipelineErrorsTotal.WithLabelValues(component)
+	}
+}
+
 var (
 	// QueueMessagesReceivedTotal counts every raw message received from a
 	// queue, labeled by queue name (e.g. "statusngin_hoststatus"), regardless

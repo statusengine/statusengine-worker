@@ -103,6 +103,11 @@ type BulkInserter[T any] struct {
 // columns). Run must be started in its own goroutine before items are
 // actually flushed to db.
 func NewBulkInserter[T any](db *sql.DB, table string, columns []string, toRow RowFunc[T]) *BulkInserter[T] {
+	// Register this table's series at zero right away, so /metrics reports
+	// events_written_total{table="..."} 0 from the first scrape instead of
+	// omitting the table until its first successful flush.
+	metrics.InitTable(table)
+
 	return &BulkInserter[T]{
 		db:             db,
 		table:          table,

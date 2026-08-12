@@ -959,6 +959,20 @@ paths:
         Plus the standard Go runtime/process metrics `promhttp.Handler()`
         exposes automatically (`go_*`, `process_*`).
 
+        ### Every series exists from the first scrape
+
+        All label combinations are pre-created at zero during startup, so
+        a freshly started worker already exports all 12 `queue_name`
+        series, all 18 `table` series and all 4 `component` series rather
+        than growing them as traffic arrives. Prometheus normally creates
+        a labeled series only on its first observation, which would mean
+        `statusengine_pipeline_errors_total{component="mysql"}` does not
+        exist until MySQL has actually failed - so a panel would read
+        "No data" precisely while everything is healthy, and an alert on
+        it would never evaluate. Dashboards can therefore rely on every
+        series below being present and can treat a missing one as the
+        worker being down rather than merely idle.
+
         ### Is the worker keeping up?
 
         Three of these answer that together. `queue_jobs_in_flight` sitting

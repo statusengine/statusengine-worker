@@ -23,7 +23,7 @@ Every queue is wired end-to-end in `internal/queue/registry.go`'s `NewRouter` - 
 - **Done** — State Changes (`statusngin_statechanges`)
 - **Done** — Core Restarts (`statusngin_core_restart`)
 - **Done** — Downtimes (`statusngin_downtimes`) - full ADD/LOAD/START/STOP/DELETE lifecycle across the `scheduleddowntimes`/`downtimehistory` table pairs; doesn't use the BulkInserter abstraction (see `.claude/specs/downtime_ablauf.txt` for the processing matrix and why)
-- **Done** — Prometheus metrics exporter (`internal/metrics`, served on its own port, default `:9105/metrics`)
+- **Done** — Prometheus metrics exporter (`internal/metrics`, served on its own port, default `:9105/metrics`). **Every labeled series is pre-created at zero on startup**, so a fresh worker exports all 12 `queue_name`, 18 `table` and 4 `component` series instead of growing them as traffic arrives - otherwise a panel reads "No data" exactly while everything is healthy, and an alert on it never evaluates. `metrics.InitQueue`/`InitTable` do that; the calls sit where the label values are actually known (`db.NewBulkInserter` for its own table, `queue.NewRouter` for the router's keys and the four downtime tables that bypass BulkInserter, the metrics package's own `init` for the components), so a new inserter or queue is covered without a second list to keep in sync. Only safe because all these label sets are small and fixed - never do this for an open-ended label like a client id or hostname.
 - **Done** — Data retention (`internal/cleanup` + `cmd/db_cleanup`) - a separate one-shot binary for cron/systemd timers, not part of the worker process
 
 ## Core Architecture Rules

@@ -421,7 +421,30 @@ func downtimeMetricsTable(action DowntimeAction) string {
 	if action.Data.IsHostDowntime {
 		scope = "host"
 	}
-	return "statusengine_" + scope + "_" + action.Table.String()
+	return downtimeTableName(scope, action.Table.String())
+}
+
+func downtimeTableName(scope, base string) string {
+	return "statusengine_" + scope + "_" + base
+}
+
+// downtimeMetricsTables enumerates every table name downtimeMetricsTable
+// can produce. The downtime path writes with a bare ExecContext instead of
+// a BulkInserter, so its tables miss the metrics.InitTable call that
+// db.NewBulkInserter makes for every other table - this is what gives them
+// their zero-valued series too. Kept next to downtimeMetricsTable and
+// built from the same helper so the two cannot spell a table differently;
+// a test pins that they agree.
+func downtimeMetricsTables() []string {
+	bases := []string{ScheduledDowntimesTable.String(), DowntimeHistoryTable.String()}
+
+	tables := make([]string, 0, 2*len(bases))
+	for _, scope := range []string{"host", "service"} {
+		for _, base := range bases {
+			tables = append(tables, downtimeTableName(scope, base))
+		}
+	}
+	return tables
 }
 
 // execDowntimeAction turns one DowntimeAction into its concrete (query,
@@ -709,6 +732,19 @@ func NewRouter(sqlDB *sql.DB, hub *websocket.Hub, gc *graphite.Client, perfdataR
 
 		QueueDowntimes:   newDowntimeHandler(hub, QueueDowntimes, sqlDB, nodeName),
 		QueueCoreRestart: newCoreRestartHandler(hub, QueueCoreRestart, sqlDB, hostStatus, serviceStatus, enableOpenITCockpitTweaks),
+	}
+
+	// Give every queue and every downtime table its zero-valued series
+	// before the first message arrives. The BulkInserter tables above got
+	// theirs from db.NewBulkInserter; these two sets have no constructor
+	// to hang it on, and driving the queue names off the router itself
+	// means a queue added to the map above is covered without a second
+	// list to remember.
+	for queueName := range router {
+		metrics.InitQueue(queueName)
+	}
+	for _, table := range downtimeMetricsTables() {
+		metrics.InitTable(table)
 	}
 
 	runners := []Runner{
