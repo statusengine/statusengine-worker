@@ -57,6 +57,16 @@ func observeHandler(ctx context.Context, queueName string, handle Handler, paylo
 	metrics.QueueJobsInFlight.Inc()
 	defer metrics.QueueJobsInFlight.Dec()
 
+	// Normalize before anything parses this. Done here rather than in
+	// each of the twelve decode functions because both Consumers funnel
+	// every payload through this one call - including the downtime and
+	// core-restart handlers, which don't go through NewHandler.
+	if repaired, changed := repairUTF8(payload); changed {
+		payload = repaired
+		metrics.QueuePayloadsRepairedTotal.WithLabelValues(queueName).Inc()
+		logRepair(queueName)
+	}
+
 	start := time.Now()
 	err := handle(ctx, payload)
 	metrics.QueueHandlerDurationSeconds.WithLabelValues(queueName).Observe(time.Since(start).Seconds())

@@ -45,6 +45,18 @@ var (
 		Help:      "Number of queue messages currently being handled.",
 	})
 
+	// QueuePayloadsRepairedTotal counts payloads that were not valid
+	// UTF-8 and had their invalid bytes reinterpreted as Windows-1252
+	// before decoding (see repairUTF8 in internal/queue). A non-zero
+	// value points at a monitoring host emitting non-UTF-8 plugin output
+	// - worth fixing at the source, since the repair is a best guess.
+	QueuePayloadsRepairedTotal = promauto.NewCounterVec(prometheus.CounterOpts{
+		Namespace: "statusengine",
+		Subsystem: "queue",
+		Name:      "payloads_repaired_total",
+		Help:      "Total number of payloads whose invalid UTF-8 was repaired, per queue.",
+	}, []string{"queue_name"})
+
 	// QueueHandlerDurationSeconds observes how long handling one message
 	// takes, end to end: decode, WebSocket publish and enqueueing every
 	// decoded item for insertion. Since Enqueue blocks once a

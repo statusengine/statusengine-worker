@@ -484,6 +484,43 @@ func configureDBPool(db *sql.DB, maxOpen int) {
 		"max_open_conns", maxOpen, "max_idle_conns", maxOpen, "conn_max_lifetime", connMaxLifetime)
 }
 
+// logConnectionCharset reports what character set the connection actually
+// negotiated.
+//
+// Nothing here sends "SET NAMES": go-sql-driver/mysql puts
+// utf8mb4_general_ci into the handshake packet itself (its
+// defaultCollationID), so the connection is utf8mb4 from the first byte
+// and asking again would only cost a round-trip per new connection. It
+// sends SET NAMES exactly when a charset is named in the DSN. That is
+// unlike PHP's PDO/mysqli, which inherit the server default - long
+// latin1 - which is why the legacy worker had to issue it explicitly.
+//
+// Since that leaves the setting invisible, log it once at startup: a DSN
+// that someone copied from the PHP era with charset=latin1 in it would
+// otherwise only show up much later, as double-encoded umlauts in the
+// database.
+func logConnectionCharset(ctx context.Context, db *sql.DB) {
+	var charset, collation string
+	err := db.QueryRowContext(ctx,
+		"SELECT @@character_set_client, @@collation_connection").Scan(&charset, &collation)
+	if err != nil {
+		// Purely informational - never hold up startup over it.
+		slog.Warn("mysql: could not determine connection charset", "error", err)
+		return
+	}
+
+	if charset != "utf8mb4" {
+		slog.Warn("mysql: connection is not utf8mb4",
+			"character_set_client", charset, "collation_connection", collation,
+			"hint", "remove any charset= from -mysql-dsn and let the driver negotiate utf8mb4; "+
+				"a non-utf8mb4 connection stores umlauts double-encoded")
+		return
+	}
+
+	slog.Info("mysql: connection charset",
+		"character_set_client", charset, "collation_connection", collation)
+}
+
 func main() {
 	cfg := loadConfig()
 	setupLogger(cfg)
@@ -551,6 +588,7 @@ func main() {
 		cancelPing()
 		fatal("mysql: unreachable", "error", err)
 	}
+	logConnectionCharset(pingCtx, sqlDB)
 	cancelPing()
 
 	// The Graphite client's Run loop is started and Flushed alongside every

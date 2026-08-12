@@ -10,6 +10,7 @@ require (
 	github.com/mikespook/gearman-go v0.0.0-20220520031403-2a518e866145
 	github.com/prometheus/client_golang v1.24.1
 	github.com/rabbitmq/amqp091-go v1.13.0
+	golang.org/x/text v0.41.0
 	gopkg.in/yaml.v3 v3.0.1
 )
 
@@ -25,4 +26,4 @@ require (
 	google.golang.org/protobuf v1.36.11 // indirect
 )
 
-replace github.com/mikespook/gearman-go => github.com/nook24/gearman-go v0.0.0-20260811181307-aeb5ea97124e
+replace github.com/mikespook/gearman-go => /home/nook24/git/gearman-go
