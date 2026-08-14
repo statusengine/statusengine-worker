@@ -91,16 +91,38 @@ func TestHubDispatchNeverBlocksOnFullClientBuffer(t *testing.T) {
 
 	// The fast client should still have received messages up to its own
 	// buffer capacity, proving the slow client didn't starve dispatch.
-	select {
-	case <-fast.send:
-	case <-time.After(time.Second):
-		t.Fatal("fast client received nothing")
+	//
+	// All 16 are drained, not just one: slow's buffer (capacity 1) is full
+	// after the very first event, so a dispatch loop that blocked on a full
+	// client would wedge on event #2 - by which point fast has already been
+	// handed its first message. Taking a single message therefore passes
+	// just as happily against a blocking dispatch, which is the one thing
+	// this test exists to rule out. Draining fast's full capacity is what
+	// makes the difference observable.
+	for i := 0; i < cap(fast.send); i++ {
+		select {
+		case <-fast.send:
+		case <-time.After(time.Second):
+			t.Fatalf("fast client starved at message #%d - a slow client backpressured dispatch", i)
+		}
 	}
 
 	// The slow client's buffer (capacity 1) absorbed exactly one message;
 	// every subsequent publish was dropped for it rather than blocking.
-	if len(slow.send) != 1 {
-		t.Fatalf("expected slow client's buffer to hold exactly 1 dropped-rest message, got %d", len(slow.send))
+	//
+	// Waited for rather than sampled once: dispatch iterates h.clients with
+	// a plain map range, whose order Go randomizes per iteration, so seeing
+	// fast's message says nothing about whether slow has been served yet in
+	// that same round. Sampling here made the test fail in roughly one run
+	// in ten. The buffer holds 1 and nothing drains it, so it can never
+	// exceed 1 - "eventually 1" is the entire claim.
+	deadline := time.After(time.Second)
+	for len(slow.send) != 1 {
+		select {
+		case <-deadline:
+			t.Fatalf("expected slow client's buffer to hold exactly 1 dropped-rest message, got %d", len(slow.send))
+		case <-time.After(time.Millisecond):
+		}
 	}
 }
 
