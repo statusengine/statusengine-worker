@@ -149,11 +149,16 @@ func (h *Hub) HasClients() bool {
 // is dropped so the ingestion/DB pipeline is never slowed down by
 // WebSocket broadcasting. Drops are counted, not logged individually -
 // see statsLogInterval - since Publish sits on the hot ingestion path.
+//
+// A drop here means the event reached no client at all, unlike the
+// per-client drops in dispatch, hence the separate
+// metrics.WebsocketPublishDroppedTotal counter.
 func (h *Hub) Publish(topic string, payload []byte) {
 	select {
 	case h.broadcast <- Event{Topic: topic, Payload: payload}:
 	default:
 		h.publishDropped.Add(1)
+		metrics.WebsocketPublishDroppedTotal.Inc()
 	}
 }
 

@@ -195,6 +195,29 @@ var (
 		Help:      "Total number of messages dropped for slow WebSocket clients.",
 	})
 
+	// WebsocketPublishDroppedTotal counts events dropped by Hub.Publish
+	// because the Hub's own inbound buffer was full - the ingestion side
+	// giving up rather than backpressuring the pipeline (CLAUDE.md rule
+	// 4).
+	//
+	// Deliberately separate from WebsocketMessagesDroppedTotal above,
+	// because the two mean very different things. That one fires when a
+	// single client cannot keep up: annoying for that client, invisible
+	// to everyone else. This one fires when the Hub's Run goroutine
+	// cannot keep up at all, so the event never reaches *any* client -
+	// every connected dashboard goes blind at once. Folding them into one
+	// counter would hide a total outage inside a number that is routinely
+	// non-zero for a single slow browser tab.
+	//
+	// A rate above zero here means Run is the bottleneck, not the
+	// network: it is the metric to alert on.
+	WebsocketPublishDroppedTotal = promauto.NewCounter(prometheus.CounterOpts{
+		Namespace: "statusengine",
+		Subsystem: "websocket",
+		Name:      "publish_dropped_total",
+		Help:      "Total number of events dropped because the Hub's inbound broadcast buffer was full.",
+	})
+
 	// PipelineErrorsTotal counts errors encountered anywhere in the
 	// pipeline, labeled by the component that hit them (ComponentMySQL,
 	// ComponentWebSocket, ComponentGraphite, ComponentQueue).

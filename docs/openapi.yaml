@@ -954,6 +954,7 @@ paths:
         | `statusengine_websocket_clients_active` | gauge | - | Currently connected WebSocket clients. |
         | `statusengine_websocket_messages_broadcasted_total` | counter | - | Messages successfully handed to a client's send buffer. |
         | `statusengine_websocket_messages_dropped_total` | counter | - | Messages dropped because a client's send buffer was full - non-blocking broadcast. Deliberately unlabeled: a client id is unique per connection, so labeling by it would mint a permanent new time series on every reconnect. Which client was too slow is logged when that client disconnects. |
+        | `statusengine_websocket_publish_dropped_total` | counter | - | Events dropped because the Hub's *inbound* buffer was full, i.e. the broadcast goroutine could not keep up. Distinct from `messages_dropped_total` above and far more serious: that one means a single slow client missed a message, this one means the event reached no client at all. A non-zero rate here is what to alert on. |
         | `statusengine_pipeline_errors_total` | counter | `component` (`mysql`, `websocket`, `graphite`, `queue`) | Errors encountered anywhere in the pipeline. |
 
         Plus the standard Go runtime/process metrics `promhttp.Handler()`
@@ -1028,6 +1029,9 @@ paths:
                 # HELP statusengine_websocket_messages_dropped_total Total number of messages dropped for slow WebSocket clients.
                 # TYPE statusengine_websocket_messages_dropped_total counter
                 statusengine_websocket_messages_dropped_total 0
+                # HELP statusengine_websocket_publish_dropped_total Total number of events dropped because the Hub's inbound broadcast buffer was full.
+                # TYPE statusengine_websocket_publish_dropped_total counter
+                statusengine_websocket_publish_dropped_total 0
                 # HELP statusengine_pipeline_errors_total Total number of errors encountered per pipeline component.
                 # TYPE statusengine_pipeline_errors_total counter
                 statusengine_pipeline_errors_total{component="mysql"} 0
