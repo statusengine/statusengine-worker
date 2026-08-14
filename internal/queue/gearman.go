@@ -221,19 +221,41 @@ func (c *GearmanConsumer) logStatsPeriodically(ctx context.Context) {
 // in progress. Safe to call multiple times and safe to call without a
 // prior Start.
 //
-// The data race this used to warn about is fixed in the patched fork
-// this module points at (see go.mod's replace directive): upstream's
-// Worker.Close closed worker.in while the per-connection agent
-// goroutines were still sending on it, and worker.running was written
-// under the worker mutex but read from exec without it. The fork waits
-// on a WaitGroup covering those goroutines before closing the channel,
-// and makes running an atomic.Bool. Shutdown is no longer best-effort,
-// and the full suite runs under -race with nothing skipped.
+// Three upstream defects made this unsafe; all are fixed in the patched
+// fork this module points at (see go.mod's replace directive).
+//
+// Two were data races: Worker.Close closed worker.in while the
+// per-connection agent goroutines were still sending on it, and
+// worker.running was written under the worker mutex but read from exec
+// without it. The fork waits on a WaitGroup covering those goroutines
+// before closing the channel, and makes running an atomic.Bool.
+// Shutdown is no longer best-effort, and the full suite runs under -race
+// with nothing skipped.
+//
+// The third cost data rather than stability, and is why w.Close() below
+// is safe to call before handlerWG.Wait(). Close used to clear running
+// and drop the connections before waiting, while exec writes a job's
+// WORK_COMPLETE only while running is true - so every handler still
+// running at that moment finished its work, wrote its rows, and then
+// silently skipped its acknowledgement. The job server re-queued exactly
+// those jobs (bounded by -gearman-max-concurrent-jobs) and redelivered
+// them after the restart. Measured here before the fix: a SIGTERM under
+// load re-queued 64 jobs and lost 1.1% of all events, because the
+// redelivery collided on a PRIMARY KEY and took the rest of its INSERT
+// batch down with it. The fork now drains in-flight jobs before
+// disconnecting, so nothing is handed out twice; cmd/losstest measures
+// it (300,000 of 300,000, and processed + still-queued adds up to
+// exactly what was published).
+//
+// Both halves are needed and neither replaces the other: this one stops
+// redelivery from happening on an orderly shutdown, and the upserts in
+// registry.go keep it harmless when it happens anyway - a crash, an
+// OOM-kill or a lost acknowledgement on the network.
 //
 // If the replace directive is ever dropped, expect
 // TestGearmanConsumerEndToEnd to fail under -race in about half of all
 // runs, with the report attaching to whichever test happens to be
-// running when it fires.
+// running when it fires, and expect the redelivery to come back.
 func (c *GearmanConsumer) Stop() error {
 	c.stopOnce.Do(func() {
 		close(c.statsDone)

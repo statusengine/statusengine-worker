@@ -26,4 +26,4 @@ require (
 	google.golang.org/protobuf v1.36.11 // indirect
 )
 
-replace github.com/mikespook/gearman-go => github.com/nook24/gearman-go v1.0.0
+replace github.com/mikespook/gearman-go => github.com/nook24/gearman-go v1.1.1

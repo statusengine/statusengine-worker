@@ -239,11 +239,26 @@ Ohne diesen Umweg wäre der letzte Batch still verloren.
 > abbricht. **Behoben:** derselbe Ablauf liefert jetzt 300.000 von 300.000
 > und keinen einzigen 1062.
 
-Beim Lesen von `registry.go` ist deshalb `newRedeliverySafeInserter` die
-Stelle, die Sie verstanden haben sollten: zehn Tabellen schreiben als Upsert,
-dessen Update-Klausel die erste Spalte des Primärschlüssels nennt und damit ein
-echtes No-Op ist. `logentries` und `perfdata` sind bewusst ausgenommen —
-Details unter Regel 6 in `CLAUDE.md`.
+Das wurde an **zwei** Stellen behoben, und beim Audit sollten Sie verstanden
+haben, warum keine die andere ersetzt:
+
+1. **`newRedeliverySafeInserter` in `registry.go`** — zehn Tabellen schreiben
+   als Upsert, dessen Update-Klausel die erste Spalte des Primärschlüssels
+   nennt und damit ein echtes No-Op ist. Das macht eine Neulieferung
+   *folgenlos*.
+2. **gearman-go v1.1.1** — `Close()` ließ die laufenden Handler ihre Quittung
+   nicht mehr absetzen, weshalb gearmand die Jobs wieder einreihte. Jetzt wird
+   erst geleert, dann getrennt. Das lässt die Neulieferung bei einem geordneten
+   Shutdown *gar nicht erst entstehen*.
+
+Punkt 2 deckt nur den geordneten Fall ab. Bei Absturz, OOM-Kill oder verlorener
+Quittung im Netz liefert der Broker weiterhin erneut aus — **exactly-once ist
+hier nicht erreichbar.** Punkt 1 ist deshalb der tragende Teil; wer ihn mit dem
+Argument „Neulieferung passiert ja nicht mehr" entfernt, holt sich den
+1,1-%-Verlust beim ersten harten Kill zurück.
+
+`logentries` und `perfdata` sind bewusst ausgenommen — Details unter Regel 6 in
+`CLAUDE.md`.
 
 ---
 
