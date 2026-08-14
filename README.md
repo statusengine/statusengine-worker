@@ -73,6 +73,8 @@ On SIGINT/SIGTERM, the worker performs an ordered shutdown:
 
 This guarantees buffered MySQL rows are written before process exit.
 
+Flushing the buffers is only half of it, though. Queue delivery is at-least-once: a worker that is killed between finishing a job and its acknowledgement reaching the broker gets that job again on restart, with its rows already in MySQL. Every table that can collide on its PRIMARY KEY is therefore written as an upsert, so a redelivery is skipped instead of aborting the whole multi-row `INSERT` and taking the rest of the batch with it. See [Verify No Events Are Lost](#verify-no-events-are-lost) for the tool that measures this end to end.
+
 ## Supported Event Topics
 
 The following queue names are also the WebSocket subscription topics:
@@ -98,6 +100,7 @@ go build -o gearman_publisher ./cmd/gearman_publisher
 go build -o rabbitmq_publisher ./cmd/rabbitmq_publisher
 go build -o db_verifier ./cmd/db_verifier
 go build -o db_cleanup ./cmd/db_cleanup
+go build -o losstest ./cmd/losstest
 go build -o worker ./cmd/app
 ```
 
@@ -161,6 +164,76 @@ Example crontab, nightly at 03:20:
 ```
 
 In a cluster, run this on **exactly one node** — or on several at clearly different times. Simultaneous runs are not dangerous, but they compete for the same locks and finish no sooner.
+
+## Verify No Events Are Lost
+
+`cmd/losstest` answers the one question about the graceful shutdown that reading the code cannot: does a restart under load lose data? Run it before a release, and after any change to the consumer, the shutdown sequence or the bulk-insert path.
+
+It publishes hostcheck events whose hostname is a unique marker, `lt-<run-id>-<seq>`. That column is the first of `statusengine_hostchecks`' PRIMARY KEY, so nothing in the pipeline can merge two of them — a missing sequence number is proof of a lost event, not an artifact of deduplication.
+
+### Before you start
+
+- **Point it at a dev or staging database.** It writes real rows into `statusengine_hostchecks`.
+- **Make sure no other worker is connected to the same Gearman server.** It would consume the test events into its own database, and the run would report them as lost. Check with `gearadmin --status`: the last column is the number of connected workers.
+- **Build the worker as a binary.** With `go run`, the worker is a *child* process, so your `SIGTERM` hits the parent and the worker keeps running.
+
+```bash
+go build -o bin/app ./cmd/app
+go build -o bin/losstest ./cmd/losstest
+```
+
+### The run
+
+Run from the repo root — the payload fixture is read from `.claude/specs/`.
+
+**1. Build a backlog.** 300,000 events become 3,000 jobs. Publishing up front rather than trickling events in is deliberate: it leaves jobs waiting at the broker, which is the realistic restart scenario and the one that exercises the window where a job is handed over while the consumer is already shutting down.
+
+```bash
+./bin/losstest -mode publish -run-id r1 -count 300000
+```
+
+**2. Start the worker, interrupt it mid-drain.** Throughput on a developer machine measured between 6,000 and 8,500 events per second, so a 300k backlog leaves well under a minute to react — scale `-count` up if that is too tight on your hardware. Watch the queue drain and send `SIGTERM` somewhere in the middle — not at the very start, and not once it is already empty:
+
+```bash
+./bin/app -config /etc/statusengine/config.yaml &
+WORKER=$!
+
+gearadmin --status | grep statusngin_hostchecks    # second column = jobs waiting
+
+kill -TERM $WORKER
+```
+
+Remember the PID when you start it rather than looking it up later: `pgrep -f bin/app` also matches the shell you type it in, whose command line now contains that string too, and the resulting `kill` takes down your own session along with the worker.
+
+**3. Start the worker again** and let it drain the rest completely, then stop it.
+
+**4. Check what arrived.**
+
+```bash
+./bin/losstest -mode verify -run-id r1 -count 300000
+```
+
+```
+Run "r1", expected 300000 events
+  rows in statusengine_hostchecks : 300000
+  distinct events  : 300000
+  missing          : 0
+  still queued     : 0 jobs (~0 events) at localhost:4730
+
+No events lost.
+```
+
+`missing: 0` and exit code 0 is the pass condition. **Jobs still queued at the broker are not loss** — they survive a restart by design and are reported separately so the accounting adds up; let the worker finish draining before you judge the result.
+
+If events are missing, the tool prints the gaps as ranges. A contiguous gap that is an exact multiple of 100 is one or more whole jobs that never reached MySQL; check the worker log for `bulk insert failed`.
+
+**5. Remove the test rows.**
+
+```bash
+./bin/losstest -mode cleanup -run-id r1
+```
+
+Use a fresh `-run-id` per run, or clean up in between — `verify` counts every row belonging to that id, including ones an earlier run left behind. Non-default servers are set with `-server` (Gearman) and `-mysql-dsn`.
 
 ## Run Simulator
 
