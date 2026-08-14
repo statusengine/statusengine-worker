@@ -650,6 +650,64 @@ func newAcknowledgementHandler(hub *websocket.Hub, topic string, hostIns, servic
 // enableOpenITCockpitTweaks selects which query newCoreRestartHandler uses
 // to clear hoststatus/servicestatus on a core restart (worker-wide
 // "ENABLE_OPENITCOCKPIT_TWEAKS" config option, default false).
+// newRedeliverySafeInserter builds a BulkInserter for a table with a natural
+// PRIMARY KEY, whose flush survives the same job being delivered twice.
+//
+// Queue delivery is at-least-once and cannot be made otherwise. A worker that
+// is killed, OOM-killed or loses power between finishing a job and its
+// acknowledgement reaching the broker will be handed that job again on
+// restart, and its rows are already in MySQL. Without this clause the
+// redelivered rows collide on the PRIMARY KEY, MySQL aborts the *entire*
+// multi-row INSERT with Error 1062, and flushBuffer drops the batch - taking
+// with it every fresh row that happened to share that batch, since batches
+// are cut at MaxBatchSize regardless of job boundaries. Measured at 1.1% of
+// all events lost on a single SIGTERM under load (CLAUDE.md rule 6); see
+// cmd/losstest, which reproduces it.
+//
+// The column used is the FIRST column of the table's PRIMARY KEY, which is
+// what makes the generated "ON DUPLICATE KEY UPDATE col = VALUES(col)" a
+// genuine no-op: the row only matched because that column is already equal,
+// so MySQL writes nothing and reports zero affected rows. INSERT IGNORE would
+// be shorter and is deliberately not used - it downgrades *every* error to a
+// warning, including truncation and NOT NULL violations, which would turn
+// real data problems invisible.
+//
+// This is a different reason from the one hoststatus/servicestatus are
+// upserted for: those collide by design, because they receive repeated
+// snapshots of the same logical row.
+func newRedeliverySafeInserter[T any](sqlDB *sql.DB, table string, columns []string, toRow db.RowFunc[T]) *db.BulkInserter[T] {
+	pkColumn, ok := redeliverySafePKColumn[table]
+	if !ok {
+		// A table added above without an entry below would silently go back
+		// to plain INSERT and lose a batch on the next redelivery. Fail at
+		// construction instead, where every NewRouter test catches it.
+		panic("queue: no redelivery-safe PRIMARY KEY column declared for " + table)
+	}
+	return db.NewUpsertBulkInserter(sqlDB, table, columns, []string{pkColumn}, toRow)
+}
+
+// redeliverySafePKColumn maps every table written through
+// newRedeliverySafeInserter to the first column of its PRIMARY KEY. Kept as
+// one table rather than spelled out at each call site so the value cannot
+// drift from the schema unnoticed - TestRedeliverySafePKColumnsMatchSchema
+// checks every entry against .claude/specs/mysql_schema.sql.
+//
+// statusengine_logentries and statusengine_perfdata are absent on purpose:
+// neither has a PRIMARY KEY a redelivery could collide on. See the comment
+// at their constructors in NewRouter.
+var redeliverySafePKColumn = map[string]string{
+	"statusengine_hostchecks":                "hostname",
+	"statusengine_servicechecks":             "service_description",
+	"statusengine_host_statehistory":         "hostname",
+	"statusengine_service_statehistory":      "service_description",
+	"statusengine_host_acknowledgements":     "hostname",
+	"statusengine_service_acknowledgements":  "service_description",
+	"statusengine_host_notifications":        "hostname",
+	"statusengine_service_notifications":     "service_description",
+	"statusengine_host_notifications_log":    "hostname",
+	"statusengine_service_notifications_log": "hostname",
+}
+
 func NewRouter(sqlDB *sql.DB, hub *websocket.Hub, gc *graphite.Client, perfdataRoute PerfdataRoute, graphitePrefix, nodeName string, enableOpenITCockpitTweaks bool) (Router, []Runner) {
 	hostStatus := db.NewUpsertBulkInserter(sqlDB, "statusengine_hoststatus",
 		hostStatusColumns, hostStatusUpdateColumns, newHostStatusRow(nodeName))
@@ -657,39 +715,48 @@ func NewRouter(sqlDB *sql.DB, hub *websocket.Hub, gc *graphite.Client, perfdataR
 	serviceStatus := db.NewUpsertBulkInserter(sqlDB, "statusengine_servicestatus",
 		serviceStatusColumns, serviceStatusUpdateColumns, newServiceStatusRow(nodeName))
 
-	hostChecks := db.NewBulkInserter(sqlDB, "statusengine_hostchecks",
+	hostChecks := newRedeliverySafeInserter(sqlDB, "statusengine_hostchecks",
 		[]string{"hostname", "start_time", "start_time_usec", "state", "is_hardstate", "end_time", "output", "long_output",
 			"timeout", "early_timeout", "latency", "execution_time", "perfdata", "command",
 			"current_check_attempt", "max_check_attempts"},
 		hostCheckRow)
 
-	serviceChecks := db.NewBulkInserter(sqlDB, "statusengine_servicechecks",
+	serviceChecks := newRedeliverySafeInserter(sqlDB, "statusengine_servicechecks",
 		[]string{"service_description", "start_time", "start_time_usec", "hostname", "state", "is_hardstate", "end_time", "output",
 			"long_output", "timeout", "early_timeout", "latency", "execution_time", "perfdata", "command",
 			"current_check_attempt", "max_check_attempts"},
 		serviceCheckRow)
 
+	// logEntries and perfdata below are deliberately NOT redelivery-safe, and
+	// cannot be made so from here: statusengine_logentries is keyed on an
+	// AUTO_INCREMENT id and statusengine_perfdata has no PRIMARY KEY at all,
+	// so a redelivered job collides with nothing and simply inserts its rows
+	// a second time. That is a silent duplicate rather than a dropped batch -
+	// no error, nothing in the log - and it is the accepted trade-off here:
+	// both are retention-managed history, and fixing it would need a UNIQUE
+	// index, i.e. a schema change, and the schema belongs to openITCOCKPIT
+	// rather than this repo. See CLAUDE.md rule 6.
 	logEntries := db.NewBulkInserter(sqlDB, "statusengine_logentries",
 		[]string{"entry_time", "logentry_type", "logentry_data", "node_name"},
 		newLogEntryRow(nodeName))
 
-	hostStateHistory := db.NewBulkInserter(sqlDB, "statusengine_host_statehistory",
+	hostStateHistory := newRedeliverySafeInserter(sqlDB, "statusengine_host_statehistory",
 		[]string{"hostname", "state_time", "state_time_usec", "state_change", "state", "is_hardstate",
 			"current_check_attempt", "max_check_attempts", "last_state", "last_hard_state", "output", "long_output"},
 		hostStateHistoryRow)
 
-	serviceStateHistory := db.NewBulkInserter(sqlDB, "statusengine_service_statehistory",
+	serviceStateHistory := newRedeliverySafeInserter(sqlDB, "statusengine_service_statehistory",
 		[]string{"service_description", "state_time", "state_time_usec", "hostname", "state_change", "state",
 			"is_hardstate", "current_check_attempt", "max_check_attempts", "last_state", "last_hard_state",
 			"output", "long_output"},
 		serviceStateHistoryRow)
 
-	hostAcks := db.NewBulkInserter(sqlDB, "statusengine_host_acknowledgements",
+	hostAcks := newRedeliverySafeInserter(sqlDB, "statusengine_host_acknowledgements",
 		[]string{"hostname", "entry_time", "entry_time_usec", "state", "author_name", "comment_data",
 			"acknowledgement_type", "is_sticky", "persistent_comment", "notify_contacts"},
 		hostAcknowledgementRow)
 
-	serviceAcks := db.NewBulkInserter(sqlDB, "statusengine_service_acknowledgements",
+	serviceAcks := newRedeliverySafeInserter(sqlDB, "statusengine_service_acknowledgements",
 		[]string{"service_description", "entry_time", "entry_time_usec", "hostname", "state", "author_name", "comment_data",
 			"acknowledgement_type", "is_sticky", "persistent_comment", "notify_contacts"},
 		serviceAcknowledgementRow)
@@ -698,22 +765,22 @@ func NewRouter(sqlDB *sql.DB, hub *websocket.Hub, gc *graphite.Client, perfdataR
 		[]string{"hostname", "service_description", "label", "timestamp", "timestamp_unix", "value", "unit"},
 		perfdataRow)
 
-	hostNotifications := db.NewBulkInserter(sqlDB, "statusengine_host_notifications",
+	hostNotifications := newRedeliverySafeInserter(sqlDB, "statusengine_host_notifications",
 		[]string{"hostname", "start_time", "start_time_usec", "contact_name", "command_name", "command_args",
 			"state", "end_time", "reason_type", "output", "ack_author", "ack_data"},
 		hostNotificationRow)
 
-	serviceNotifications := db.NewBulkInserter(sqlDB, "statusengine_service_notifications",
+	serviceNotifications := newRedeliverySafeInserter(sqlDB, "statusengine_service_notifications",
 		[]string{"service_description", "start_time", "start_time_usec", "hostname", "contact_name",
 			"command_name", "command_args", "state", "end_time", "reason_type", "output", "ack_author", "ack_data"},
 		serviceNotificationRow)
 
-	hostNotificationsLog := db.NewBulkInserter(sqlDB, "statusengine_host_notifications_log",
+	hostNotificationsLog := newRedeliverySafeInserter(sqlDB, "statusengine_host_notifications_log",
 		[]string{"hostname", "start_time", "start_time_usec", "end_time", "state", "reason_type",
 			"is_escalated", "contacts_notified_count", "output", "ack_author", "ack_data"},
 		hostNotificationLogRow)
 
-	serviceNotificationsLog := db.NewBulkInserter(sqlDB, "statusengine_service_notifications_log",
+	serviceNotificationsLog := newRedeliverySafeInserter(sqlDB, "statusengine_service_notifications_log",
 		[]string{"hostname", "service_description", "start_time", "start_time_usec", "end_time", "state",
 			"reason_type", "is_escalated", "contacts_notified_count", "output", "ack_author", "ack_data"},
 		serviceNotificationLogRow)

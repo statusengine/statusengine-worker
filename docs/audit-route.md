@@ -227,8 +227,23 @@ bei `ctx.Done()` als auch beim geschlossenen Eingangskanal wird erst
 eigenen 5s-Context, weil der reguläre zu diesem Zeitpunkt schon abgelaufen ist.
 Ohne diesen Umweg wäre der letzte Batch still verloren.
 
-**Prüfen Sie das als Erstes praktisch**, nicht nur lesend: Worker unter Last
-mit SIGTERM beenden und die Zeilenzahlen vorher/nachher vergleichen.
+**Dieser Teil ist gemessen, nicht nur gelesen** — mit `cmd/losstest`:
+
+> Bei 300.000 Events, SIGTERM mitten im Abarbeiten, Neustart und vollständigem
+> Leerlaufen gingen ursprünglich **3.300 Events (1,1 %) endgültig verloren.**
+> Der Flush-Pfad war nie die Ursache — zwei ununterbrochene Kontrollläufe
+> verloren nichts. Schuld war die Kombination aus Wiedereinreihung durch
+> gearmand (exakt 64 Jobs, der Concurrency-Cap), Batches, die unabhängig von
+> Job-Grenzen bei 100 Zeilen geschnitten werden, und einem `Error 1062`, der
+> den **gesamten** Multi-Row-INSERT mitsamt der frischen Zeilen darin
+> abbricht. **Behoben:** derselbe Ablauf liefert jetzt 300.000 von 300.000
+> und keinen einzigen 1062.
+
+Beim Lesen von `registry.go` ist deshalb `newRedeliverySafeInserter` die
+Stelle, die Sie verstanden haben sollten: zehn Tabellen schreiben als Upsert,
+dessen Update-Klausel die erste Spalte des Primärschlüssels nennt und damit ein
+echtes No-Op ist. `logentries` und `perfdata` sind bewusst ausgenommen —
+Details unter Regel 6 in `CLAUDE.md`.
 
 ---
 
@@ -237,8 +252,13 @@ mit SIGTERM beenden und die Zeilenzahlen vorher/nachher vergleichen.
 Konkrete Invarianten, die halten müssen — die Punkte, an denen ein Fehler
 teuer wäre:
 
-- [ ] **Kein Datenverlust bei SIGTERM unter Last.** Der Pfad
-      `drainPending` → `finalFlush` ist die einzige Absicherung.
+- [ ] **Kein Datenverlust bei SIGTERM unter Last.** Erfüllt und mit
+      `cmd/losstest` nachgemessen (300.000/300.000). Vor jedem Release
+      wiederholen — es ist der einzige Test, der diese Zusage wirklich prüft.
+- [ ] **`logentries` und `perfdata` dürfen Duplikate haben.** Bei einem
+      Neustart unter Last können bis zu 6.400 Zeilen doppelt entstehen, ohne
+      Fehlermeldung. Bewusst akzeptiert — prüfen Sie, ob das für Ihre
+      Perfdata-Graphen tragbar ist.
 - [ ] **`-mysql-max-open-conns` ≥ Anzahl Runner**, sonst serialisiert der Pool
       den Shutdown-Flush innerhalb des 10s-Budgets. Default 25 gegen 15 Runner
       passt; bei mehr Queues mitwachsen lassen.
