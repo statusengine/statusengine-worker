@@ -135,7 +135,7 @@ Ten tables with a natural PRIMARY KEY are written as `INSERT ... ON DUPLICATE KE
 
 `INSERT IGNORE` would be shorter and is deliberately **not** used: it downgrades *every* error to a warning, including truncation and `NOT NULL` violations, which would make real data problems invisible.
 
-Two tables are knowingly not covered, because neither can collide: `statusengine_logentries` (AUTO_INCREMENT key) and `statusengine_perfdata` (no PRIMARY KEY at all). A redelivery or a mid-statement retry inserts their rows a **second time, silently**. Accepted rather than fixed — both are retention-managed history, and closing it would need a UNIQUE index, i.e. a schema change to a schema owned by openITCOCKPIT. A duplicate row in a history table is the lesser evil against a missing event.
+Two tables are knowingly not covered, because neither can collide: `statusengine_logentries` (AUTO_INCREMENT key) and `statusengine_perfdata` (no PRIMARY KEY at all). A redelivery or a mid-statement retry inserts their rows a **second time, silently**. Accepted rather than fixed — both are retention-managed history, and closing it would need a UNIQUE index, i.e. a schema migration plus an index on the two highest-volume tables in the database. A duplicate row in a history table is the lesser evil against a missing event.
 
 ### Where data can still be lost
 

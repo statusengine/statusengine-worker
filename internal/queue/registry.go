@@ -668,17 +668,36 @@ func newAcknowledgementHandler(hub *websocket.Hub, topic string, hostIns, servic
 // all events lost on a single SIGTERM under load (CLAUDE.md rule 6); see
 // cmd/losstest, which reproduces it.
 //
-// The column used is the FIRST column of the table's PRIMARY KEY, which is
-// what makes the generated "ON DUPLICATE KEY UPDATE col = VALUES(col)" a
-// genuine no-op: the row only matched because that column is already equal,
-// so MySQL writes nothing and reports zero affected rows. INSERT IGNORE would
-// be shorter and is deliberately not used - it downgrades *every* error to a
-// warning, including truncation and NOT NULL violations, which would turn
-// real data problems invisible.
+// What the clause is for, since this is easy to misread: the goal is an
+// INSERT that adds the rows MySQL does not have yet and does nothing at all
+// for the ones it already has. MySQL has no such statement, but
+// "ON DUPLICATE KEY UPDATE" gets there - provided the update it performs is
+// worthless.
 //
-// This is a different reason from the one hoststatus/servicestatus are
-// upserted for: those collide by design, because they receive repeated
-// snapshots of the same logical row.
+// The column named below is therefore NOT a key specification. MySQL decides
+// what counts as a duplicate entirely on its own, matching the *complete*
+// index - for statusengine_servicechecks that is all three of
+// (service_description, start_time, start_time_usec). The list only says what
+// to write once a duplicate has been found, and MySQL rejects an empty one as
+// a syntax error, so something has to be named.
+//
+// Naming a PRIMARY KEY column is what makes that something a genuine no-op: a
+// collision means every key column already matches, so "col = VALUES(col)"
+// writes back the value the row already holds. MySQL sees no change, creates
+// no new row version, touches no index and reports zero affected rows. Any of
+// the key's columns would do equally well - listing all three would be just as
+// correct and three times as long for an identical result. The FIRST one is a
+// convention, chosen because it can be checked mechanically against the schema
+// (TestRedeliverySafePKColumnsMatchSchema).
+//
+// Note the contrast with hoststatus/servicestatus a few lines up in NewRouter:
+// their updateColumns list the entire payload, because there a collision is
+// supposed to overwrite - they receive repeated snapshots of the same logical
+// row. Same mechanism, opposite intent.
+//
+// INSERT IGNORE would express the same intent more briefly and is deliberately
+// not used - it downgrades *every* error to a warning, including truncation and
+// NOT NULL violations, which would turn real data problems invisible.
 func newRedeliverySafeInserter[T any](sqlDB *sql.DB, table string, columns []string, toRow db.RowFunc[T]) *db.BulkInserter[T] {
 	pkColumn, ok := redeliverySafePKColumn[table]
 	if !ok {
