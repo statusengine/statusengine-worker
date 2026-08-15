@@ -738,8 +738,7 @@ func NewRouter(sqlDB *sql.DB, hub *websocket.Hub, gc *graphite.Client, perfdataR
 	// a second time. That is a silent duplicate rather than a dropped batch -
 	// no error, nothing in the log - and it is the accepted trade-off here:
 	// both are retention-managed history, and fixing it would need a UNIQUE
-	// index, i.e. a schema change, and the schema belongs to openITCOCKPIT
-	// rather than this repo. See CLAUDE.md rule 6.
+	// index, i.e. a schema change.
 	logEntries := db.NewBulkInserter(sqlDB, "statusengine_logentries",
 		[]string{"entry_time", "logentry_type", "logentry_data", "node_name"},
 		newLogEntryRow(nodeName))
@@ -765,6 +764,7 @@ func NewRouter(sqlDB *sql.DB, hub *websocket.Hub, gc *graphite.Client, perfdataR
 			"acknowledgement_type", "is_sticky", "persistent_comment", "notify_contacts"},
 		serviceAcknowledgementRow)
 
+	// See the comment above why perfdat uses db.NewBulkInserter
 	perfdata := db.NewBulkInserter(sqlDB, "statusengine_perfdata",
 		[]string{"hostname", "service_description", "label", "timestamp", "timestamp_unix", "value", "unit"},
 		perfdataRow)
