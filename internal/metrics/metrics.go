@@ -74,6 +74,9 @@ func init() {
 	for _, component := range Components {
 		PipelineErrorsTotal.WithLabelValues(component)
 	}
+	// A worker that has not written anything yet is not a worker whose
+	// database is down - see DBAvailable.
+	DBAvailable.Set(1)
 }
 
 var (
@@ -161,6 +164,36 @@ var (
 		Subsystem: "db",
 		Name:      "batch_retries_total",
 		Help:      "Total number of bulk-insert retries after a transient MySQL locking failure.",
+	})
+
+	// DBConnectionRetriesTotal counts flush attempts that failed because
+	// MySQL was unreachable and were therefore repeated. Unlike a lock
+	// retry this is not bounded, so the counter climbs for as long as the
+	// outage lasts - what it measures is the length of the outage, not a
+	// number of incidents. Use DBAvailable to alert, this one to see how
+	// often it happens at all.
+	DBConnectionRetriesTotal = promauto.NewCounter(prometheus.CounterOpts{
+		Namespace: "statusengine",
+		Subsystem: "db",
+		Name:      "connection_retries_total",
+		Help:      "Total number of bulk-insert attempts repeated because MySQL was unreachable.",
+	})
+
+	// DBAvailable is 1 while bulk inserts are succeeding and 0 from the
+	// moment one fails with a connection error until one succeeds again.
+	// This is the metric to alert on: while it is 0 the pipeline is not
+	// losing data (it holds the batch and backpressures to the broker),
+	// but it is also not draining, so the backlog at Gearman/RabbitMQ is
+	// growing and will need time to catch up afterwards.
+	//
+	// Pre-set to 1 in init below rather than left at Prometheus' default
+	// of 0, which would otherwise read as "MySQL is down" for every
+	// worker that has not flushed its first batch yet.
+	DBAvailable = promauto.NewGauge(prometheus.GaugeOpts{
+		Namespace: "statusengine",
+		Subsystem: "db",
+		Name:      "available",
+		Help:      "1 if bulk inserts are reaching MySQL, 0 while the pipeline is stalled on an unreachable server.",
 	})
 
 	// DBBatchSizeAtFlush observes how many rows each flush actually

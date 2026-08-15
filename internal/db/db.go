@@ -5,9 +5,12 @@ package db
 import (
 	"context"
 	"database/sql"
+	"database/sql/driver"
 	"errors"
 	"fmt"
+	"io"
 	"log/slog"
+	"net"
 	"strings"
 	"sync/atomic"
 	"time"
@@ -337,10 +340,10 @@ func (b *BulkInserter[T]) finalFlush() {
 
 // flushBuffer executes the buffered rows as a single bulk INSERT and
 // clears the buffer, reusing its underlying array. A failed insert is
-// logged and the batch is dropped rather than retried indefinitely, since
-// retrying here would either block the pipeline or grow the buffer
-// unbounded - the one exception is a transient locking failure, which is
-// retried a bounded number of times (see execWithRetry).
+// logged and the batch is dropped, with two exceptions that are retried
+// instead: a transient locking failure and an unreachable server (see
+// execWithRetry). Blocking the pipeline is the intended behaviour for the
+// second of those, not a side effect.
 //
 // Every flush is logged exactly once, at most every FlushInterval (or
 // MaxBatchSize rows) - never per row - so structured logging never adds
@@ -397,61 +400,148 @@ func (b *BulkInserter[T]) flushBuffer(ctx context.Context) error {
 // MySQL error numbers that mean "the statement lost a race, try again",
 // as opposed to "the statement is wrong".
 const (
-	mysqlErrLockWaitTimeout = 1205 // ER_LOCK_WAIT_TIMEOUT
-	mysqlErrDeadlock        = 1213 // ER_LOCK_DEADLOCK
+	mysqlErrTooManyConnections = 1040 // ER_CON_COUNT_ERROR
+	mysqlErrServerShutdown     = 1053 // ER_SERVER_SHUTDOWN
+	mysqlErrLockWaitTimeout    = 1205 // ER_LOCK_WAIT_TIMEOUT
+	mysqlErrDeadlock           = 1213 // ER_LOCK_DEADLOCK
+	mysqlErrConnectionKilled   = 1927 // ER_CONNECTION_KILLED
 )
 
-// flushRetryBackoff is how long to wait before each retry; its length
-// therefore also caps the number of retries, so a flush makes at most
-// len+1 attempts in total. The values are deliberately short and not
-// configurable: Shutdown flushes under a 5s context (see Shutdown), and a
-// pause long enough to matter there would trade one problem for another.
+// flushRetryBackoff is how long to wait before each retry of a *lock*
+// failure; its length therefore also caps the number of those retries, so
+// a flush makes at most len+1 attempts. The values are deliberately short
+// and not configurable: a deadlock clears in milliseconds, and Shutdown
+// flushes under a 5s context.
 var flushRetryBackoff = []time.Duration{50 * time.Millisecond, 200 * time.Millisecond}
 
+// Connection failures are retried on a different schedule, because they
+// are a different kind of transient: a MySQL restart takes tens of
+// seconds, not milliseconds. The wait therefore backs off up to a cap and
+// then keeps going for as long as the context allows, rather than being
+// limited to a fixed number of attempts.
+const (
+	connRetryInitialBackoff = 100 * time.Millisecond
+	connRetryMaxBackoff     = 5 * time.Second
+	// connRetryLogInterval throttles the "still unreachable" log line. A
+	// 20-minute outage must not produce one line per attempt.
+	connRetryLogInterval = 10 * time.Second
+)
+
 // execWithRetry runs the bulk INSERT, re-executing the identical statement
-// when MySQL reports a deadlock or a lock wait timeout.
+// for the two classes of failure that are about timing rather than about
+// the statement's content. Everything else is returned on the first
+// attempt, and flushBuffer then drops the batch.
 //
-// Those two are the only errors worth retrying, and retrying anything else
-// would be actively harmful. A deadlock or lock wait timeout rolls back
-// just this statement, is caused by another transaction's timing rather
-// than by this statement's content, and therefore usually succeeds on the
-// second attempt. Every other error - a truncated value, a NOT NULL
-// violation, a column count mismatch - is deterministic: the retry fails
-// identically, and the only thing three attempts buy is a slower shutdown
-// and a triplicated log line.
+// A *lock* failure (deadlock, lock wait timeout) rolls back only this
+// statement and is caused by another transaction's timing, so it clears in
+// milliseconds; it gets len(flushRetryBackoff)+1 attempts.
 //
-// Retrying is only safe because the writes are idempotent (CLAUDE.md
-// rule 6): the ten tables with a natural PRIMARY KEY are upserts, so a
-// statement that partially succeeded before being rolled back cannot
-// produce duplicates on the second attempt. Before that change this would
-// have been the wrong fix.
+// A *connection* failure means MySQL is unreachable - typically someone
+// restarted it. It gets retried with a capped backoff for as long as ctx
+// allows, which in practice means until the server is back or the worker
+// is shut down. This is the deliberate part: while this call is blocked,
+// Run's goroutine is blocked, so Enqueue blocks, so the queue handlers
+// block, so the consumer's concurrency cap fills and the backlog stays at
+// the broker, where it survives a worker restart and is visible in
+// gearadmin --status (CLAUDE.md rule 2 - backpressure belongs at the
+// broker). Dropping instead was measured at 29,400 of 150,000 events lost
+// for a five-second outage, because a job is acknowledged as soon as
+// Enqueue returns and there is no redelivery to fall back on.
 //
-// The alternative - dropping the batch, as every other error path does -
-// loses up to MaxBatchSize events for a condition that resolves itself in
-// milliseconds. That is the same shape of avoidable loss that the Error
-// 1062 collisions used to cause.
+// A permanently unreachable MySQL therefore stalls the pipeline rather
+// than draining it into nowhere. That is the intended trade: a growing,
+// visible, recoverable backlog beats a silent, unrecoverable hole.
+//
+// Everything else is deterministic - a truncated value, a NOT NULL
+// violation, a column count mismatch - so a retry fails identically and
+// only buys a slower shutdown and a triplicated log line.
+//
+// Retrying at all is only safe because the writes are idempotent
+// (CLAUDE.md rule 6). Note the one gap that remains: a connection lost
+// *mid*-statement leaves it unknown whether MySQL applied it, so the
+// retry can duplicate a row in statusengine_logentries and
+// statusengine_perfdata - the same two tables that already accept silent
+// duplicates on a redelivery, for the same reason (no colliding key) and
+// with the same reasoning (a duplicate in a retention-managed history
+// table is less harmful than a missing event).
 func (b *BulkInserter[T]) execWithRetry(ctx context.Context, query string, args ...any) error {
-	for attempt := 1; ; attempt++ {
+	var (
+		lockAttempts  int
+		connAttempts  int
+		outageStart   time.Time
+		lastOutageLog time.Time
+		connBackoff   = connRetryInitialBackoff
+	)
+
+	for {
 		_, err := b.db.ExecContext(ctx, query, args...)
-		if err == nil || attempt > len(flushRetryBackoff) || !isTransientLockError(err) {
+		if err == nil {
+			if connAttempts > 0 {
+				metrics.DBAvailable.Set(1)
+				slog.Info("db: MySQL is reachable again, held batch written",
+					"table", b.table, "unavailable_for", time.Since(outageStart).Round(time.Millisecond),
+					"attempts", connAttempts+1)
+			}
+			return nil
+		}
+
+		// A cancelled context means shutdown or an expired flush deadline,
+		// never something a retry can fix.
+		if ctx.Err() != nil {
 			return err
 		}
 
-		metrics.DBBatchRetriesTotal.Inc()
-		slog.Warn("db: bulk insert hit a transient lock failure, retrying",
-			"table", b.table, "attempt", attempt,
-			"attempts_allowed", len(flushRetryBackoff)+1, "error", err)
+		switch {
+		case isTransientLockError(err):
+			if lockAttempts >= len(flushRetryBackoff) {
+				return err
+			}
+			metrics.DBBatchRetriesTotal.Inc()
+			slog.Warn("db: bulk insert hit a transient lock failure, retrying",
+				"table", b.table, "attempt", lockAttempts+1,
+				"attempts_allowed", len(flushRetryBackoff)+1, "error", err)
+			if !sleepContext(ctx, flushRetryBackoff[lockAttempts]) {
+				return err
+			}
+			lockAttempts++
 
-		timer := time.NewTimer(flushRetryBackoff[attempt-1])
-		select {
-		case <-timer.C:
-		case <-ctx.Done():
-			// Shutting down (or the flush deadline expired): report the
-			// last real MySQL error rather than the context error, since
-			// that is what the caller needs to see in the log.
-			timer.Stop()
+		case isConnectionError(err):
+			if connAttempts == 0 {
+				outageStart = time.Now()
+				metrics.DBAvailable.Set(0)
+				slog.Warn("db: MySQL is unreachable, holding the batch until it returns",
+					"table", b.table, "rows", len(b.buffer), "error", err)
+				lastOutageLog = time.Now()
+			} else if time.Since(lastOutageLog) >= connRetryLogInterval {
+				slog.Warn("db: MySQL still unreachable, pipeline is stalled",
+					"table", b.table, "unavailable_for", time.Since(outageStart).Round(time.Second),
+					"attempts", connAttempts+1, "error", err)
+				lastOutageLog = time.Now()
+			}
+			metrics.DBConnectionRetriesTotal.Inc()
+			if !sleepContext(ctx, connBackoff) {
+				return err
+			}
+			connAttempts++
+			if connBackoff *= 2; connBackoff > connRetryMaxBackoff {
+				connBackoff = connRetryMaxBackoff
+			}
+
+		default:
 			return err
 		}
+	}
+}
+
+// sleepContext waits for d, reporting false if ctx was cancelled first.
+func sleepContext(ctx context.Context, d time.Duration) bool {
+	timer := time.NewTimer(d)
+	defer timer.Stop()
+	select {
+	case <-timer.C:
+		return true
+	case <-ctx.Done():
+		return false
 	}
 }
 
@@ -464,6 +554,42 @@ func isTransientLockError(err error) bool {
 		return false
 	}
 	return mysqlErr.Number == mysqlErrDeadlock || mysqlErr.Number == mysqlErrLockWaitTimeout
+}
+
+// isConnectionError reports whether err means "the server could not be
+// reached" rather than "the server rejected this statement".
+//
+// There is deliberately no check for error 2006 ("MySQL server has gone
+// away") or 2013 ("Lost connection during query"): those are client-side
+// numbers from libmysqlclient and this driver never produces them. What it
+// produces instead is driver.ErrBadConn when it can prove nothing was
+// written, mysql.ErrInvalidConn when the connection broke at any other
+// point, and a plain net error while the server is down and the dial
+// itself fails. Note that database/sql already retries ErrBadConn up to
+// three times on its own - it is listed here only for the case where
+// those are exhausted, which is exactly what a restart does to a pool.
+func isConnectionError(err error) bool {
+	if errors.Is(err, driver.ErrBadConn) || errors.Is(err, mysql.ErrInvalidConn) || errors.Is(err, io.EOF) {
+		return true
+	}
+
+	// Covers dial failures ("connection refused" while the server is down)
+	// as well as read/write failures on an established connection.
+	var netErr net.Error
+	if errors.As(err, &netErr) {
+		return true
+	}
+
+	// The server is up enough to answer, but not to accept this work.
+	var mysqlErr *mysql.MySQLError
+	if errors.As(err, &mysqlErr) {
+		switch mysqlErr.Number {
+		case mysqlErrServerShutdown, mysqlErrTooManyConnections, mysqlErrConnectionKilled:
+			return true
+		}
+	}
+
+	return false
 }
 
 // buildInsert renders "INSERT INTO table (cols...) VALUES (?,...), (?,...), ..."
