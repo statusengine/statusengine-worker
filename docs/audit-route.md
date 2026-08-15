@@ -4,24 +4,25 @@ Eine Lesereihenfolge für das Code-Review vor dem Prod-Einsatz. Nicht als
 Referenz gedacht, sondern als Route: von vorne nach hinten lesbar, und jeder
 Durchgang setzt voraus, dass der vorherige gelesen wurde.
 
-Der Umfang ist überschaubarer, als er wirkt. Von 14.077 Zeilen Go sind 7.775
-Produktivcode und 6.302 Tests. Davon sind wiederum drei Dateien
+Der Umfang ist überschaubarer, als er wirkt. Von 16.139 Zeilen Go sind 8.729
+Produktivcode und 7.410 Tests. Davon sind wiederum drei Dateien
 (`registry.go`, `main.go`, `rabbitmq.go`) fast ein Drittel — der Rest ist klein
 und einzeln lesbar.
 
 **Zu Zeilennummern:** dieses Dokument nennt vorrangig Funktionsnamen, weil die
 stabil bleiben. Wo Zeilennummern stehen, sind sie ein Sprungziel für den Stand
-vom 14.08.2026, kein Versprechen.
+vom 15.08.2026, kein Versprechen.
 
 ---
 
-## Die vier Durchgänge
+## Die fünf Durchgänge
 
 | # | Durchgang | Dateien | Frage, die er beantwortet |
 |---|---|---|---|
 | 1 | Das Skelett | `cmd/app/main.go` | Was wird in welcher Reihenfolge gestartet? |
 | 2 | Der Weg eines Events | `queue/router.go`, `queue/registry.go`, `db/db.go` | Was passiert mit einer Nachricht? |
 | 3 | Die Nebenläufigkeit | `queue/gearman.go`, `websocket/hub.go`, `db/db.go` | Wer läuft parallel, wer wartet auf wen? |
+| 3b | Das Fehlerverhalten von MySQL | `db/db.go` (`execWithRetry`) | Wann wird wiederholt, wann geht etwas verloren? |
 | 4 | Die Sonderfälle | `queue/downtime_processor.go`, `queue/processor.go`, `registry.go` | Wo weicht der Code vom Muster ab? |
 
 Halten Sie beim Lesen `CLAUDE.md` daneben. Die Architekturregeln 1–6 dort sind
@@ -32,7 +33,7 @@ geschrieben wurde — der Code verweist an vielen Stellen namentlich darauf.
 
 ## Durchgang 1 — Das Skelett
 
-**Nur eine Datei: `cmd/app/main.go`, und darin nur `main()` ab Zeile 524.**
+**Nur eine Datei: `cmd/app/main.go`, und darin nur `main()` ab Zeile 530.**
 Alles darüber ist Konfigurationsauflösung (Flag > Env > YAML > Default); die
 können Sie im ersten Durchgang überspringen und später gezielt nachlesen.
 
@@ -52,13 +53,15 @@ können Sie im ersten Durchgang überspringen und später gezielt nachlesen.
    `logConnectionCharset`
 7. **Graphite-Client** wird gebaut — aber noch nicht verbunden
 8. **`queue.NewRouter(...)`** liefert `Router` (12 Queues) und `[]Runner`
-   (15 Stück). Jeder Runner bekommt seine eigene Goroutine.
+   (15 Stück). Jeder Runner bekommt seine eigene Goroutine. Direkt davor wird
+   `-status-max-age` geparst und die effektive Einstellung einmalig geloggt —
+   die einzige Konfiguration, die absichtlich Daten verwirft.
 9. **Consumer** (`gearman` oder `rabbitmq`) wird gebaut und gestartet
 
 Danach blockiert `main()` auf `<-sigCtx.Done()`.
 
 **Worauf Sie hier achten sollten:** die drei Dinge, die *nicht* über `wg`
-laufen. Die beiden HTTP-Server und der Drain-Loop für `rawMessages` (Zeile 628)
+laufen. Die beiden HTTP-Server und der Drain-Loop für `rawMessages` (Zeile 651)
 werden mit blankem `go func()` gestartet und nicht in die WaitGroup
 aufgenommen. Bei den HTTP-Servern ist das korrekt — sie werden am Ende über
 `Shutdown()` beendet. Ob der Drain-Loop sauber terminiert, hängt daran, dass
@@ -81,11 +84,17 @@ flowchart TD
     E --> F[repairUTF8<br/>CP1252 reparieren]
     F --> G[Handler aus dem Router]
     G --> H[decodeHostStatus<br/>JSON-Bulk-Array]
-    H --> I[pro Item: publish<br/>Hub, nicht blockierend]
-    H --> J[pro Item: Enqueue<br/>BLOCKIERT bei vollem Puffer]
+    H --> S{älter als<br/>status-max-age?<br/>nur hier + servicestatus}
+    S -->|ja| Y[verwerfen, zählen<br/>weder MySQL noch Hub]
+    S -->|nein| I[pro Item: publish<br/>Hub, nicht blockierend]
+    S -->|nein| J[pro Item: Enqueue<br/>BLOCKIERT bei vollem Puffer]
     J --> K[BulkInserter.Run<br/>eigene Goroutine]
     K --> L{100 Zeilen<br/>oder 250ms?}
-    L --> M[ein Multi-Row-INSERT]
+    L --> M[execWithRetry<br/>ein Multi-Row-INSERT]
+    M --> N{Fehler?}
+    N -->|Sperre| O[3 Versuche<br/>50ms/200ms]
+    N -->|Server weg| P[warten bis zurück<br/>staut zum Broker]
+    N -->|sonst| Q[Batch verworfen<br/>bis zu 100 Zeilen]
 ```
 
 Die Kette in Dateien:
@@ -94,27 +103,46 @@ Die Kette in Dateien:
 |---|---|
 | Job-Annahme | `queue/gearman.go`, `Start()` → `w.AddFunc(...)` |
 | Zähler, UTF-8-Reparatur, Dauermessung | `queue/router.go`, `observeHandler` |
-| Zuordnung Queue → Handler | `queue/registry.go`, `NewRouter` (Zeile 721) |
+| Zuordnung Queue → Handler | `queue/registry.go`, `NewRouter` (Zeile 715) |
 | Decode | `queue/decode.go`, `decodeHostStatus` |
 | Broadcast | `queue/router.go`, `publish` |
-| Persistenz | `db/db.go`, `Enqueue` → `Run` → `flushBuffer` |
+| Altersfilter (nur Status-Queues) | `queue/router.go`, `NewStaleDroppingHandler` |
+| Persistenz | `db/db.go`, `Enqueue` → `Run` → `flushBuffer` → `execWithRetry` |
 
 **Die drei Stellen, an denen ich beim Review genau hinsehen würde:**
 
-`NewHandler` in `router.go:106` ist das Muster, dem acht der zwölf Queues
-folgen. Sie ist generisch über den Item-Typ und in vier Zeilen zu lesen — wenn
-Sie die verstanden haben, verstehen Sie den Großteil des Routers.
+`NewHandler` in `router.go:106` ist das Muster. Nur drei Queues nutzen sie
+direkt (`hostchecks`, `servicechecks`, `logentries`) und zwei weitere die
+gefilterte Variante darunter, aber alle übrigen Handler sind Varianten
+derselben vier Zeilen: decode → publish → Enqueue. Wenn Sie die verstanden
+haben, verstehen Sie den Großteil des Routers.
 
-`publish` in `router.go:152` prüft `hub.HasClients()` und überspringt das
+`publish` in `router.go:233` prüft `hub.HasClients()` und überspringt das
 JSON-Marshalling komplett, wenn niemand verbunden ist. Das ist der heißeste
 Pfad im Worker. Die Konsequenz ist bewusst in Kauf genommen: die Antwort ist
 eine Momentaufnahme, ein sich gerade verbindender Client verpasst das Event.
 
-`Enqueue` in `db/db.go:179` ist **die einzige Stelle im ganzen Datenpfad, die
-blockiert.** Wenn `b.in` (Kapazität 100) voll ist, wartet der Handler. Genau
-das ist beabsichtigt: der Rückstau wandert über den Handler und den
+`Enqueue` in `db/db.go:185` ist die Stelle, an der der Datenpfad **wartet statt
+zu verwerfen.** Wenn `b.in` (Kapazität 100) voll ist, blockiert der Handler.
+Genau das ist beabsichtigt: der Rückstau wandert über den Handler und den
 Concurrency-Cap des Consumers bis zum Broker, wo er einen Worker-Neustart
 überlebt. Regel 2 in `CLAUDE.md` beschreibt das im Detail.
+
+Der zweite Wartepunkt liegt eine Stufe dahinter und ist neu: `execWithRetry`
+blockiert, solange MySQL nicht erreichbar ist — wodurch `Run` blockiert,
+wodurch `Enqueue` blockiert. Derselbe Rückstaupfad, ausgelöst von der anderen
+Seite. Durchgang 3b geht darauf ein.
+
+**`NewStaleDroppingHandler` in `router.go:162` ist die einzige Stelle im
+Worker, die Events absichtlich wegwirft.** Sie ersetzt `NewHandler` für genau
+`statusngin_hoststatus` und `statusngin_servicestatus`: Events, deren
+Envelope-Timestamp älter als `-status-max-age` (Default 5m) ist, erreichen
+weder MySQL noch den Hub. Die Begründung — beides sind Snapshots, die einander
+überschreiben, und ein Rückstau davon ist nach einem Ausfall wertlos — steht
+im Funktionskommentar. Beim Audit ist hier zweierlei zu prüfen: dass wirklich
+nur diese beiden Queues so verdrahtet sind (jede andere Queue trägt Historie,
+dort wäre es schlicht Datenverlust), und dass Ihnen die Konsequenz bei
+Uhren-Drift bewusst ist.
 
 ---
 
@@ -129,11 +157,11 @@ Bei laufendem Betrieb mit Gearman-Backend und einem verbundenen Dashboard:
 
 | Goroutine | Anzahl | Start | Ende |
 |---|---|---|---|
-| `hub.Run` | 1 | `main.go:549` | `pipelineCtx` gecancelt |
-| `BulkInserter.Run` | 14 | `main.go:603` | `pipelineCtx` oder `b.in` geschlossen |
+| `hub.Run` | 1 | `main.go:572` | `pipelineCtx` gecancelt |
+| `BulkInserter.Run` | 14 | `main.go:624` | `pipelineCtx` oder `b.in` geschlossen |
 | `graphite.Client.Run` | 1 | ebenda (als 15. Runner) | dito |
-| `/ws`- und `/metrics`-Server | 2 | `main.go:560`, `:572` | `Shutdown()` |
-| `rawMessages`-Drain | 1 | `main.go:628` | Kanal geschlossen |
+| `/ws`- und `/metrics`-Server | 2 | `main.go:583`, `:595` | `Shutdown()` |
+| `rawMessages`-Drain | 1 | `main.go:651` | Kanal geschlossen |
 | `w.Work()` (Bibliothek) | 1 | `gearman.go:165` | `w.Close()` |
 | Job-Handler | 0…64 | von der Bibliothek | pro Job |
 | `logStatsPeriodically` | 1 | `gearman.go:166` | `statsDone` oder ctx |
@@ -171,20 +199,66 @@ Drei Wartepunkte, alle beim Herunterfahren:
   bei `stoppedMu` (`gearman.go:56`) und ist einer der Punkte, die ich beim
   Audit zweimal lesen würde.
 - `flushRunners` wartet auf alle 15 Runner — **nebenläufig**, mit 10s
-  Gesamtbudget. Der Kommentar bei `main.go:423` erklärt, warum sequenziell
+  Gesamtbudget. Der Kommentar bei `main.go:445` erklärt, warum sequenziell
   falsch war.
 - `wg.Wait()` in `main()` wartet auf Hub und alle Runner-Loops.
 
-`WithPaused` in `db/db.go:217` ist ein vierter, seltener Fall: der
+`WithPaused` in `db/db.go:223` ist ein vierter, seltener Fall: der
 Core-Restart-Handler hält den BulkInserter an, um selbst ein Statement gegen
 dieselbe Tabelle abzusetzen. Wenn Sie eine Deadlock-Quelle suchen, ist das die
 interessanteste Stelle im Repo.
 
 ---
 
-## Durchgang 4 — Die vier Sonderfälle
+## Durchgang 3b — Das MySQL-Fehlerverhalten
 
-Acht Queues folgen dem Muster aus Durchgang 2. Diese vier nicht:
+Kurz, aber der Teil mit der direktesten Datenverlust-Relevanz. Eine Datei,
+eine Funktion: `execWithRetry` in `db/db.go:467`, aufgerufen ausschließlich
+aus `flushBuffer`.
+
+Zwei Dinge müssen Sie vorher verinnerlicht haben, weil alles Weitere daran
+hängt:
+
+- **Der Job ist quittiert, sobald `Enqueue` zurückkehrt** — nicht, wenn die
+  Zeile in MySQL steht. Ein MySQL-Fehler erreicht Gearman nie, ein
+  fehlgeschlagener Schreibvorgang wird also nie erneut geliefert.
+- **Batches werden bei 100 Zeilen geschnitten, unabhängig von Job-Grenzen.**
+  Ein Batch enthält routinemäßig Events aus mehreren Jobs — deshalb reißt eine
+  einzige schlechte Zeile fremde Events mit.
+
+Die Klassifikation:
+
+| Klasse | Erkennung | Versuche | Backoff |
+|---|---|---|---|
+| Sperren | `1213` Deadlock, `1205` Lock wait timeout | 3 | 50ms, 200ms |
+| Server weg | `driver.ErrBadConn`, `mysql.ErrInvalidConn`, jeder `net.Error`, `1053`, `1040`, `1927` | bis er zurück ist | 100ms → 5s gedeckelt |
+| Alles andere | Truncation, `NOT NULL`, unbekannte Spalte | 1 — Batch wird verworfen | — |
+
+**Der zweite Fall ist der, den ich beim Audit genau lesen würde.** Solange
+MySQL weg ist, blockiert der Flush — und damit `Run`, `Enqueue`, der Handler
+und am Ende der Concurrency-Cap. Der Rückstau landet beim Broker. Das ist
+Absicht und gemessen: Verwerfen kostete bei fünf Sekunden Ausfall **29.400 von
+150.000 Events**, Warten kostete bei sechzehn Sekunden Ausfall nichts.
+Die Konsequenz, die man mittragen muss: ein dauerhaft kaputtes MySQL legt die
+Pipeline still, statt die Queue ins Leere zu leeren.
+
+Warum ein Retry überhaupt gefahrlos ist, steht in `newRedeliverySafeInserter`
+(siehe Shutdown-Abschnitt): zehn Tabellen schreiben als No-Op-Upsert. Die
+verbleibende Lücke ist ein Verbindungsabbruch *mitten* im Statement — dann ist
+unbekannt, ob MySQL es ausgeführt hat, und der zweite Versuch kann in
+`logentries` und `perfdata` eine Zeile doppelt anlegen. Dieselben zwei
+Tabellen, dieselbe Begründung wie bei der Neulieferung.
+
+Es gibt in Go übrigens **keinen Fehler 2006 („MySQL server has gone away")** —
+das ist eine Client-Nummer aus libmysqlclient. Wer danach sucht, sucht
+vergeblich; der Treiber meldet `invalid connection` oder einen Dial-Fehler.
+
+---
+
+## Durchgang 4 — Die Sonderfälle
+
+Fünf Queues folgen dem Muster aus Durchgang 2 unverändert bzw. mit
+Altersfilter. Die übrigen sieben weichen ab, in vier Gruppen:
 
 **Perfdata** (`queue/processor.go`) — `NewPerfdataHandler` routet jede Metrik
 nach `perfdataRoute` in MySQL, nach Graphite oder in beides (Regel 5). Der
@@ -211,7 +285,7 @@ passen.
 
 ## Der Shutdown
 
-Der heikelste Teil und in `main.go:633` bewusst durchnummeriert. Die
+Der heikelste Teil und in `main.go:661` bewusst durchnummeriert. Die
 Reihenfolge trägt die ganze Zusage aus Regel 6:
 
 1. `consumer.Stop()` — **zuerst**, damit nichts Neues mehr hereinkommt
@@ -260,6 +334,13 @@ Argument „Neulieferung passiert ja nicht mehr" entfernt, holt sich den
 `logentries` und `perfdata` sind bewusst ausgenommen — Details unter Regel 6 in
 `CLAUDE.md`.
 
+Ein Fall bleibt: **Shutdown, während MySQL nicht erreichbar ist.** Der
+Retry-Loop aus Durchgang 3b respektiert den Context, der Flush bekommt also
+sein 10s-Budget und gibt danach auf — was nicht geschrieben werden konnte, ist
+weg. Das ist die richtige Abwägung (ein Shutdown darf nicht hängen), aber es
+heißt: einen Worker während eines Datenbankausfalls neu zu starten kostet
+seine Puffer.
+
 ---
 
 ## Prüfpunkte
@@ -274,6 +355,23 @@ teuer wäre:
       Neustart unter Last können bis zu 6.400 Zeilen doppelt entstehen, ohne
       Fehlermeldung. Bewusst akzeptiert — prüfen Sie, ob das für Ihre
       Perfdata-Graphen tragbar ist.
+- [ ] **Kein Datenverlust bei einem MySQL-Neustart.** Erfüllt und gemessen
+      (150.000/150.000 über 16s Ausfall, null verworfene Batches). Der Worker
+      wartet und staut zum Broker zurück, statt die Queue ins Leere zu leeren.
+      Die Kehrseite bewusst mittragen: ein dauerhaft kaputtes MySQL legt die
+      Pipeline still.
+- [ ] **Alarm auf `statusengine_db_available`.** `0` heißt: Pipeline steht auf
+      MySQL. Das ist die aussagekräftigste einzelne Metrik im ganzen Worker.
+- [ ] **`statusengine_pipeline_errors_total{component="mysql"}` ist flach.**
+      Jede Erhöhung ist ein verworfener Batch, also bis zu 100 verlorene
+      Zeilen — in der Praxis ein Schemafehler und ein Vorfall, kein Rauschen.
+- [ ] **`status_max_age` und die Uhren.** Der Vergleich läuft zwischen der Uhr
+      des Monitoring-Cores und der des Workers. Driften die beiden Hosts um
+      mehr als den eingestellten Wert auseinander, werden `hoststatus` und
+      `servicestatus` **vollständig und lautlos** verworfen. Prüfen Sie, dass
+      beide Hosts NTP haben, und legen Sie ein Panel auf
+      `statusengine_queue_events_discarded_stale_total` — auch (gerade) wenn
+      es null anzeigen soll.
 - [ ] **`-mysql-max-open-conns` ≥ Anzahl Runner**, sonst serialisiert der Pool
       den Shutdown-Flush innerhalb des 10s-Budgets. Default 25 gegen 15 Runner
       passt; bei mehr Queues mitwachsen lassen.
@@ -322,6 +420,13 @@ die Nebenläufigkeitsstellen benannt, aber keine Sicherheitsanalyse der
 Auth-Pfade gemacht, keine SQL-Injektionsprüfung über alle Query-Builder
 gezogen und die Downtime-Zustandsmatrix nicht gegen die Spezifikation
 durchgerechnet.
+
+Neu hinzugekommen und entsprechend frisch: der Altersfilter für die beiden
+Status-Queues und das Retry-Verhalten in `execWithRetry`. Beides ist
+Ende-zu-Ende gemessen (500/500 verworfen bzw. 150.000/150.000 über einen
+16-Sekunden-MySQL-Ausfall), aber es ist der jüngste Code im Repo und verdient
+beim Audit entsprechend mehr Aufmerksamkeit als die Teile, die seit Wochen
+laufen.
 
 Insbesondere die Query-Konstruktion in `db/downtime.go` baut Tabellen- und
 Spaltennamen per String-Konkatenation zusammen. Das ist hier vertretbar, weil

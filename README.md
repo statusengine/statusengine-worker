@@ -18,6 +18,25 @@ This repository was created using Claude Code and the principles of Vibe Coding.
 - Broadcasts events to WebSocket clients with topic-based subscriptions.
 - Exposes real-time Prometheus metrics for observability.
 
+## Glossary
+
+A few words in this document mean something narrower than they might elsewhere — especially around Naemon, where several of them are already taken.
+
+| Term | Here it means | Not to be confused with |
+|---|---|---|
+| **Broker** | The message broker the worker consumes from: **gearmand** (default) or RabbitMQ. When this document says "the backlog waits at the broker", it means jobs sitting in gearmand. | Naemon's **Event Broker Module** (NEB), the shared library loaded *into* the monitoring core. In this stack the NEB module is what *publishes* to the broker — [statusengine/statusengine-module](https://github.com/statusengine/statusengine-module) — it is not part of this worker and never talks to it directly. |
+| **Queue** | One named channel at the broker, e.g. `statusngin_hoststatus`. In Gearman terms this is a *function name*, in RabbitMQ terms a *queue*. Queue names double as WebSocket topics. | The in-process Go channels between the pipeline stages, which this document calls *buffers*. |
+| **Job** | One unit of work handed to the worker by the broker. A job carries one payload, which for most queues is a **bulk** array of many events. | A single event. One job typically contains 100. |
+| **Event** | One decoded item out of a job's payload — one host check, one status snapshot, one notification. This is what becomes a row and what a WebSocket client receives. | A Naemon "event" in the NEB callback sense. |
+| **Handler** | The worker's function for one queue: decode the payload, publish each event to the hub, enqueue each event for insertion. Runs on its own goroutine, one per job. | Naemon's *event handler*, the command run on a state change. That one arrives here as ordinary event data (`event_handler` column). |
+| **Worker** | This process. | A Gearman "worker" in the protocol sense — though this process is one of those too, which is why `gearadmin --status` counts it in its last column. |
+| **Runner** | Anything with a `Run`/`Flush` pair the pipeline starts and drains: every `BulkInserter` plus the Graphite client. There are 15. | The queue consumer, which has its own `Start`/`Stop` lifecycle. |
+| **Batch** | The rows one `INSERT` statement carries — at most 100. Cut purely by size and time, **never** along job boundaries. | A bulk payload. One batch can hold events from several jobs, and one job's events can span several batches. |
+| **Flush** | Executing the buffered rows as one bulk `INSERT` and clearing the buffer. Triggered by 100 rows, by the 250ms ticker, or by shutdown. | A Graphite flush, which is the same idea one stage further along. |
+| **Topic** | What a WebSocket client subscribes to. Always equal to a queue name. | — |
+| **Hub** | The WebSocket pub/sub broadcaster. Has an inbound buffer of its own, hence two distinct drop metrics. | The broker. Nothing is persisted in the hub; a client that is not connected misses the event permanently, by design. |
+| **Stale** | For the two status queues only: an event whose envelope timestamp is older than `status_max_age`. Discarded before it reaches MySQL or the hub. | The `status_update_time`-based `DELETE` on core restart, which removes stale *rows* from a previous run. Related idea, different mechanism. |
+
 ## Why This Version
 
 Compared to the legacy PHP worker, this Go implementation focuses on:
@@ -45,7 +64,7 @@ Compared to the legacy PHP worker, this Go implementation focuses on:
 	- Both
 
 4. WebSocket Hub
-- Endpoint: `:8080/ws`
+- Endpoint: `127.0.0.1:8080/ws` (loopback by default — see `-listen-addr`)
 - Clients can subscribe to specific event topics (queue names).
 - Subscription can be set:
 	- During connect via `?topics=topic1,topic2`
@@ -53,7 +72,7 @@ Compared to the legacy PHP worker, this Go implementation focuses on:
 		- `{"subscribe":["statusngin_hoststatus"]}`
 		- `{"unsubscribe":["statusngin_hoststatus"]}`
 - If no topics are set, the client receives all topics.
-- Authentication (optional, off by default - see `-api-keys` below):
+- Authentication is **always on** — configuring no key does not disable it, the worker generates a random one per run and logs it as a warning (see `-api-keys` below):
 	- Recommended for real clients: `Authorization: Bearer <key>` or `X-Api-Key: <key>` header.
 	- `?api_key=<key>` query parameter also accepted, for browser clients that can't set custom headers on a WebSocket handshake (e.g. `web/ws-test-client.html`).
 	- An unauthorized request is rejected with HTTP 401 before the handshake upgrades.
@@ -73,7 +92,81 @@ On SIGINT/SIGTERM, the worker performs an ordered shutdown:
 
 This guarantees buffered MySQL rows are written before process exit.
 
-Flushing the buffers is only half of it, though. Queue delivery is at-least-once: a worker that is killed between finishing a job and its acknowledgement reaching the broker gets that job again on restart, with its rows already in MySQL. Every table that can collide on its PRIMARY KEY is therefore written as an upsert, so a redelivery is skipped instead of aborting the whole multi-row `INSERT` and taking the rest of the batch with it. See [Verify No Events Are Lost](#verify-no-events-are-lost) for the tool that measures this end to end.
+Flushing the buffers is only half of it, though. Queue delivery is at-least-once: a worker that is killed between finishing a job and its acknowledgement reaching the broker gets that job again on restart, with its rows already in MySQL. Every table that can collide on its PRIMARY KEY is therefore written as an upsert, so a redelivery is skipped instead of aborting the whole multi-row `INSERT` and taking the rest of the batch with it. See [MySQL Write Behavior](#mysql-write-behavior) for the full picture and [Verify No Events Are Lost](#verify-no-events-are-lost) for the tool that measures it end to end.
+
+## MySQL Write Behavior
+
+Every rule below exists because dropping a batch was measured to cost real events, twice. This section describes what happens when a write fails, when it is retried, and where data can still be lost.
+
+### The normal path
+
+A queue handler decodes a job and calls `Enqueue` for each event, which hands it to that table's `BulkInserter` over a 100-deep channel. A separate goroutine per table owns the buffer and flushes it as one multi-row `INSERT` when **either** 100 rows have accumulated **or** 250ms have passed since the last flush.
+
+Two consequences are worth internalising, because most of what follows depends on them:
+
+- **A job is acknowledged to the broker as soon as `Enqueue` returns**, not when the row reaches MySQL. The insert happens later, on a different goroutine. A MySQL error therefore never travels back to Gearman, and a failed write is never redelivered.
+- **Batches are cut at 100 rows regardless of job boundaries.** One batch routinely holds events from several jobs, so one bad row can take unrelated events down with it. That is exactly how the first data-loss bug did its damage.
+
+### When a failed write is retried
+
+`execWithRetry` in `internal/db/db.go` classifies the error. Only two classes are retried, and the same statement is re-executed unchanged:
+
+| Class | MySQL codes / errors | Attempts | Backoff |
+|---|---|---|---|
+| **Lock contention** | `1213` deadlock, `1205` lock wait timeout | 3 total | 50ms, then 200ms |
+| **Server unreachable** | `driver.ErrBadConn`, `mysql.ErrInvalidConn`, any `net.Error`, `1053` server shutdown, `1040` too many connections, `1927` connection killed | until it succeeds or the context ends | 100ms doubling to a 5s cap |
+| **Everything else** | truncation, `NOT NULL`, unknown column, `1062` on a table without an upsert clause | 1 — the batch is dropped | — |
+
+The reasoning behind the split: the first two classes are about *timing*, so the identical statement usually succeeds moments later. Everything else is deterministic and would fail identically three times over, buying nothing but a slower shutdown and a triplicated log line.
+
+Note that MySQL error **2006 ("MySQL server has gone away") never appears in Go** — it is a client-side number from libmysqlclient. `go-sql-driver` reports a lost connection as `ErrInvalidConn`, or as a plain dial error while the server is down. And `database/sql`'s own built-in retry only covers `driver.ErrBadConn`, only three times, and the driver only returns that error when it can prove nothing was written — which is why a server restart needs handling here at all.
+
+### Waiting on an unreachable server is deliberate
+
+While MySQL is unreachable, the flush blocks — and so, in order, do the buffer's goroutine, `Enqueue`, and the queue handler. The consumer's concurrency cap (`-gearman-max-concurrent-jobs`, default 64) then fills, the worker stops taking jobs, and the surplus stays at the broker, where it survives a worker restart and is visible in `gearadmin --status`.
+
+That is the point. A worker that kept accepting jobs and dropping batches would drain the queue into nowhere; measured against a five-second outage, that cost **29,400 of 150,000 events**. Holding instead turns the outage into catch-up time: the same test over a 16-second outage lost nothing.
+
+A permanently broken MySQL therefore stalls the pipeline rather than draining it. The backlog grows, but it is visible and recoverable — the strictly better failure. Watch `statusengine_db_available`; it is `0` for exactly as long as the pipeline is stalled.
+
+### Idempotency: why a retry or a redelivery is harmless
+
+Ten tables with a natural PRIMARY KEY are written as `INSERT ... ON DUPLICATE KEY UPDATE <first PK column> = VALUES(<same column>)`. That update is a genuine no-op — the row only collided because that column already matches — so re-running a statement, or replaying a whole job, changes nothing.
+
+`INSERT IGNORE` would be shorter and is deliberately **not** used: it downgrades *every* error to a warning, including truncation and `NOT NULL` violations, which would make real data problems invisible.
+
+Two tables are knowingly not covered, because neither can collide: `statusengine_logentries` (AUTO_INCREMENT key) and `statusengine_perfdata` (no PRIMARY KEY at all). A redelivery or a mid-statement retry inserts their rows a **second time, silently**. Accepted rather than fixed — both are retention-managed history, and closing it would need a UNIQUE index, i.e. a schema change to a schema owned by openITCOCKPIT. A duplicate row in a history table is the lesser evil against a missing event.
+
+### Where data can still be lost
+
+Four places, in rough order of likelihood:
+
+1. **A permanent SQL error drops its batch** — up to 100 rows, including unrelated events that shared it. Logged as `bulk insert failed, rows dropped` and counted in `statusengine_pipeline_errors_total{component="mysql"}`. In practice this means a schema mismatch, and it should be treated as an incident rather than as noise.
+2. **A hard kill loses what is buffered but not yet written** — `SIGKILL`, an OOM kill, a power cut. Up to 200 rows per table (100 in the channel, 100 in the buffer) whose jobs the broker already considers done. This is the at-least-once boundary and cannot be closed without acknowledging per row, which would cost roughly an order of magnitude in throughput. A normal `SIGTERM` is unaffected.
+3. **Shutting down while MySQL is unreachable** — the final flush gets a 10-second budget for all 15 runners; whatever cannot be written in that window is dropped. Restarting a worker during a database outage therefore costs its buffers.
+4. **Discarded stale status events** — by design, not by accident. `statusngin_hoststatus` and `statusngin_servicestatus` events older than `-status-max-age` (default `5m`) are dropped before MySQL and the WebSocket hub, because they are superseded snapshots. See [Discarding Superseded Status Events](#discarding-superseded-status-events).
+
+### What to watch
+
+| Metric | Healthy | What it means otherwise |
+|---|---|---|
+| `statusengine_db_available` | `1` | `0` = pipeline stalled on MySQL. Alert on this. |
+| `statusengine_pipeline_errors_total{component="mysql"}` | flat | A batch was dropped. Every increment is up to 100 lost rows. |
+| `statusengine_db_connection_retries_total` | flat | Climbs for the duration of an outage; measures its length, not a count of incidents. |
+| `statusengine_db_batch_retries_total` | ~0 | Lock contention, in practice `db_cleanup` running against a busy table. |
+| `statusengine_db_batch_size_at_flush` | mixed | Constant 100 = flushes are batch- rather than ticker-triggered, i.e. saturated. |
+
+`statusengine_db_events_written_total` counts every buffered row as written, including duplicates an upsert skipped, so it briefly overstates after a restart under load. It is a throughput signal, not an audit.
+
+## Discarding Superseded Status Events
+
+`statusngin_hoststatus` and `statusngin_servicestatus` carry a full snapshot of an object's current state, re-sent on every check and upserted into a table that holds exactly one row per object. A snapshot from ten minutes ago has no reader left: MySQL holds a newer one already, and a dashboard showing it would be showing something untrue.
+
+That matters after downtime. These two queues accumulate one job per check interval per object while the worker is not running, and draining that backlog costs exactly as much MySQL time as live traffic would — time the live traffic then spends waiting behind it — to produce rows that are overwritten moments later. Events older than `-status-max-age` (default `5m`) are therefore discarded before they reach either MySQL or the WebSocket hub, letting the worker catch up to the present in seconds.
+
+**This applies to those two queues only.** Every other queue carries history — a check result, a state change, a notification — where each event is a distinct row that nothing will ever supply again, and dropping one on age would be plain data loss.
+
+One caveat deserves attention, because it is silent by nature: the comparison is between the **monitoring core's** clock and **this worker's**. If the two hosts disagree by more than `status_max_age`, every event looks stale and both tables stop being written, with nothing in the log to say so. `statusengine_queue_events_discarded_stale_total` is the only signal, which is why it is worth a dashboard panel even when it is expected to read zero — and why `-status-max-age 0`, which processes everything regardless of age, exists as an escape hatch. The effective setting is logged once at startup.
 
 ## Supported Event Topics
 
@@ -116,11 +209,12 @@ Useful flags:
 - `-gearman-addr`: Gearman server address
 - `-rabbitmq-url`: AMQP URL
 - `-mysql-dsn`: MySQL DSN
-- `-listen-addr`: WebSocket server listen address (default `:8080`)
+- `-listen-addr`: WebSocket server listen address (default `127.0.0.1:8080` — **loopback only**; exposing it on the network is an explicit opt-in, e.g. `-listen-addr :8080`)
 - `-api-keys`: comma-separated API keys accepted by `/ws`. Leaving this empty does **not** disable authentication — the worker generates a random key at startup and logs it as a warning instead, so an unconfigured worker is never an open event stream
 - `-metrics-listen-addr`: Prometheus server listen address (default `:9105`)
 - `-graphite-addr`: Graphite Carbon address
 - `-perfdata-route`: `mysql`, `graphite`, or `both`
+- `-status-max-age`: discard `statusngin_hoststatus`/`statusngin_servicestatus` events older than this Go duration (default `5m`); `0` processes every event regardless of age. See [Discarding Superseded Status Events](#discarding-superseded-status-events)
 
 Environment variables with matching names are also supported (for example `STATUSENGINE_CONSUMER`, `STATUSENGINE_MYSQL_DSN`).
 
