@@ -650,6 +650,10 @@ func newAcknowledgementHandler(hub *websocket.Hub, topic string, hostIns, servic
 // enableOpenITCockpitTweaks selects which query newCoreRestartHandler uses
 // to clear hoststatus/servicestatus on a core restart (worker-wide
 // "ENABLE_OPENITCOCKPIT_TWEAKS" config option, default false).
+// statusMaxAge is how old a hoststatus/servicestatus event may be before it
+// is discarded instead of processed ("status_max_age" config option,
+// default 5m, zero disables) - see NewStaleDroppingHandler, and note it
+// applies to those two queues only.
 // newRedeliverySafeInserter builds a BulkInserter for a table with a natural
 // PRIMARY KEY, whose flush survives the same job being delivered twice.
 //
@@ -708,7 +712,7 @@ var redeliverySafePKColumn = map[string]string{
 	"statusengine_service_notifications_log": "hostname",
 }
 
-func NewRouter(sqlDB *sql.DB, hub *websocket.Hub, gc *graphite.Client, perfdataRoute PerfdataRoute, graphitePrefix, nodeName string, enableOpenITCockpitTweaks bool) (Router, []Runner) {
+func NewRouter(sqlDB *sql.DB, hub *websocket.Hub, gc *graphite.Client, perfdataRoute PerfdataRoute, graphitePrefix, nodeName string, enableOpenITCockpitTweaks bool, statusMaxAge time.Duration) (Router, []Runner) {
 	hostStatus := db.NewUpsertBulkInserter(sqlDB, "statusengine_hoststatus",
 		hostStatusColumns, hostStatusUpdateColumns, newHostStatusRow(nodeName))
 
@@ -786,14 +790,16 @@ func NewRouter(sqlDB *sql.DB, hub *websocket.Hub, gc *graphite.Client, perfdataR
 		serviceNotificationLogRow)
 
 	router := Router{
-		QueueHostChecks:                NewHandler(hub, QueueHostChecks, hostChecks, decodeHostCheck),
-		QueueServiceChecks:             NewHandler(hub, QueueServiceChecks, serviceChecks, decodeServiceCheck),
-		QueueLogEntries:                NewHandler(hub, QueueLogEntries, logEntries, decodeLogEntry),
-		QueueStateChanges:              newStateChangeHandler(hub, QueueStateChanges, hostStateHistory, serviceStateHistory),
-		QueueAcknowledgements:          newAcknowledgementHandler(hub, QueueAcknowledgements, hostAcks, serviceAcks),
-		QueueServicePerfdata:           NewPerfdataHandler(hub, QueueServicePerfdata, perfdataRoute, perfdata, gc, graphitePrefix),
-		QueueHostStatus:                NewHandler(hub, QueueHostStatus, hostStatus, decodeHostStatus),
-		QueueServiceStatus:             NewHandler(hub, QueueServiceStatus, serviceStatus, decodeServiceStatus),
+		QueueHostChecks:       NewHandler(hub, QueueHostChecks, hostChecks, decodeHostCheck),
+		QueueServiceChecks:    NewHandler(hub, QueueServiceChecks, serviceChecks, decodeServiceCheck),
+		QueueLogEntries:       NewHandler(hub, QueueLogEntries, logEntries, decodeLogEntry),
+		QueueStateChanges:     newStateChangeHandler(hub, QueueStateChanges, hostStateHistory, serviceStateHistory),
+		QueueAcknowledgements: newAcknowledgementHandler(hub, QueueAcknowledgements, hostAcks, serviceAcks),
+		QueueServicePerfdata:  NewPerfdataHandler(hub, QueueServicePerfdata, perfdataRoute, perfdata, gc, graphitePrefix),
+		// The only two queues that may discard on age - see
+		// NewStaleDroppingHandler for why that is safe here and nowhere else.
+		QueueHostStatus:                NewStaleDroppingHandler(hub, QueueHostStatus, hostStatus, decodeHostStatus, statusMaxAge),
+		QueueServiceStatus:             NewStaleDroppingHandler(hub, QueueServiceStatus, serviceStatus, decodeServiceStatus, statusMaxAge),
 		QueueContactNotificationMethod: newContactNotificationMethodHandler(hub, QueueContactNotificationMethod, hostNotifications, serviceNotifications),
 		QueueNotifications:             newNotificationHandler(hub, QueueNotifications, hostNotificationsLog, serviceNotificationsLog),
 
@@ -809,6 +815,9 @@ func NewRouter(sqlDB *sql.DB, hub *websocket.Hub, gc *graphite.Client, perfdataR
 	// list to remember.
 	for queueName := range router {
 		metrics.InitQueue(queueName)
+	}
+	for _, queueName := range []string{QueueHostStatus, QueueServiceStatus} {
+		metrics.InitStaleDiscards(queueName)
 	}
 	for _, table := range downtimeMetricsTables() {
 		metrics.InitTable(table)

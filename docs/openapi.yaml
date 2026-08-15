@@ -946,6 +946,7 @@ paths:
         |---|---|---|---|
         | `statusengine_queue_messages_received_total` | counter | `queue_name` | Raw messages received per queue, regardless of backend (Gearman/RabbitMQ). |
         | `statusengine_queue_payloads_repaired_total` | counter | `queue_name` | Payloads that were not valid UTF-8 and had their invalid bytes reinterpreted as Windows-1252 before decoding. Non-zero means a monitoring host is emitting non-UTF-8 plugin output. |
+        | `statusengine_queue_events_discarded_stale_total` | counter | `queue_name` | Status events dropped for being older than `status_max_age` (default 5m), before reaching MySQL or any WebSocket client. Only `statusngin_hoststatus` and `statusngin_servicestatus` ever appear here - they carry superseded snapshots, every other queue carries history. A burst after a restart is the feature working; a value that keeps climbing while the worker is up means the monitoring core's clock and this worker's disagree, and both queues are being discarded wholesale. |
         | `statusengine_queue_jobs_in_flight` | gauge | - | Messages currently being handled, across all queues. |
         | `statusengine_queue_handler_duration_seconds` | histogram | `queue_name` | Time to handle one message end to end: decode, WebSocket publish and enqueueing every decoded item for insertion. |
         | `statusengine_db_events_written_total` | counter | `table` | Rows successfully persisted per destination table. |

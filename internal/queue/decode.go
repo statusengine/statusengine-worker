@@ -44,6 +44,11 @@ type serviceStatusEvent struct {
 	types.ServiceStatusPayload
 }
 
+// eventTimestamp implements timestamped, which is what lets these two - and
+// deliberately only these two - be wired up through NewStaleDroppingHandler.
+func (e hostStatusEvent) eventTimestamp() int64    { return e.Timestamp }
+func (e serviceStatusEvent) eventTimestamp() int64 { return e.Timestamp }
+
 func decodeHostStatus(payload []byte) ([]hostStatusEvent, error) {
 	var bulk types.HostStatusBulk
 	if err := json.Unmarshal(payload, &bulk); err != nil {

@@ -154,7 +154,10 @@ func main() {
 	// Enqueue is never called on it - see graphite.Client's doc comment.
 	gc := graphite.NewClient("127.0.0.1:2003")
 
-	router, runners := queue.NewRouter(sqlDB, hub, gc, queue.PerfdataRouteMySQL, "statusengine-simulator", "statusengine-simulator", false)
+	// statusMaxAge 0: the simulator shifts every fixture timestamp to keep
+	// primary keys unique (see withUniqueTimestamps), so ages here are
+	// synthetic and an age filter would only make its output unpredictable.
+	router, runners := queue.NewRouter(sqlDB, hub, gc, queue.PerfdataRouteMySQL, "statusengine-simulator", "statusengine-simulator", false, 0)
 	for _, r := range runners {
 		wg.Add(1)
 		go func(r queue.Runner) {

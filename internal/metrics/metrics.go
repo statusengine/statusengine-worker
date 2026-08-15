@@ -57,6 +57,14 @@ func InitQueue(queueName string) {
 	QueueHandlerDurationSeconds.WithLabelValues(queueName)
 }
 
+// InitStaleDiscards pre-creates the per-queue series on
+// QueueEventsDiscardedStaleTotal. Separate from InitQueue because only the
+// two status queues can ever discard on age - pre-creating it for all 12
+// would advertise a behaviour the other ten do not have.
+func InitStaleDiscards(queueName string) {
+	QueueEventsDiscardedStaleTotal.WithLabelValues(queueName)
+}
+
 // InitTable pre-creates the per-table series on DBEventsWrittenTotal.
 // Called from db.NewBulkInserter, so every table this worker can write to
 // is covered automatically - including one added later, which is the
@@ -113,6 +121,23 @@ var (
 		Subsystem: "queue",
 		Name:      "payloads_repaired_total",
 		Help:      "Total number of payloads whose invalid UTF-8 was repaired, per queue.",
+	}, []string{"queue_name"})
+
+	// QueueEventsDiscardedStaleTotal counts status events dropped for
+	// being older than the configured maximum age, before they reached
+	// either MySQL or a WebSocket client (see NewStaleDroppingHandler in
+	// internal/queue). Only the two status queues can ever appear here.
+	//
+	// A burst after a restart is the feature working: that is the backlog
+	// of superseded snapshots being skipped. A value that keeps climbing
+	// while the worker is up is not - it means the monitoring core's clock
+	// and this worker's disagree by more than the configured age, in which
+	// case both queues are being discarded wholesale and silently.
+	QueueEventsDiscardedStaleTotal = promauto.NewCounterVec(prometheus.CounterOpts{
+		Namespace: "statusengine",
+		Subsystem: "queue",
+		Name:      "events_discarded_stale_total",
+		Help:      "Total number of status events discarded for being older than the configured maximum age, per queue.",
 	}, []string{"queue_name"})
 
 	// QueueHandlerDurationSeconds observes how long handling one message

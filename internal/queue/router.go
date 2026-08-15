@@ -121,6 +121,87 @@ func NewHandler[P any](hub *websocket.Hub, topic string, ins enqueuer[P], decode
 	}
 }
 
+// timestamped is implemented by the event types whose freshness decides
+// whether they are worth processing at all - see NewStaleDroppingHandler.
+// The value is the unix second the monitoring core produced the event,
+// taken from the message Envelope, and is also what lands in the row's
+// status_update_time column.
+type timestamped interface {
+	eventTimestamp() int64
+}
+
+// NewStaleDroppingHandler builds a Handler like NewHandler, except items
+// older than maxAge are discarded before they reach either MySQL or the
+// WebSocket hub. A maxAge of zero or less disables the filter entirely,
+// making this behave exactly like NewHandler.
+//
+// This is only correct for the two status queues, and using it anywhere
+// else would silently lose data. statusngin_hoststatus and
+// statusngin_servicestatus carry a full *snapshot* of an object's current
+// state, re-sent on every check, and each one overwrites its predecessor
+// in an upserted single-row-per-object table. A snapshot from ten minutes
+// ago therefore has no reader: MySQL holds a newer one already or is about
+// to, and a dashboard showing it would be showing something untrue. Every
+// other queue carries history - a check result, a state change, a
+// notification - where each event is a distinct row that nothing else will
+// ever supply again, so age is no reason to drop it.
+//
+// What this is for: while the worker is down, these two queues accumulate
+// one job per check interval per object, and none of that backlog is worth
+// writing on restart. Draining it costs exactly as much MySQL time as
+// live traffic would, which is time the live traffic then waits for.
+// Dropping it lets the worker catch up to the present in seconds rather
+// than minutes.
+//
+// Note the failure mode this creates, because it is silent by nature: the
+// comparison is between the *core's* clock and this worker's. If the two
+// hosts disagree by more than maxAge, every event looks stale and the two
+// queues stop being written at all, with nothing in the log to say so.
+// statusengine_queue_events_discarded_stale_total is the only signal, so
+// it is worth a dashboard panel even when it is expected to be zero.
+func NewStaleDroppingHandler[P timestamped](hub *websocket.Hub, topic string, ins enqueuer[P], decode func([]byte) ([]P, error), maxAge time.Duration) Handler {
+	if maxAge <= 0 {
+		return NewHandler(hub, topic, ins, decode)
+	}
+
+	return func(ctx context.Context, payload []byte) error {
+		items, err := decode(payload)
+		if err != nil {
+			return decodeError(topic, err)
+		}
+
+		// One cutoff for the whole payload rather than one time.Now() per
+		// item: a bulk message is decoded in microseconds, so the extra
+		// precision would be noise, and this runs on the hottest path in
+		// the worker.
+		cutoff := time.Now().Add(-maxAge).Unix()
+
+		var dropped int
+		for _, item := range items {
+			if item.eventTimestamp() < cutoff {
+				dropped++
+				metrics.QueueEventsDiscardedStaleTotal.WithLabelValues(topic).Inc()
+				continue
+			}
+
+			publish(hub, topic, item)
+
+			if err := ins.Enqueue(ctx, item); err != nil {
+				return fmt.Errorf("queue: enqueue %s event: %w", topic, err)
+			}
+		}
+
+		if dropped > 0 {
+			// Debug, not Info: draining a backlog produces one of these per
+			// job, and the counter above is the metric that actually
+			// answers "how much was dropped".
+			slog.Debug("queue: discarded stale status events",
+				"topic", topic, "dropped", dropped, "of", len(items), "max_age", maxAge)
+		}
+		return nil
+	}
+}
+
 // NewBroadcastHandler builds a Handler for a queue with no MySQL
 // destination (e.g. no matching table, or a not-yet-implemented routing
 // target such as Graphite): every decoded item is only published to hub

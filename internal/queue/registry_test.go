@@ -35,10 +35,18 @@ func openTestDB(t *testing.T) *sql.DB {
 	return sqlDB
 }
 
+// noAgeFilter disables NewStaleDroppingHandler's age check for tests that
+// replay the fixtures under .claude/specs/: those carry fixed timestamps
+// from 2026-07, so any realistic max age would discard every status event
+// before it reached MySQL and the assertions below would be testing the
+// filter rather than what they mean to. The filter itself is covered by
+// stale_test.go.
+const noAgeFilter = 0 * time.Second
+
 func TestNewRouterCoversAllQueues(t *testing.T) {
 	sqlDB := openTestDB(t)
 	hub := websocket.NewHub()
-	router, runners := NewRouter(sqlDB, hub, graphite.NewClient("127.0.0.1:2003"), PerfdataRouteMySQL, "statusengine-test", "statusengine-test", false)
+	router, runners := NewRouter(sqlDB, hub, graphite.NewClient("127.0.0.1:2003"), PerfdataRouteMySQL, "statusengine-test", "statusengine-test", false, noAgeFilter)
 
 	want := []string{
 		QueueHostStatus, QueueServiceStatus, QueueHostChecks, QueueServiceChecks,
@@ -83,7 +91,7 @@ func runAllAndFlush(t *testing.T, runners []Runner) context.Context {
 func TestHostCheckHandlerPersistsToMySQL(t *testing.T) {
 	sqlDB := openTestDB(t)
 	hub := websocket.NewHub()
-	router, runners := NewRouter(sqlDB, hub, graphite.NewClient("127.0.0.1:2003"), PerfdataRouteMySQL, "statusengine-test", "statusengine-test", false)
+	router, runners := NewRouter(sqlDB, hub, graphite.NewClient("127.0.0.1:2003"), PerfdataRouteMySQL, "statusengine-test", "statusengine-test", false, noAgeFilter)
 	ctx := runAllAndFlush(t, runners)
 	go hub.Run(ctx)
 
@@ -145,7 +153,7 @@ func TestHostCheckHandlerPersistsToMySQL(t *testing.T) {
 func TestAcknowledgementHandlerRoutesToHostAndServiceTables(t *testing.T) {
 	sqlDB := openTestDB(t)
 	hub := websocket.NewHub()
-	router, runners := NewRouter(sqlDB, hub, graphite.NewClient("127.0.0.1:2003"), PerfdataRouteMySQL, "statusengine-test", "statusengine-test", false)
+	router, runners := NewRouter(sqlDB, hub, graphite.NewClient("127.0.0.1:2003"), PerfdataRouteMySQL, "statusengine-test", "statusengine-test", false, noAgeFilter)
 	ctx := runAllAndFlush(t, runners)
 	go hub.Run(ctx)
 

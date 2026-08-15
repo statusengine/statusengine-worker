@@ -150,7 +150,7 @@ func TestNewRouterEmitsUpsertForCheckTables(t *testing.T) {
 
 	hub := websocket.NewHub()
 	router, runners := NewRouter(mockDB, hub, graphite.NewClient("127.0.0.1:2003"),
-		PerfdataRouteMySQL, "statusengine-test", "statusengine-test", false)
+		PerfdataRouteMySQL, "statusengine-test", "statusengine-test", false, noAgeFilter)
 
 	ctx, cancel := context.WithCancel(context.Background())
 	defer cancel()

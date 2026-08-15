@@ -53,6 +53,7 @@ type config struct {
 	nodeName                  string // written into hoststatus/servicestatus rows' node_name column
 	apiKeys                   string // comma-separated; empty disables /ws authentication entirely
 	enableOpenITCockpitTweaks bool   // selects the core-restart hoststatus/servicestatus cleanup query
+	statusMaxAge              string // max age of a hoststatus/servicestatus event before it is discarded; "0" disables
 	logLevel                  string // "debug", "info", "warn" or "error"
 	logFormat                 string // "text" or "json"
 }
@@ -82,6 +83,7 @@ type fileConfig struct {
 	NodeName                  string   `yaml:"nodename"`
 	APIKeys                   []string `yaml:"api_keys"`
 	EnableOpenITCockpitTweaks *bool    `yaml:"enable_openitcockpit_tweaks"`
+	StatusMaxAge              string   `yaml:"status_max_age"`
 	LogLevel                  string   `yaml:"log_level"`
 	LogFormat                 string   `yaml:"log_format"`
 }
@@ -201,6 +203,9 @@ func loadConfig() config {
 	flag.BoolVar(&cfg.enableOpenITCockpitTweaks, "enable-openitcockpit-tweaks", false,
 		"on a core restart, delete only hoststatus/servicestatus rows for objects openITCockpit no longer "+
 			"knows about instead of truncating both tables outright")
+	flag.StringVar(&cfg.statusMaxAge, "status-max-age", "5m",
+		"discard statusngin_hoststatus/statusngin_servicestatus events older than this Go duration (e.g. \"5m\", \"90s\"); "+
+			"they are superseded snapshots, so a backlog of them is not worth draining after downtime. \"0\" processes every event regardless of age")
 	flag.StringVar(&cfg.logLevel, "log-level", "info",
 		`minimum log level: "debug", "info", "warn" or "error"`)
 	flag.StringVar(&cfg.logFormat, "log-format", "text",
@@ -230,6 +235,7 @@ func loadConfig() config {
 	cfg.nodeName = resolveString(explicit, "nodename", cfg.nodeName, "STATUSENGINE_NODENAME", fc.NodeName)
 	cfg.apiKeys = resolveString(explicit, "api-keys", cfg.apiKeys, "STATUSENGINE_API_KEYS", strings.Join(fc.APIKeys, ","))
 	cfg.enableOpenITCockpitTweaks = resolveBool(explicit, "enable-openitcockpit-tweaks", cfg.enableOpenITCockpitTweaks, "ENABLE_OPENITCOCKPIT_TWEAKS", fc.EnableOpenITCockpitTweaks)
+	cfg.statusMaxAge = resolveString(explicit, "status-max-age", cfg.statusMaxAge, "STATUSENGINE_STATUS_MAX_AGE", fc.StatusMaxAge)
 	cfg.logLevel = resolveString(explicit, "log-level", cfg.logLevel, "STATUSENGINE_LOG_LEVEL", fc.LogLevel)
 	cfg.logFormat = resolveString(explicit, "log-format", cfg.logFormat, "STATUSENGINE_LOG_FORMAT", fc.LogFormat)
 
@@ -533,6 +539,23 @@ func main() {
 		fatal("invalid -perfdata-route", "error", err)
 	}
 
+	statusMaxAge, err := time.ParseDuration(cfg.statusMaxAge)
+	if err != nil {
+		fatal("invalid -status-max-age", "value", cfg.statusMaxAge, "error", err)
+	}
+	if statusMaxAge < 0 {
+		fatal("invalid -status-max-age: must not be negative", "value", cfg.statusMaxAge)
+	}
+	// Logged at startup because this is the one setting that deliberately
+	// drops data: if hoststatus rows stop appearing, the first question is
+	// what this was set to and whether the two clocks agree.
+	if statusMaxAge == 0 {
+		slog.Info("status queues: age filter disabled, every event will be processed regardless of age")
+	} else {
+		slog.Info("status queues: discarding events older than this",
+			"max_age", statusMaxAge, "queues", []string{queue.QueueHostStatus, queue.QueueServiceStatus})
+	}
+
 	// pipelineCtx governs every long-running loop (BulkInserters, the Hub,
 	// the consumer's internal ctx.Done() watcher). It is only cancelled
 	// once the ordered shutdown sequence below has already stopped the
@@ -597,7 +620,7 @@ func main() {
 	// connection is ever dialed (CLAUDE.md rule 5).
 	gc := graphite.NewClient(cfg.graphiteAddr)
 
-	router, runners := queue.NewRouter(sqlDB, hub, gc, perfdataRoute, cfg.graphitePrefix, cfg.nodeName, cfg.enableOpenITCockpitTweaks)
+	router, runners := queue.NewRouter(sqlDB, hub, gc, perfdataRoute, cfg.graphitePrefix, cfg.nodeName, cfg.enableOpenITCockpitTweaks, statusMaxAge)
 	for _, r := range runners {
 		wg.Add(1)
 		go func(r queue.Runner) {

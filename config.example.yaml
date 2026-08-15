@@ -97,6 +97,28 @@ api_keys: []
 #         exist survives the restart instead of needing to be rebuilt.
 enable_openitcockpit_tweaks: false
 
+# Discard statusngin_hoststatus and statusngin_servicestatus events older
+# than this, instead of writing them to MySQL and broadcasting them.
+#
+# These two queues carry a full snapshot of an object's current state, sent
+# again on every check and overwriting its predecessor in a single-row-per-
+# object table - so a snapshot from ten minutes ago has no reader left.
+# While the worker is down they pile up one job per check interval per
+# object, and draining that backlog costs the same MySQL time live traffic
+# needs, which the live traffic then waits for. Skipping it lets the worker
+# catch up in seconds instead of minutes.
+#
+# Applies to those two queues ONLY. Every other queue carries history -
+# check results, state changes, notifications - where each event is the
+# single record of something that happened and age is no reason to drop it.
+#
+# Any Go duration ("5m", "90s", "1h"). "0" processes every event regardless
+# of age. Note the comparison is between the monitoring core's clock and
+# this worker's: if the two hosts disagree by more than this, both queues
+# stop being written entirely. statusengine_queue_events_discarded_stale_total
+# is the metric that shows it.
+status_max_age: 5m
+
 # Minimum log level: "debug", "info", "warn" or "error".
 log_level: info
 
