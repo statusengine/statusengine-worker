@@ -148,6 +148,21 @@ var (
 		Buckets:   prometheus.DefBuckets,
 	})
 
+	// DBBatchRetriesTotal counts how often a bulk insert was re-executed
+	// unchanged because MySQL reported a deadlock (1213) or a lock wait
+	// timeout (1205). Both are transient and cost nothing but a few
+	// hundred milliseconds; what they indicate is contention on a table
+	// this worker writes to, in practice another writer such as
+	// cmd/db_cleanup. Occasional increments are harmless, a steadily
+	// rising value means the two are fighting over the same rows and the
+	// cleanup should run at a quieter time or in smaller batches.
+	DBBatchRetriesTotal = promauto.NewCounter(prometheus.CounterOpts{
+		Namespace: "statusengine",
+		Subsystem: "db",
+		Name:      "batch_retries_total",
+		Help:      "Total number of bulk-insert retries after a transient MySQL locking failure.",
+	})
+
 	// DBBatchSizeAtFlush observes how many rows each flush actually
 	// contained, to see whether flushes are mostly triggered by the
 	// 100-item batch size or the 250ms ticker (CLAUDE.md rule 3).

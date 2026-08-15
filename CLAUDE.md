@@ -47,6 +47,7 @@ Every queue is wired end-to-end in `internal/queue/registry.go`'s `NewRouter` - 
 - Messages must be collected and executed as a single Bulk-Insert query as soon as **EITHER** of these conditions is met:
   - The buffer reaches **100 entries**.
   - The oldest item in the buffer reaches **250ms** (`time.Ticker`).
+- **A failed flush drops its batch - with exactly two exceptions, retried up to three times** (`execWithRetry` in `internal/db/db.go`): MySQL error 1205 (lock wait timeout) and 1213 (deadlock). Those two roll back only the statement and are caused by another transaction's timing rather than by this statement's content, so the identical statement usually succeeds on the next attempt; dropping the batch instead would lose up to 100 events for a condition that clears in milliseconds. Every other error is deterministic - a truncated value or a NOT NULL violation fails the same way three times, and retrying it only slows the shutdown and triplicates the log line. The realistic source of contention is `cmd/db_cleanup` deleting from a table the worker is writing to; `statusengine_db_batch_retries_total` is what makes that visible. Note that this is only safe **because** the writes are idempotent (rule 6) - retrying a plain INSERT that was rolled back mid-statement is a different and much worse proposition. Backoff is 50ms then 200ms, deliberately short and not configurable, since `Shutdown` flushes under a 5s context.
 
 ### 4. WebSocket Pub/Sub Broadcaster
 - Implement a central WebSocket `Hub` using a publish/subscribe pattern.

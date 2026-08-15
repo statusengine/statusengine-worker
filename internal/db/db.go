@@ -5,11 +5,14 @@ package db
 import (
 	"context"
 	"database/sql"
+	"errors"
 	"fmt"
 	"log/slog"
 	"strings"
 	"sync/atomic"
 	"time"
+
+	"github.com/go-sql-driver/mysql"
 
 	"statusengine-worker/internal/metrics"
 )
@@ -336,7 +339,8 @@ func (b *BulkInserter[T]) finalFlush() {
 // clears the buffer, reusing its underlying array. A failed insert is
 // logged and the batch is dropped rather than retried indefinitely, since
 // retrying here would either block the pipeline or grow the buffer
-// unbounded.
+// unbounded - the one exception is a transient locking failure, which is
+// retried a bounded number of times (see execWithRetry).
 //
 // Every flush is logged exactly once, at most every FlushInterval (or
 // MaxBatchSize rows) - never per row - so structured logging never adds
@@ -364,8 +368,12 @@ func (b *BulkInserter[T]) flushBuffer(ctx context.Context) error {
 		return fmt.Errorf("db: %s: got %d row values, want %d", b.table, len(args), want)
 	}
 
+	// duration covers retries as well, because that is what the pipeline
+	// actually waited for. A retried flush therefore shows up as a single
+	// slow observation rather than several fast ones, and
+	// db_batch_retries_total is what explains the outlier.
 	start := time.Now()
-	_, err := b.db.ExecContext(ctx, query, args...)
+	err := b.execWithRetry(ctx, query, args...)
 	duration := time.Since(start)
 
 	metrics.DBBatchFlushDurationSeconds.Observe(duration.Seconds())
@@ -384,6 +392,78 @@ func (b *BulkInserter[T]) flushBuffer(ctx context.Context) error {
 
 	b.buffer = b.buffer[:0]
 	return err
+}
+
+// MySQL error numbers that mean "the statement lost a race, try again",
+// as opposed to "the statement is wrong".
+const (
+	mysqlErrLockWaitTimeout = 1205 // ER_LOCK_WAIT_TIMEOUT
+	mysqlErrDeadlock        = 1213 // ER_LOCK_DEADLOCK
+)
+
+// flushRetryBackoff is how long to wait before each retry; its length
+// therefore also caps the number of retries, so a flush makes at most
+// len+1 attempts in total. The values are deliberately short and not
+// configurable: Shutdown flushes under a 5s context (see Shutdown), and a
+// pause long enough to matter there would trade one problem for another.
+var flushRetryBackoff = []time.Duration{50 * time.Millisecond, 200 * time.Millisecond}
+
+// execWithRetry runs the bulk INSERT, re-executing the identical statement
+// when MySQL reports a deadlock or a lock wait timeout.
+//
+// Those two are the only errors worth retrying, and retrying anything else
+// would be actively harmful. A deadlock or lock wait timeout rolls back
+// just this statement, is caused by another transaction's timing rather
+// than by this statement's content, and therefore usually succeeds on the
+// second attempt. Every other error - a truncated value, a NOT NULL
+// violation, a column count mismatch - is deterministic: the retry fails
+// identically, and the only thing three attempts buy is a slower shutdown
+// and a triplicated log line.
+//
+// Retrying is only safe because the writes are idempotent (CLAUDE.md
+// rule 6): the ten tables with a natural PRIMARY KEY are upserts, so a
+// statement that partially succeeded before being rolled back cannot
+// produce duplicates on the second attempt. Before that change this would
+// have been the wrong fix.
+//
+// The alternative - dropping the batch, as every other error path does -
+// loses up to MaxBatchSize events for a condition that resolves itself in
+// milliseconds. That is the same shape of avoidable loss that the Error
+// 1062 collisions used to cause.
+func (b *BulkInserter[T]) execWithRetry(ctx context.Context, query string, args ...any) error {
+	for attempt := 1; ; attempt++ {
+		_, err := b.db.ExecContext(ctx, query, args...)
+		if err == nil || attempt > len(flushRetryBackoff) || !isTransientLockError(err) {
+			return err
+		}
+
+		metrics.DBBatchRetriesTotal.Inc()
+		slog.Warn("db: bulk insert hit a transient lock failure, retrying",
+			"table", b.table, "attempt", attempt,
+			"attempts_allowed", len(flushRetryBackoff)+1, "error", err)
+
+		timer := time.NewTimer(flushRetryBackoff[attempt-1])
+		select {
+		case <-timer.C:
+		case <-ctx.Done():
+			// Shutting down (or the flush deadline expired): report the
+			// last real MySQL error rather than the context error, since
+			// that is what the caller needs to see in the log.
+			timer.Stop()
+			return err
+		}
+	}
+}
+
+// isTransientLockError reports whether err is a MySQL deadlock or lock
+// wait timeout. Matching on the numeric code rather than the message text
+// keeps this independent of the server's language and version.
+func isTransientLockError(err error) bool {
+	var mysqlErr *mysql.MySQLError
+	if !errors.As(err, &mysqlErr) {
+		return false
+	}
+	return mysqlErr.Number == mysqlErrDeadlock || mysqlErr.Number == mysqlErrLockWaitTimeout
 }
 
 // buildInsert renders "INSERT INTO table (cols...) VALUES (?,...), (?,...), ..."

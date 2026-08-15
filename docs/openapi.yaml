@@ -951,6 +951,7 @@ paths:
         | `statusengine_db_events_written_total` | counter | `table` | Rows successfully persisted per destination table. |
         | `statusengine_db_batch_flush_duration_seconds` | histogram | - | Duration of each bulk-insert flush to MySQL. |
         | `statusengine_db_batch_size_at_flush` | histogram | - | Row count of each bulk-insert flush - shows whether flushes are mostly hitting the 100-row batch size or the 250ms ticker. |
+        | `statusengine_db_batch_retries_total` | counter | - | Bulk inserts re-executed unchanged after MySQL reported a deadlock (1213) or a lock wait timeout (1205). Both are transient and cost only the retry, but they mean another writer is contending for the same rows - in practice `db_cleanup` running against a busy table. Occasional increments are harmless; a steadily rising value is a scheduling problem, not a database one. |
         | `statusengine_websocket_clients_active` | gauge | - | Currently connected WebSocket clients. |
         | `statusengine_websocket_messages_broadcasted_total` | counter | - | Messages successfully handed to a client's send buffer. |
         | `statusengine_websocket_messages_dropped_total` | counter | - | Messages dropped because a client's send buffer was full - non-blocking broadcast. Deliberately unlabeled: a client id is unique per connection, so labeling by it would mint a permanent new time series on every reconnect. Which client was too slow is logged when that client disconnects. |
