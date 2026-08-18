@@ -26,13 +26,13 @@ A few words in this document mean something narrower than they might elsewhere �
 |---|---|---|
 | **Broker** | The message broker the worker consumes from: **gearmand** (default) or RabbitMQ. When this document says "the backlog waits at the broker", it means jobs sitting in gearmand. | Naemon's **Event Broker Module** (NEB), the shared library loaded *into* the monitoring core. In this stack the NEB module is what *publishes* to the broker — [statusengine/broker](https://github.com/statusengine/broker) — it is not part of this worker and never talks to it directly. |
 | **Queue** | One named channel at the broker, e.g. `statusngin_hoststatus`. In Gearman terms this is a *function name*, in RabbitMQ terms a *queue*. Queue names double as WebSocket topics. | The in-process Go channels between the pipeline stages, which this document calls *buffers*. |
-| **Job** | One unit of work handed to the worker by the broker. A job carries one payload, which for most queues is a **bulk** array of many events. | A single event. One job typically contains 100. |
+| **Job** | One unit of work handed to the worker by the broker. A job carries one payload, which for most queues is a **bulk** array of many events. | A single event. One job typically contains 100, which is unrelated to the batch size below. |
 | **Event** | One decoded item out of a job's payload — one host check, one status snapshot, one notification. This is what becomes a row and what a WebSocket client receives. | A Naemon "event" in the NEB callback sense. |
 | **Handler** | The worker's function for one queue: decode the payload, publish each event to the hub, enqueue each event for insertion. Runs on its own goroutine, one per job. | Naemon's *event handler*, the command run on a state change. That one arrives here as ordinary event data (`event_handler` column). |
 | **Worker** | This process. | A Gearman "worker" in the protocol sense — though this process is one of those too, which is why `gearadmin --status` counts it in its last column. |
 | **Runner** | Anything with a `Run`/`Flush` pair the pipeline starts and drains: every `BulkInserter` plus the Graphite client. There are 15. | The queue consumer, which has its own `Start`/`Stop` lifecycle. |
-| **Batch** | The rows one `INSERT` statement carries — at most 100. Cut purely by size and time, **never** along job boundaries. | A bulk payload. One batch can hold events from several jobs, and one job's events can span several batches. |
-| **Flush** | Executing the buffered rows as one bulk `INSERT` and clearing the buffer. Triggered by 100 rows, by the 250ms ticker, or by shutdown. | A Graphite flush, which is the same idea one stage further along. |
+| **Batch** | The rows one `INSERT` statement carries — at most `-mysql-batch-size`, 100 by default. Cut purely by size and time, **never** along job boundaries. | A bulk payload. One batch can hold events from several jobs, and one job's events can span several batches. |
+| **Flush** | Executing the buffered rows as one bulk `INSERT` and clearing the buffer. Triggered by the batch size, by the 250ms ticker, or by shutdown. A shutdown flush is the one that can exceed the batch size — see below. | A Graphite flush, which is the same idea one stage further along. |
 | **Topic** | What a WebSocket client subscribes to. Always equal to a queue name. | — |
 | **Hub** | The WebSocket pub/sub broadcaster. Has an inbound buffer of its own, hence two distinct drop metrics. | The broker. Nothing is persisted in the hub; a client that is not connected misses the event permanently, by design. |
 | **Stale** | For the two status queues only: an event whose envelope timestamp is older than `status_max_age`. Discarded before it reaches MySQL or the hub. | The `status_update_time`-based `DELETE` on core restart, which removes stale *rows* from a previous run. Related idea, different mechanism. |
@@ -54,7 +54,7 @@ Compared to the legacy PHP worker, this Go implementation focuses on:
 2. MySQL Bulk Insert Pipeline
 - Events are buffered and written in bulk.
 - Flush conditions:
-	- Batch size reached: 100 rows.
+	- Batch size reached: `-mysql-batch-size` rows (default 100, maximum 700).
 	- Time reached: 250ms since last flush tick.
 
 3. Graphite Routing (Perfdata)
@@ -100,12 +100,12 @@ Every rule below exists because dropping a batch was measured to cost real event
 
 ### The normal path
 
-A queue handler decodes a job and calls `Enqueue` for each event, which hands it to that table's `BulkInserter` over a 100-deep channel. A separate goroutine per table owns the buffer and flushes it as one multi-row `INSERT` when **either** 100 rows have accumulated **or** 250ms have passed since the last flush.
+A queue handler decodes a job and calls `Enqueue` for each event, which hands it to that table's `BulkInserter` over a channel as deep as the batch size. A separate goroutine per table owns the buffer and flushes it as one multi-row `INSERT` when **either** `-mysql-batch-size` rows have accumulated **or** 250ms have passed since the last flush. The batch size defaults to 100 and may be raised to 700; see [Choosing a batch size](#choosing-a-batch-size).
 
 Two consequences are worth internalising, because most of what follows depends on them:
 
 - **A job is acknowledged to the broker as soon as `Enqueue` returns**, not when the row reaches MySQL. The insert happens later, on a different goroutine. A MySQL error therefore never travels back to Gearman, and a failed write is never redelivered.
-- **Batches are cut at 100 rows regardless of job boundaries.** One batch routinely holds events from several jobs, so one bad row can take unrelated events down with it. That is exactly how the first data-loss bug did its damage.
+- **Batches are cut at the batch size regardless of job boundaries.** One batch routinely holds events from several jobs, so one bad row can take unrelated events down with it. That is exactly how the first data-loss bug did its damage — and it is why raising the batch size raises the blast radius with it.
 
 ### When a failed write is retried
 
@@ -141,8 +141,8 @@ Two tables are knowingly not covered, because neither can collide: `statusengine
 
 Four places, in rough order of likelihood:
 
-1. **A permanent SQL error drops its batch** — up to 100 rows, including unrelated events that shared it. Logged as `bulk insert failed, rows dropped` and counted in `statusengine_pipeline_errors_total{component="mysql"}`. In practice this means a schema mismatch, and it should be treated as an incident rather than as noise.
-2. **A hard kill loses what is buffered but not yet written** — `SIGKILL`, an OOM kill, a power cut. Up to 200 rows per table (100 in the channel, 100 in the buffer) whose jobs the broker already considers done. This is the at-least-once boundary and cannot be closed without acknowledging per row, which would cost roughly an order of magnitude in throughput. A normal `SIGTERM` is unaffected.
+1. **A permanent SQL error drops its batch** — up to `-mysql-batch-size` rows, including unrelated events that shared it. Logged as `bulk insert failed, rows dropped` and counted in `statusengine_pipeline_errors_total{component="mysql"}`. In practice this means a schema mismatch, and it should be treated as an incident rather than as noise.
+2. **A hard kill loses what is buffered but not yet written** — `SIGKILL`, an OOM kill, a power cut. Up to twice the batch size per table (one batch in the channel, one in the buffer) whose jobs the broker already considers done. This is the at-least-once boundary and cannot be closed without acknowledging per row, which would cost roughly an order of magnitude in throughput. A normal `SIGTERM` is unaffected.
 3. **Shutting down while MySQL is unreachable** — the final flush gets a 10-second budget for all 15 runners; whatever cannot be written in that window is dropped. Restarting a worker during a database outage therefore costs its buffers.
 4. **Discarded stale status events** — by design, not by accident. `statusngin_hoststatus` and `statusngin_servicestatus` events older than `-status-max-age` (default `5m`) are dropped before MySQL and the WebSocket hub, because they are superseded snapshots. See [Discarding Superseded Status Events](#discarding-superseded-status-events).
 
@@ -151,12 +151,30 @@ Four places, in rough order of likelihood:
 | Metric | Healthy | What it means otherwise |
 |---|---|---|
 | `statusengine_db_available` | `1` | `0` = pipeline stalled on MySQL. Alert on this. |
-| `statusengine_pipeline_errors_total{component="mysql"}` | flat | A batch was dropped. Every increment is up to 100 lost rows. |
+| `statusengine_pipeline_errors_total{component="mysql"}` | flat | A batch was dropped. Every increment is up to `-mysql-batch-size` lost rows. |
 | `statusengine_db_connection_retries_total` | flat | Climbs for the duration of an outage; measures its length, not a count of incidents. |
 | `statusengine_db_batch_retries_total` | ~0 | Lock contention, in practice `db_cleanup` running against a busy table. |
-| `statusengine_db_batch_size_at_flush` | mixed | Constant 100 = flushes are batch- rather than ticker-triggered, i.e. saturated. |
+| `statusengine_db_batch_size_at_flush` | mixed | Constant at the batch size = flushes are batch- rather than ticker-triggered, i.e. saturated. |
 
 `statusengine_db_events_written_total` counts every buffered row as written, including duplicates an upsert skipped, so it briefly overstates after a restart under load. It is a throughput signal, not an audit.
+
+### Choosing a batch size
+
+`-mysql-batch-size` defaults to **100** and accepts up to **700**. `-graphite-batch-size` defaults to 100 and accepts up to **1000**. The worker refuses to start on a value outside those ranges rather than quietly clamping it.
+
+Raising it only helps under sustained load. With a 250ms ticker, a batch size of N only binds above roughly 4·N events per second **on that one table** — 100 caps at about 400 rows/s per table, 700 at about 2800. Below that the ticker fires first and the batch size is irrelevant. Against it: a dropped batch costs N events instead of 100, and a longer statement holds locks longer against `db_cleanup`.
+
+The 700 ceiling is arithmetic, not taste. Every flush is sent as a server-side prepared statement (`interpolateParams` is off by default, so `database/sql` falls back to Prepare/Exec/Close), and a prepared statement is limited to **65535 placeholders**. What has to fit is not N rows but `2N-1`: `drainPending` deliberately tops the buffer up from the input channel before a shutdown or core-restart flush, and all of it becomes one statement.
+
+| Batch size | Worst-case rows | × 43 columns | |
+|---|---|---|---|
+| 700 | 1399 | 60,157 | fits, room for 3 more columns |
+| 750 | 1499 | 64,457 | fits, but a 44th column breaks it |
+| 1000 | 1999 | 85,957 | **`Error 1390`** |
+
+`Error 1390` ("Prepared statement contains too many placeholders") is deterministic, so it is never retried — every batch would be dropped and `statusengine_hoststatus`/`statusengine_servicestatus` would silently stop being written. `db.NewBulkInserter` panics at construction rather than allow it, and `TestBatchSizeStaysUnderPlaceholderLimit` checks all 14 tables at the ceiling.
+
+Graphite gets a higher ceiling because Carbon's plaintext protocol has no equivalent limit; there the cap only bounds how many metrics a single failed write drops.
 
 ## Discarding Superseded Status Events
 
@@ -209,10 +227,12 @@ Useful flags:
 - `-gearman-addr`: Gearman server address
 - `-rabbitmq-url`: AMQP URL
 - `-mysql-dsn`: MySQL DSN
+- `-mysql-batch-size`: rows buffered per table before a bulk `INSERT` is flushed ahead of the 250ms ticker (default `100`, maximum `700`). See [Choosing a batch size](#choosing-a-batch-size)
 - `-listen-addr`: WebSocket server listen address (default `127.0.0.1:8080` — **loopback only**; exposing it on the network is an explicit opt-in, e.g. `-listen-addr :8080`)
 - `-api-keys`: comma-separated API keys accepted by `/ws`. Leaving this empty does **not** disable authentication — the worker generates a random key at startup and logs it as a warning instead, so an unconfigured worker is never an open event stream
 - `-metrics-listen-addr`: Prometheus server listen address (default `:9105`)
 - `-graphite-addr`: Graphite Carbon address
+- `-graphite-batch-size`: metrics buffered before a Carbon write is flushed ahead of the 250ms ticker (default `100`, maximum `1000`)
 - `-perfdata-route`: `mysql`, `graphite`, or `both`
 - `-status-max-age`: discard `statusngin_hoststatus`/`statusngin_servicestatus` events older than this Go duration (default `5m`); `0` processes every event regardless of age. See [Discarding Superseded Status Events](#discarding-superseded-status-events)
 
@@ -319,7 +339,7 @@ No events lost.
 
 `missing: 0` and exit code 0 is the pass condition. **Jobs still queued at the broker are not loss** — they survive a restart by design and are reported separately so the accounting adds up; let the worker finish draining before you judge the result.
 
-If events are missing, the tool prints the gaps as ranges. A contiguous gap that is an exact multiple of 100 is one or more whole jobs that never reached MySQL; check the worker log for `bulk insert failed`.
+If events are missing, the tool prints the gaps as ranges. A contiguous gap that is an exact multiple of the publisher's 100 events per job is one or more whole jobs that never reached MySQL (that 100 is the job size, unrelated to `-mysql-batch-size`); check the worker log for `bulk insert failed`.
 
 **5. Remove the test rows.**
 

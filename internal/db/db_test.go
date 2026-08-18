@@ -79,7 +79,7 @@ func TestRunFlushesOnBatchSize(t *testing.T) {
 	}
 	defer mockDB.Close()
 
-	mock.ExpectExec(`^INSERT INTO events`).WillReturnResult(sqlmock.NewResult(0, MaxBatchSize))
+	mock.ExpectExec(`^INSERT INTO events`).WillReturnResult(sqlmock.NewResult(0, DefaultMaxBatchSize))
 
 	inserter := NewBulkInserter[row](mockDB, "events", []string{"id", "name"}, toRow)
 
@@ -87,7 +87,7 @@ func TestRunFlushesOnBatchSize(t *testing.T) {
 	defer cancel()
 	go inserter.Run(ctx)
 
-	for i := 0; i < MaxBatchSize; i++ {
+	for i := 0; i < DefaultMaxBatchSize; i++ {
 		if err := inserter.Enqueue(ctx, row{id: i}); err != nil {
 			t.Fatalf("Enqueue: %v", err)
 		}

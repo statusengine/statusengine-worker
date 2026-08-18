@@ -10,6 +10,7 @@ import (
 
 	_ "github.com/go-sql-driver/mysql"
 
+	"statusengine-worker/internal/db"
 	"statusengine-worker/internal/graphite"
 	"statusengine-worker/internal/types"
 	"statusengine-worker/internal/websocket"
@@ -43,10 +44,16 @@ func openTestDB(t *testing.T) *sql.DB {
 // stale_test.go.
 const noAgeFilter = 0 * time.Second
 
+// testBatchSize is the batch size every NewRouter call in the queue tests
+// passes. The default rather than the ceiling on purpose: these tests are
+// about routing, and a size the assertions do not depend on keeps them that
+// way. TestBatchSizeStaysUnderPlaceholderLimit is what covers the ceiling.
+const testBatchSize = db.DefaultMaxBatchSize
+
 func TestNewRouterCoversAllQueues(t *testing.T) {
 	sqlDB := openTestDB(t)
 	hub := websocket.NewHub()
-	router, runners := NewRouter(sqlDB, hub, graphite.NewClient("127.0.0.1:2003"), PerfdataRouteMySQL, "statusengine-test", "statusengine-test", false, noAgeFilter)
+	router, runners := NewRouter(sqlDB, hub, graphite.NewClient("127.0.0.1:2003"), PerfdataRouteMySQL, "statusengine-test", "statusengine-test", false, noAgeFilter, testBatchSize)
 
 	want := []string{
 		QueueHostStatus, QueueServiceStatus, QueueHostChecks, QueueServiceChecks,
@@ -91,7 +98,7 @@ func runAllAndFlush(t *testing.T, runners []Runner) context.Context {
 func TestHostCheckHandlerPersistsToMySQL(t *testing.T) {
 	sqlDB := openTestDB(t)
 	hub := websocket.NewHub()
-	router, runners := NewRouter(sqlDB, hub, graphite.NewClient("127.0.0.1:2003"), PerfdataRouteMySQL, "statusengine-test", "statusengine-test", false, noAgeFilter)
+	router, runners := NewRouter(sqlDB, hub, graphite.NewClient("127.0.0.1:2003"), PerfdataRouteMySQL, "statusengine-test", "statusengine-test", false, noAgeFilter, testBatchSize)
 	ctx := runAllAndFlush(t, runners)
 	go hub.Run(ctx)
 
@@ -153,7 +160,7 @@ func TestHostCheckHandlerPersistsToMySQL(t *testing.T) {
 func TestAcknowledgementHandlerRoutesToHostAndServiceTables(t *testing.T) {
 	sqlDB := openTestDB(t)
 	hub := websocket.NewHub()
-	router, runners := NewRouter(sqlDB, hub, graphite.NewClient("127.0.0.1:2003"), PerfdataRouteMySQL, "statusengine-test", "statusengine-test", false, noAgeFilter)
+	router, runners := NewRouter(sqlDB, hub, graphite.NewClient("127.0.0.1:2003"), PerfdataRouteMySQL, "statusengine-test", "statusengine-test", false, noAgeFilter, testBatchSize)
 	ctx := runAllAndFlush(t, runners)
 	go hub.Run(ctx)
 

@@ -259,7 +259,7 @@ func TestOnlyStatusQueuesDiscardOnAge(t *testing.T) {
 	go hub.Run(ctx)
 
 	router, _ := NewRouter(sqlDB, hub, graphite.NewClient("127.0.0.1:2003"), PerfdataRouteMySQL,
-		"statusengine-test", "statusengine-test", false, 5*time.Minute)
+		"statusengine-test", "statusengine-test", false, 5*time.Minute, testBatchSize)
 
 	// NewRouter must have pre-created both series at zero, so a dashboard
 	// panel reads 0 rather than "No data" on a worker that has not

@@ -89,12 +89,12 @@ flowchart TD
     S -->|nein| I[pro Item: publish<br/>Hub, nicht blockierend]
     S -->|nein| J[pro Item: Enqueue<br/>BLOCKIERT bei vollem Puffer]
     J --> K[BulkInserter.Run<br/>eigene Goroutine]
-    K --> L{100 Zeilen<br/>oder 250ms?}
+    K --> L{mysql_batch_size<br/>Zeilen oder 250ms?}
     L --> M[execWithRetry<br/>ein Multi-Row-INSERT]
     M --> N{Fehler?}
     N -->|Sperre| O[3 Versuche<br/>50ms/200ms]
     N -->|Server weg| P[warten bis zurück<br/>staut zum Broker]
-    N -->|sonst| Q[Batch verworfen<br/>bis zu 100 Zeilen]
+    N -->|sonst| Q[Batch verworfen<br/>bis zu mysql_batch_size Zeilen]
 ```
 
 Die Kette in Dateien:
@@ -123,7 +123,8 @@ Pfad im Worker. Die Konsequenz ist bewusst in Kauf genommen: die Antwort ist
 eine Momentaufnahme, ein sich gerade verbindender Client verpasst das Event.
 
 `Enqueue` in `db/db.go:185` ist die Stelle, an der der Datenpfad **wartet statt
-zu verwerfen.** Wenn `b.in` (Kapazität 100) voll ist, blockiert der Handler.
+zu verwerfen.** Wenn `b.in` (Kapazität = `mysql_batch_size`, Standard 100) voll
+ist, blockiert der Handler.
 Genau das ist beabsichtigt: der Rückstau wandert über den Handler und den
 Concurrency-Cap des Consumers bis zum Broker, wo er einen Worker-Neustart
 überlebt. Regel 2 in `CLAUDE.md` beschreibt das im Detail.
@@ -178,7 +179,7 @@ Neustart nach einem Ausfall. Die Begründung steht ausführlich über
 
 | Kanal | Kapazität | Bei „voll" |
 |---|---|---|
-| `BulkInserter.in` | 100 | **blockiert** — der einzige Rückstaupunkt |
+| `BulkInserter.in` | `mysql_batch_size` (100) | **blockiert** — der einzige Rückstaupunkt |
 | `BulkInserter.flushReq` / `pauseReq` | 0 | Rendezvous mit `Run` |
 | `Hub.broadcast` | 1024 | verwirft, zählt `publish_dropped_total` |
 | `Hub.register` / `unregister` | 0 | Rendezvous mit `Run` |
@@ -222,7 +223,7 @@ hängt:
 - **Der Job ist quittiert, sobald `Enqueue` zurückkehrt** — nicht, wenn die
   Zeile in MySQL steht. Ein MySQL-Fehler erreicht Gearman nie, ein
   fehlgeschlagener Schreibvorgang wird also nie erneut geliefert.
-- **Batches werden bei 100 Zeilen geschnitten, unabhängig von Job-Grenzen.**
+- **Batches werden bei `mysql_batch_size` Zeilen geschnitten, unabhängig von Job-Grenzen.**
   Ein Batch enthält routinemäßig Events aus mehreren Jobs — deshalb reißt eine
   einzige schlechte Zeile fremde Events mit.
 
@@ -308,7 +309,8 @@ Ohne diesen Umweg wäre der letzte Batch still verloren.
 > Der Flush-Pfad war nie die Ursache — zwei ununterbrochene Kontrollläufe
 > verloren nichts. Schuld war die Kombination aus Wiedereinreihung durch
 > gearmand (exakt 64 Jobs, der Concurrency-Cap), Batches, die unabhängig von
-> Job-Grenzen bei 100 Zeilen geschnitten werden, und einem `Error 1062`, der
+> Job-Grenzen bei der Batch-Größe geschnitten werden (damals fest 100), und
+> einem `Error 1062`, der
 > den **gesamten** Multi-Row-INSERT mitsamt der frischen Zeilen darin
 > abbricht. **Behoben:** derselbe Ablauf liefert jetzt 300.000 von 300.000
 > und keinen einzigen 1062.
@@ -363,8 +365,18 @@ teuer wäre:
 - [ ] **Alarm auf `statusengine_db_available`.** `0` heißt: Pipeline steht auf
       MySQL. Das ist die aussagekräftigste einzelne Metrik im ganzen Worker.
 - [ ] **`statusengine_pipeline_errors_total{component="mysql"}` ist flach.**
-      Jede Erhöhung ist ein verworfener Batch, also bis zu 100 verlorene
-      Zeilen — in der Praxis ein Schemafehler und ein Vorfall, kein Rauschen.
+      Jede Erhöhung ist ein verworfener Batch, also bis zu `mysql_batch_size`
+      verlorene Zeilen — in der Praxis ein Schemafehler und ein Vorfall, kein
+      Rauschen. Wer die Batch-Größe anhebt, hebt diesen Radius mit an.
+- [ ] **`mysql_batch_size` liegt im erlaubten Bereich und ist bewusst gewählt.**
+      Der Worker verweigert den Start außerhalb von 1..700, die Grenze ist also
+      nicht umgehbar — aber sie ist auch nicht willkürlich: bindend sind nicht
+      *n* Zeilen, sondern die `2n-1` eines Drain-Flushes beim Shutdown, und bei
+      43 Spalten reißt das ab 750 die 65535-Platzhalter-Grenze eines Prepared
+      Statements (`Error 1390`, deterministisch, also **nicht** wiederholt).
+      Prüfen Sie, ob eine Anhebung überhaupt etwas bringt: bei 250 ms Ticker
+      greift eine Batch-Größe *N* erst oberhalb von rund 4·*N* Events/s **auf
+      dieser einen Tabelle**.
 - [ ] **`status_max_age` und die Uhren.** Der Vergleich läuft zwischen der Uhr
       des Monitoring-Cores und der des Workers. Driften die beiden Hosts um
       mehr als den eingestellten Wert auseinander, werden `hoststatus` und

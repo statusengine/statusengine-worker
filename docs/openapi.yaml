@@ -951,7 +951,7 @@ paths:
         | `statusengine_queue_handler_duration_seconds` | histogram | `queue_name` | Time to handle one message end to end: decode, WebSocket publish and enqueueing every decoded item for insertion. |
         | `statusengine_db_events_written_total` | counter | `table` | Rows successfully persisted per destination table. |
         | `statusengine_db_batch_flush_duration_seconds` | histogram | - | Duration of each bulk-insert flush to MySQL. |
-        | `statusengine_db_batch_size_at_flush` | histogram | - | Row count of each bulk-insert flush - shows whether flushes are mostly hitting the 100-row batch size or the 250ms ticker. |
+        | `statusengine_db_batch_size_at_flush` | histogram | - | Row count of each bulk-insert flush - shows whether flushes are mostly hitting the configured batch size (`-mysql-batch-size`, default 100, maximum 700) or the 250ms ticker. Buckets span the whole configurable range, including the oversized drain flush a shutdown produces. |
         | `statusengine_db_batch_retries_total` | counter | - | Bulk inserts re-executed unchanged after MySQL reported a deadlock (1213) or a lock wait timeout (1205). Both are transient and cost only the retry, but they mean another writer is contending for the same rows - in practice `db_cleanup` running against a busy table. Occasional increments are harmless; a steadily rising value is a scheduling problem, not a database one. |
         | `statusengine_db_available` | gauge | - | 1 while bulk inserts are reaching MySQL, 0 from the first connection failure until one succeeds again. **This is the one to alert on.** While it is 0 no data is being lost - the batch is held and the backlog waits at the broker - but nothing is draining either, so the catch-up afterwards takes as long as the outage did. |
         | `statusengine_db_connection_retries_total` | counter | - | Flush attempts repeated because MySQL was unreachable. Unbounded by design, so this counts the *length* of an outage rather than the number of incidents - a 30-second MySQL restart adds roughly a dozen. |
@@ -989,8 +989,9 @@ paths:
         shows where that time goes: a handler blocks in the bulk-insert
         buffer once it is full, so this is where MySQL backpressure becomes
         visible from the ingestion side. `db_batch_size_at_flush` pinned at
-        100 means flushes are triggered by the batch size rather than the
-        250ms ticker - the same saturation seen from the database side.
+        the configured batch size means flushes are triggered by that rather
+        than the 250ms ticker - the same saturation seen from the database
+        side.
         `go_goroutines` staying flat under a backlog confirms the cap is
         holding.
       servers:

@@ -19,15 +19,57 @@ import (
 )
 
 const (
-	// MaxBatchSize is the buffer capacity that triggers an immediate flush.
-	MaxBatchSize = 100
+	// DefaultMaxBatchSize is the buffer capacity that triggers an immediate
+	// flush when nothing else is configured. Override with WithMaxBatchSize.
+	DefaultMaxBatchSize = 100
+
+	// MaxConfigurableBatchSize is the hard ceiling WithMaxBatchSize accepts.
+	// Unlike its counterpart in internal/db there is no protocol limit
+	// behind it: a batch is one Write of newline-delimited plaintext lines,
+	// and Carbon reads them line by line, so even the drain overshoot -
+	// drainPending can push the buffer to just under 2*n, i.e. ~140 KB of
+	// lines here - is nothing a TCP socket minds.
+	//
+	// The ceiling exists for the other reason only: flushBuffer drops the
+	// entire batch on a failed dial or write and leaves re-dialling to the
+	// next flush, so everything buffered at that moment is lost at once.
+	// That loss grows linearly with this number, and Graphite metrics are
+	// the one part of the pipeline with no at-least-once redelivery behind
+	// it.
+	MaxConfigurableBatchSize = 1000
+
 	// FlushInterval is the ticker period that triggers a flush of whatever
-	// is buffered, even if MaxBatchSize hasn't been reached.
+	// is buffered, even if the batch size hasn't been reached.
 	FlushInterval = 250 * time.Millisecond
 
 	dialTimeout  = 5 * time.Second
 	writeTimeout = 5 * time.Second
 )
+
+// Option configures a Client at construction time.
+type Option func(*clientOptions)
+
+type clientOptions struct {
+	maxBatchSize int
+}
+
+// WithMaxBatchSize sets how many buffered metrics trigger an immediate
+// flush, instead of DefaultMaxBatchSize. Values outside
+// [1, MaxConfigurableBatchSize] are clamped rather than rejected - cmd/app
+// validates the configured value up front and refuses to start, so an
+// operator sees the flag name and the accepted range instead of a silently
+// different batch size.
+func WithMaxBatchSize(n int) Option {
+	return func(o *clientOptions) {
+		if n < 1 {
+			n = 1
+		}
+		if n > MaxConfigurableBatchSize {
+			n = MaxConfigurableBatchSize
+		}
+		o.maxBatchSize = n
+	}
+}
 
 // Metric is one Graphite plaintext-protocol data point.
 type Metric struct {
@@ -53,6 +95,11 @@ type Client struct {
 	in       chan Metric
 	flushReq chan flushRequest
 
+	// maxBatchSize is how many buffered metrics trigger an immediate flush,
+	// set once at construction and never changed afterwards. It also sizes
+	// in and buffer, so the whole client scales off this one number.
+	maxBatchSize int
+
 	buffer []Metric
 	conn   net.Conn
 
@@ -61,7 +108,7 @@ type Client struct {
 	// built fresh each time, so a flush neither reallocates the whole
 	// batch nor copies it a second time on the way to the socket. It
 	// settles at the size of the largest batch seen - a few KB at
-	// MaxBatchSize lines - and stays there. Owned by Run's goroutine,
+	// a full batch of lines - and stays there. Owned by Run's goroutine,
 	// like buffer and conn.
 	writeBuf []byte
 
@@ -74,19 +121,26 @@ type Client struct {
 
 // NewClient creates a Client that writes to the Graphite Carbon receiver
 // at addr (host:port). Run must be started in its own goroutine before
-// enqueued metrics are actually flushed.
-func NewClient(addr string) *Client {
+// enqueued metrics are actually flushed. Pass WithMaxBatchSize to flush at
+// something other than DefaultMaxBatchSize metrics.
+func NewClient(addr string, opts ...Option) *Client {
+	o := clientOptions{maxBatchSize: DefaultMaxBatchSize}
+	for _, opt := range opts {
+		opt(&o)
+	}
+
 	return &Client{
-		addr:     addr,
-		in:       make(chan Metric, MaxBatchSize),
-		flushReq: make(chan flushRequest),
-		// 2*MaxBatchSize, not MaxBatchSize: drainPending can top up an
+		addr:         addr,
+		maxBatchSize: o.maxBatchSize,
+		in:           make(chan Metric, o.maxBatchSize),
+		flushReq:     make(chan flushRequest),
+		// 2*maxBatchSize, not maxBatchSize: drainPending can top up an
 		// almost-full buffer with everything sitting in c.in, which holds
-		// MaxBatchSize itself. Sizing for the real maximum keeps the flush
+		// maxBatchSize itself. Sizing for the real maximum keeps the flush
 		// path free of reallocations - the alternative is a one-time grow
 		// to exactly this size the first time a drain lands on a full
 		// buffer, after which the backing array stays this large anyway.
-		buffer: make([]Metric, 0, 2*MaxBatchSize),
+		buffer: make([]Metric, 0, 2*o.maxBatchSize),
 	}
 }
 
@@ -148,7 +202,7 @@ func (c *Client) Run(ctx context.Context) {
 				return
 			}
 			c.buffer = append(c.buffer, m)
-			if len(c.buffer) >= MaxBatchSize {
+			if len(c.buffer) >= c.maxBatchSize {
 				c.flushBuffer(ctx)
 				ticker.Reset(FlushInterval)
 			}
@@ -170,9 +224,9 @@ func (c *Client) Run(ctx context.Context) {
 // buffer into c.buffer without blocking, so a shutdown racing with an
 // in-flight Enqueue never silently loses that metric.
 //
-// This deliberately appends past MaxBatchSize: the point is to lose
+// This deliberately appends past maxBatchSize: the point is to lose
 // nothing, and the overshoot is bounded by c.in's own capacity, so
-// c.buffer peaks just under 2*MaxBatchSize - which is what NewClient
+// c.buffer peaks just under 2*maxBatchSize - which is what NewClient
 // sizes it for.
 func (c *Client) drainPending() {
 	for {
@@ -202,7 +256,7 @@ func (c *Client) finalFlush() {
 // will simply try to re-dial.
 //
 // Every flush is logged exactly once, at most every FlushInterval (or
-// MaxBatchSize metrics) - never per metric - so structured logging never
+// a full batch of metrics) - never per metric - so structured logging never
 // adds per-message overhead to the hot ingestion path (CLAUDE.md rule 2).
 func (c *Client) flushBuffer(ctx context.Context) error {
 	if len(c.buffer) == 0 {

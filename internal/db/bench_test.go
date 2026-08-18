@@ -26,7 +26,7 @@ import (
 //
 // Shape is taken from the widest real table: statusengine_hoststatus has
 // 40 columns of mixed strings, ints, bools and times (see newHostStatusRow
-// in internal/queue/registry.go), flushed MaxBatchSize rows at a time.
+// in internal/queue/registry.go), flushed DefaultMaxBatchSize rows at a time.
 
 const benchColumns = 40
 
@@ -89,7 +89,7 @@ func benchInserter(tb testing.TB) (*BulkInserter[benchRow], []benchRow) {
 	b := NewUpsertBulkInserter[benchRow](nil, "statusengine_hoststatus",
 		columns, columns[:8], benchToRow)
 
-	items := make([]benchRow, MaxBatchSize)
+	items := make([]benchRow, DefaultMaxBatchSize)
 	for i := range items {
 		items[i] = benchRow{
 			name:         "host-with-a-reasonably-long-name.example.org",

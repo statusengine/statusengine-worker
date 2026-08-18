@@ -25,6 +25,7 @@ import (
 
 	_ "github.com/go-sql-driver/mysql"
 
+	"statusengine-worker/internal/db"
 	"statusengine-worker/internal/graphite"
 	"statusengine-worker/internal/queue"
 	"statusengine-worker/internal/websocket"
@@ -45,6 +46,8 @@ type config struct {
 	rabbitMQPrefetch          int // unacknowledged deliveries the broker may push per queue
 	mysqlDSN                  string
 	mysqlMaxOpenConns         int // upper bound on simultaneously open MySQL connections; also used as the idle limit
+	mysqlBatchSize            int // rows buffered before a bulk INSERT is flushed ahead of the 250ms ticker
+	graphiteBatchSize         int // metrics buffered before a Carbon write is flushed ahead of the 250ms ticker
 	listenAddr                string
 	metricsListenAddr         string
 	graphiteAddr              string
@@ -75,6 +78,8 @@ type fileConfig struct {
 	RabbitMQPrefetch          int      `yaml:"rabbitmq_prefetch"`
 	MySQLDSN                  string   `yaml:"mysql_dsn"`
 	MySQLMaxOpenConns         int      `yaml:"mysql_max_open_conns"`
+	MySQLBatchSize            int      `yaml:"mysql_batch_size"`
+	GraphiteBatchSize         int      `yaml:"graphite_batch_size"`
 	ListenAddr                string   `yaml:"listen_addr"`
 	MetricsListenAddr         string   `yaml:"metrics_listen_addr"`
 	GraphiteAddr              string   `yaml:"graphite_addr"`
@@ -184,6 +189,10 @@ func loadConfig() config {
 	flag.IntVar(&cfg.mysqlMaxOpenConns, "mysql-max-open-conns", 25,
 		"maximum number of open MySQL connections (also used as the idle-connection limit); "+
 			"must stay below the server's max_connections")
+	flag.IntVar(&cfg.mysqlBatchSize, "mysql-batch-size", db.DefaultMaxBatchSize,
+		fmt.Sprintf("rows buffered per table before a bulk INSERT is flushed ahead of the %s ticker; "+
+			"1..%d, see db.MaxConfigurableBatchSize for why the ceiling is where it is",
+			db.FlushInterval, db.MaxConfigurableBatchSize))
 	flag.StringVar(&cfg.listenAddr, "listen-addr", "127.0.0.1:8080",
 		"address the WebSocket HTTP server listens on; loopback-only by default, "+
 			"pass an explicit interface (e.g. \":8080\") to expose it on the network")
@@ -191,6 +200,9 @@ func loadConfig() config {
 		"address the Prometheus /metrics HTTP server listens on")
 	flag.StringVar(&cfg.graphiteAddr, "graphite-addr", "127.0.0.1:2003",
 		"Graphite Carbon plaintext receiver address (host:port)")
+	flag.IntVar(&cfg.graphiteBatchSize, "graphite-batch-size", graphite.DefaultMaxBatchSize,
+		fmt.Sprintf("metrics buffered before a Carbon write is flushed ahead of the %s ticker; 1..%d",
+			graphite.FlushInterval, graphite.MaxConfigurableBatchSize))
 	flag.StringVar(&cfg.graphitePrefix, "graphite-prefix", "statusengine",
 		"prefix prepended to every Graphite metric path (prefix.hostname.service_description.label)")
 	flag.StringVar(&cfg.perfdataRoute, "perfdata-route", "mysql",
@@ -227,6 +239,8 @@ func loadConfig() config {
 	cfg.rabbitMQPrefetch = resolveInt(explicit, "rabbitmq-prefetch", cfg.rabbitMQPrefetch, "STATUSENGINE_RABBITMQ_PREFETCH", fc.RabbitMQPrefetch)
 	cfg.mysqlDSN = resolveString(explicit, "mysql-dsn", cfg.mysqlDSN, "STATUSENGINE_MYSQL_DSN", fc.MySQLDSN)
 	cfg.mysqlMaxOpenConns = resolveInt(explicit, "mysql-max-open-conns", cfg.mysqlMaxOpenConns, "STATUSENGINE_MYSQL_MAX_OPEN_CONNS", fc.MySQLMaxOpenConns)
+	cfg.mysqlBatchSize = resolveInt(explicit, "mysql-batch-size", cfg.mysqlBatchSize, "STATUSENGINE_MYSQL_BATCH_SIZE", fc.MySQLBatchSize)
+	cfg.graphiteBatchSize = resolveInt(explicit, "graphite-batch-size", cfg.graphiteBatchSize, "STATUSENGINE_GRAPHITE_BATCH_SIZE", fc.GraphiteBatchSize)
 	cfg.listenAddr = resolveString(explicit, "listen-addr", cfg.listenAddr, "STATUSENGINE_LISTEN_ADDR", fc.ListenAddr)
 	cfg.metricsListenAddr = resolveString(explicit, "metrics-listen-addr", cfg.metricsListenAddr, "STATUSENGINE_METRICS_LISTEN_ADDR", fc.MetricsListenAddr)
 	cfg.graphiteAddr = resolveString(explicit, "graphite-addr", cfg.graphiteAddr, "STATUSENGINE_GRAPHITE_ADDR", fc.GraphiteAddr)
@@ -250,6 +264,20 @@ func loadConfig() config {
 	}
 	if cfg.rabbitMQPrefetch < 1 {
 		fatal("invalid -rabbitmq-prefetch", "value", cfg.rabbitMQPrefetch, "want", "a positive number")
+	}
+	// Rejected rather than clamped. The db/graphite packages clamp as a last
+	// line of defence, but silently running at 700 when the file says 5000
+	// would leave an operator tuning a number that has no effect; refusing to
+	// start names the flag and the range instead. The ceiling is not a matter
+	// of taste - see db.MaxConfigurableBatchSize for the placeholder
+	// arithmetic behind it.
+	if cfg.mysqlBatchSize < 1 || cfg.mysqlBatchSize > db.MaxConfigurableBatchSize {
+		fatal("invalid -mysql-batch-size", "value", cfg.mysqlBatchSize,
+			"want", fmt.Sprintf("1..%d", db.MaxConfigurableBatchSize))
+	}
+	if cfg.graphiteBatchSize < 1 || cfg.graphiteBatchSize > graphite.MaxConfigurableBatchSize {
+		fatal("invalid -graphite-batch-size", "value", cfg.graphiteBatchSize,
+			"want", fmt.Sprintf("1..%d", graphite.MaxConfigurableBatchSize))
 	}
 
 	return cfg
@@ -618,9 +646,9 @@ func main() {
 	// BulkInserter below regardless of perfdataRoute; if perfdataRoute
 	// excludes Graphite, NewRouter simply never calls Enqueue on it, so no
 	// connection is ever dialed (CLAUDE.md rule 5).
-	gc := graphite.NewClient(cfg.graphiteAddr)
+	gc := graphite.NewClient(cfg.graphiteAddr, graphite.WithMaxBatchSize(cfg.graphiteBatchSize))
 
-	router, runners := queue.NewRouter(sqlDB, hub, gc, perfdataRoute, cfg.graphitePrefix, cfg.nodeName, cfg.enableOpenITCockpitTweaks, statusMaxAge)
+	router, runners := queue.NewRouter(sqlDB, hub, gc, perfdataRoute, cfg.graphitePrefix, cfg.nodeName, cfg.enableOpenITCockpitTweaks, statusMaxAge, cfg.mysqlBatchSize)
 	for _, r := range runners {
 		wg.Add(1)
 		go func(r queue.Runner) {

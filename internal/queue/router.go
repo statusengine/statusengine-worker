@@ -49,8 +49,8 @@ type Handler func(ctx context.Context, payload []byte) error
 // cap is the signature of the pipeline falling behind - with the backlog
 // waiting at the broker, which is where it belongs.
 //
-// Two existing signals complement these: DBBatchSizeAtFlush sitting at
-// MaxBatchSize means flushes are batch- rather than ticker-triggered
+// Two existing signals complement these: DBBatchSizeAtFlush sitting at the
+// configured batch size means flushes are batch- rather than ticker-triggered
 // (i.e. saturated), and go_goroutines, which promhttp's default registry
 // exports on its own, shows whether work is accumulating in-process.
 func observeHandler(ctx context.Context, queueName string, handle Handler, payload []byte) error {

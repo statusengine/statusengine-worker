@@ -21,12 +21,87 @@ import (
 )
 
 const (
-	// MaxBatchSize is the buffer capacity that triggers an immediate flush.
-	MaxBatchSize = 100
+	// DefaultMaxBatchSize is the buffer capacity that triggers an immediate
+	// flush when nothing else is configured. Override per inserter with
+	// WithMaxBatchSize.
+	DefaultMaxBatchSize = 100
+
+	// MaxConfigurableBatchSize is the hard ceiling WithMaxBatchSize accepts.
+	// It is not a round number picked for comfort - it is what the wire
+	// protocol allows, and exceeding it breaks the two most important tables
+	// silently.
+	//
+	// This driver sends every flush as a server-side prepared statement:
+	// interpolateParams is off by default, so mysqlConn.Exec returns
+	// driver.ErrSkip for a non-empty argument list and database/sql falls
+	// back to Prepare/Exec/Close. Prepared statements carry a 16-bit
+	// parameter count, so a statement may not exceed 65535 placeholders.
+	// Going over is Error 1390 ("Prepared statement contains too many
+	// placeholders"), which is deterministic and therefore NOT retried by
+	// execWithRetry - every flush would drop its batch and the table would
+	// simply stop being written, with nothing but one error line per flush
+	// to show for it.
+	//
+	// The binding number is not the batch size but 2*n-1, because
+	// drainPending deliberately appends past the batch size: b.buffer can
+	// already hold n-1 rows while b.in holds another n, and flushBuffer
+	// builds ONE statement out of all of it. That happens on every Flush()
+	// path - every shutdown and every core restart (WithPaused) under load -
+	// so it is a normal occurrence, not a corner case.
+	//
+	// The widest table here is statusengine_servicestatus at 43 columns
+	// (hoststatus 41, servicechecks 17, hostchecks 16, logentries 4):
+	//
+	//	n=1000 -> 1999 rows * 43 = 85957   over the limit
+	//	n= 750 -> 1499 rows * 43 = 64457   fits, but a 44th column breaks it
+	//	n= 700 -> 1399 rows * 43 = 60157   room for three more columns
+	//
+	// TestBatchSizeStaysUnderPlaceholderLimit in internal/queue is what keeps
+	// that arithmetic honest if a column is ever added.
+	//
+	// Two reasons hold independently of the protocol limit. The per-row cost
+	// of a bulk INSERT is already flat well below this number, so a larger
+	// batch mostly buys longer-running statements, longer lock hold times
+	// against cmd/db_cleanup and larger binlog events. And a failed flush
+	// drops its batch (CLAUDE.md rule 3), so the blast radius of a single
+	// truncated value grows linearly with it.
+	MaxConfigurableBatchSize = 700
+
 	// FlushInterval is the ticker period that triggers a flush of whatever
-	// is buffered, even if MaxBatchSize hasn't been reached.
+	// is buffered, even if the batch size hasn't been reached.
 	FlushInterval = 250 * time.Millisecond
 )
+
+// MaxPlaceholdersPerStatement is MySQL's limit on the number of ? in one
+// prepared statement, imposed by the 16-bit parameter count in the protocol.
+// Exported for the guard test in internal/queue; see
+// MaxConfigurableBatchSize for what it means here.
+const MaxPlaceholdersPerStatement = 65535
+
+// Option configures a BulkInserter at construction time.
+type Option func(*inserterOptions)
+
+type inserterOptions struct {
+	maxBatchSize int
+}
+
+// WithMaxBatchSize sets how many buffered rows trigger an immediate flush,
+// instead of DefaultMaxBatchSize. Values outside [1, MaxConfigurableBatchSize]
+// are clamped rather than rejected - this is the last line of defence, not the
+// place a misconfiguration should be caught. cmd/app validates the configured
+// value up front and refuses to start, so an operator sees the flag name and
+// the accepted range instead of a silently different batch size.
+func WithMaxBatchSize(n int) Option {
+	return func(o *inserterOptions) {
+		if n < 1 {
+			n = 1
+		}
+		if n > MaxConfigurableBatchSize {
+			n = MaxConfigurableBatchSize
+		}
+		o.maxBatchSize = n
+	}
+}
 
 // RowFunc appends a single buffered item's column values, in the order
 // declared by the inserter's columns, to dst and returns the extended
@@ -40,7 +115,7 @@ const (
 // into dst rather than returning a fresh []any is what keeps the hot path
 // cheap: buildInsert already sizes one args slice for the whole batch, so
 // a RowFunc that allocated its own would have every row allocate a slice
-// only to be copied out of and thrown away. At MaxBatchSize rows of a
+// only to be copied out of and thrown away. At a full batch of rows of a
 // 40-column table that measured ~39% of the bytes and ~29% of the time
 // spent building a statement.
 type RowFunc[T any] func(item T, dst []any) []any
@@ -61,7 +136,7 @@ type pauseRequest struct {
 
 // BulkInserter batches items received via Enqueue and flushes them to a
 // single MySQL table as one multi-row INSERT statement as soon as EITHER
-// the buffer reaches MaxBatchSize OR FlushInterval elapses - whichever
+// the buffer reaches its batch size OR FlushInterval elapses - whichever
 // happens first (CLAUDE.md rule 3). One BulkInserter instance handles
 // exactly one destination table; the pipeline runs one per event type.
 type BulkInserter[T any] struct {
@@ -92,6 +167,12 @@ type BulkInserter[T any] struct {
 	flushReq chan flushRequest
 	pauseReq chan pauseRequest
 
+	// maxBatchSize is how many buffered rows trigger an immediate flush,
+	// set once at construction (DefaultMaxBatchSize unless WithMaxBatchSize
+	// says otherwise) and never changed afterwards. It also sizes in and
+	// buffer, so the whole inserter scales off this one number.
+	maxBatchSize int
+
 	buffer []T
 
 	// processed is the running total of rows successfully flushed to db,
@@ -107,12 +188,38 @@ type BulkInserter[T any] struct {
 // NewBulkInserter creates a BulkInserter for table, using toRow to turn a
 // buffered item into that row's column values (in the same order as
 // columns). Run must be started in its own goroutine before items are
-// actually flushed to db.
-func NewBulkInserter[T any](db *sql.DB, table string, columns []string, toRow RowFunc[T]) *BulkInserter[T] {
+// actually flushed to db. Pass WithMaxBatchSize to flush at something other
+// than DefaultMaxBatchSize rows.
+func NewBulkInserter[T any](db *sql.DB, table string, columns []string, toRow RowFunc[T], opts ...Option) *BulkInserter[T] {
 	// Register this table's series at zero right away, so /metrics reports
 	// events_written_total{table="..."} 0 from the first scrape instead of
 	// omitting the table until its first successful flush.
 	metrics.InitTable(table)
+
+	o := inserterOptions{maxBatchSize: DefaultMaxBatchSize}
+	for _, opt := range opts {
+		opt(&o)
+	}
+
+	// Refuse to build an inserter that can generate a statement MySQL will
+	// reject. The bound is the drain overshoot (2n-1 rows, see drainPending),
+	// not the batch size, because that is the largest statement this inserter
+	// can ever produce - and it produces it on every shutdown and every core
+	// restart under load, i.e. exactly where the batch must not be lost.
+	//
+	// A panic rather than a clamp because reaching this is a code change, not
+	// a configuration mistake: MaxConfigurableBatchSize is chosen to leave
+	// room up to 46 columns, so the only way here is adding columns to an
+	// already-wide table. Failing at construction puts that in front of
+	// whoever added the column - every NewRouter test builds these - instead
+	// of surfacing as an Error 1390 that silently drops the batch of the two
+	// most important tables in production. Same reasoning as the panic in
+	// newRedeliverySafeInserter.
+	if worst := (2*o.maxBatchSize - 1) * len(columns); worst > MaxPlaceholdersPerStatement {
+		panic(fmt.Sprintf("db: %s: %d columns at batch size %d can produce a %d-placeholder statement, "+
+			"which exceeds MySQL's limit of %d - lower MaxConfigurableBatchSize or split the table",
+			table, len(columns), o.maxBatchSize, worst, MaxPlaceholdersPerStatement))
+	}
 
 	return &BulkInserter[T]{
 		db:             db,
@@ -120,16 +227,17 @@ func NewBulkInserter[T any](db *sql.DB, table string, columns []string, toRow Ro
 		columns:        columns,
 		toRow:          toRow,
 		rowPlaceholder: buildRowPlaceholder(len(columns)),
-		in:             make(chan T, MaxBatchSize),
+		maxBatchSize:   o.maxBatchSize,
+		in:             make(chan T, o.maxBatchSize),
 		flushReq:       make(chan flushRequest),
 		pauseReq:       make(chan pauseRequest),
-		// 2*MaxBatchSize, not MaxBatchSize: drainPending can top up an
+		// 2*maxBatchSize, not maxBatchSize: drainPending can top up an
 		// almost-full buffer with everything sitting in b.in, which holds
-		// MaxBatchSize itself. Sizing for the real maximum keeps the flush
+		// maxBatchSize itself. Sizing for the real maximum keeps the flush
 		// path free of reallocations - the alternative is a one-time grow
 		// to exactly this size the first time a drain lands on a full
 		// buffer, after which the backing array stays this large anyway.
-		buffer: make([]T, 0, 2*MaxBatchSize),
+		buffer: make([]T, 0, 2*o.maxBatchSize),
 	}
 }
 
@@ -173,12 +281,26 @@ func buildUpdateClause(updateColumns []string) string {
 // is refreshed from the row that would have been inserted. Use this for
 // tables that receive repeated snapshots of the same logical row (e.g.
 // statusengine_hoststatus/statusengine_servicestatus, keyed on hostname).
-func NewUpsertBulkInserter[T any](db *sql.DB, table string, columns []string, updateColumns []string, toRow RowFunc[T]) *BulkInserter[T] {
-	b := NewBulkInserter(db, table, columns, toRow)
+func NewUpsertBulkInserter[T any](db *sql.DB, table string, columns []string, updateColumns []string, toRow RowFunc[T], opts ...Option) *BulkInserter[T] {
+	b := NewBulkInserter(db, table, columns, toRow, opts...)
 	b.updateColumns = updateColumns
 	b.updateClause = buildUpdateClause(updateColumns)
 	return b
 }
+
+// MaxBatchSize reports how many buffered rows trigger an immediate flush for
+// this inserter. Exposed so callers that build inserters in bulk - NewRouter -
+// can be tested for actually passing the configured size on, rather than
+// accepting it and silently keeping the default.
+func (b *BulkInserter[T]) MaxBatchSize() int { return b.maxBatchSize }
+
+// ColumnCount reports how many columns each row of this inserter carries.
+// Exposed alongside MaxBatchSize so a caller that builds many inserters can
+// check the placeholder arithmetic of MaxConfigurableBatchSize against its
+// own tables, independently of the guard in NewBulkInserter - a test that
+// only asserted the guard stayed quiet would pass just as happily with a
+// guard that was wrong.
+func (b *BulkInserter[T]) ColumnCount() int { return len(b.columns) }
 
 // Enqueue hands an item to the inserter's buffer, blocking only until
 // either it is accepted or ctx is cancelled.
@@ -218,7 +340,7 @@ func (b *BulkInserter[T]) Flush(ctx context.Context) error {
 // core-restart hoststatus/servicestatus TRUNCATE/DELETE cleanup - without
 // racing an in-flight bulk INSERT and risking a lock-wait/deadlock against
 // MySQL. Items can still be Enqueued while paused (they just buffer in the
-// input channel up to MaxBatchSize), so ingestion is never blocked, only
+// input channel up to the batch size), so ingestion is never blocked, only
 // briefly delayed.
 func (b *BulkInserter[T]) WithPaused(ctx context.Context, fn func(ctx context.Context) error) error {
 	if err := b.Flush(ctx); err != nil {
@@ -272,7 +394,7 @@ func (b *BulkInserter[T]) Run(ctx context.Context) {
 				return
 			}
 			b.buffer = append(b.buffer, item)
-			if len(b.buffer) >= MaxBatchSize {
+			if len(b.buffer) >= b.maxBatchSize {
 				b.flushBuffer(ctx)
 				ticker.Reset(FlushInterval)
 			}
@@ -314,10 +436,12 @@ func (b *BulkInserter[T]) Run(ctx context.Context) {
 // buffer into b.buffer without blocking, so a shutdown racing with an
 // in-flight Enqueue never silently loses that item.
 //
-// This deliberately appends past MaxBatchSize - CLAUDE.md rule 3 governs
+// This deliberately appends past maxBatchSize - CLAUDE.md rule 3 governs
 // when a flush is triggered, not how large a single rescued batch may be.
 // The overshoot is bounded by b.in's own capacity, so b.buffer peaks just
-// under 2*MaxBatchSize, which is what NewBulkInserter sizes it for.
+// under 2*maxBatchSize, which is what NewBulkInserter sizes it for. That
+// overshoot is why MaxConfigurableBatchSize is capped where it is - see
+// there.
 func (b *BulkInserter[T]) drainPending() {
 	for {
 		select {
@@ -346,7 +470,7 @@ func (b *BulkInserter[T]) finalFlush() {
 // second of those, not a side effect.
 //
 // Every flush is logged exactly once, at most every FlushInterval (or
-// MaxBatchSize rows) - never per row - so structured logging never adds
+// a full batch of rows) - never per row - so structured logging never adds
 // per-message overhead to the hot ingestion path (CLAUDE.md rule 2).
 func (b *BulkInserter[T]) flushBuffer(ctx context.Context) error {
 	if len(b.buffer) == 0 {
@@ -600,7 +724,7 @@ func (b *BulkInserter[T]) buildInsert(items []T) (string, []any) {
 	columnList := strings.Join(b.columns, ", ")
 
 	// Size the builder up front. Growing a strings.Builder reallocates and
-	// copies everything written so far, and at MaxBatchSize rows of a wide
+	// copies everything written so far, and at a full batch of rows of a wide
 	// table (statusengine_hoststatus has 40 columns) that is several
 	// doublings per flush, every flush.
 	var query strings.Builder

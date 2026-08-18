@@ -223,13 +223,20 @@ var (
 
 	// DBBatchSizeAtFlush observes how many rows each flush actually
 	// contained, to see whether flushes are mostly triggered by the
-	// 100-item batch size or the 250ms ticker (CLAUDE.md rule 3).
+	// configured batch size or the 250ms ticker (CLAUDE.md rule 3).
+	//
+	// The buckets have to span the whole configurable range, not just the
+	// default of 100: once -mysql-batch-size is raised, buckets that stop
+	// at 100 put every flush in +Inf and the saturation signal is gone
+	// exactly when it starts to matter. 700 is db.MaxConfigurableBatchSize,
+	// the largest a normal flush can be; 1400 covers the drain flush on
+	// shutdown, which deliberately overshoots to just under twice that.
 	DBBatchSizeAtFlush = promauto.NewHistogram(prometheus.HistogramOpts{
 		Namespace: "statusengine",
 		Subsystem: "db",
 		Name:      "batch_size_at_flush",
 		Help:      "Number of rows contained in each bulk-insert flush.",
-		Buckets:   []float64{1, 5, 10, 25, 50, 75, 100},
+		Buckets:   []float64{1, 5, 10, 25, 50, 100, 250, 500, 700, 1400},
 	})
 
 	// WebsocketClientsActive tracks currently connected WebSocket clients.
