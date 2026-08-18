@@ -54,8 +54,8 @@ type Handler func(ctx context.Context, payload []byte) error
 // (i.e. saturated), and go_goroutines, which promhttp's default registry
 // exports on its own, shows whether work is accumulating in-process.
 func observeHandler(ctx context.Context, queueName string, handle Handler, payload []byte) error {
-	metrics.QueueJobsInFlight.Inc()
-	defer metrics.QueueJobsInFlight.Dec()
+	metrics.QueueJobsInFlight.WithLabelValues(queueName).Inc()
+	defer metrics.QueueJobsInFlight.WithLabelValues(queueName).Dec()
 
 	// Normalize before anything parses this. Done here rather than in
 	// each of the twelve decode functions because both Consumers funnel

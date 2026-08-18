@@ -967,7 +967,7 @@ paths:
         | `statusengine_queue_messages_received_total` | counter | `queue_name` | Raw messages received per queue, regardless of backend (Gearman/RabbitMQ). |
         | `statusengine_queue_payloads_repaired_total` | counter | `queue_name` | Payloads that were not valid UTF-8 and had their invalid bytes reinterpreted as Windows-1252 before decoding. Non-zero means a monitoring host is emitting non-UTF-8 plugin output. |
         | `statusengine_queue_events_discarded_stale_total` | counter | `queue_name` | Status events dropped for being older than `status_max_age` (default 5m), before reaching MySQL or any WebSocket client. Only `statusngin_hoststatus` and `statusngin_servicestatus` ever appear here - they carry superseded snapshots, every other queue carries history. A burst after a restart is the feature working; a value that keeps climbing while the worker is up means the monitoring core's clock and this worker's disagree, and both queues are being discarded wholesale. |
-        | `statusengine_queue_jobs_in_flight` | gauge | - | Messages currently being handled, across all queues. |
+        | `statusengine_queue_jobs_in_flight` | gauge | `queue_name` | Messages currently being handled, per queue. Labeled because each queue has its own Gearman connection and its own concurrency budget: a queue pinned at `-gearman-max-concurrent-jobs-per-queue` is that queue falling behind, which an unlabeled total cannot distinguish from twelve queues sharing the load. `sum()` without the label gives the old process-wide number. |
         | `statusengine_queue_handler_duration_seconds` | histogram | `queue_name` | Time to handle one message end to end: decode, WebSocket publish and enqueueing every decoded item for insertion. |
         | `statusengine_db_events_written_total` | counter | `table` | Rows successfully persisted per destination table. |
         | `statusengine_db_batch_flush_duration_seconds` | histogram | - | Duration of each bulk-insert flush to MySQL. |
@@ -1002,12 +1002,15 @@ paths:
 
         ### Is the worker keeping up?
 
-        Three of these answer that together. `queue_jobs_in_flight` sitting
-        at the consumer's concurrency cap (`-gearman-max-concurrent-jobs`,
-        default 64, or `-rabbitmq-prefetch` per queue) means the broker is
-        feeding faster than the pipeline drains - which is working as
-        intended, since the surplus then waits at the broker rather than
-        accumulating in this process. `queue_handler_duration_seconds`
+        Three of these answer that together. `queue_jobs_in_flight` for a
+        given `queue_name` sitting at the consumer's concurrency cap
+        (`-gearman-max-concurrent-jobs-per-queue`, default 8, or
+        `-rabbitmq-prefetch`, default 100 - both per queue) means the
+        broker is feeding that queue faster than the pipeline drains -
+        which is working as intended, since the surplus then waits at the
+        broker rather than accumulating in this process. Read it per queue:
+        one queue at its cap while the others sit near zero is normal
+        under a backlog, and no longer means the other queues are blocked. `queue_handler_duration_seconds`
         shows where that time goes: a handler blocks in the bulk-insert
         buffer once it is full, so this is where MySQL backpressure becomes
         visible from the ingestion side. `db_batch_size_at_flush` pinned at
@@ -1030,9 +1033,10 @@ paths:
                 # HELP statusengine_queue_messages_received_total Total number of messages received per queue.
                 # TYPE statusengine_queue_messages_received_total counter
                 statusengine_queue_messages_received_total{queue_name="statusngin_hoststatus"} 1042
-                # HELP statusengine_queue_jobs_in_flight Number of queue messages currently being handled.
+                # HELP statusengine_queue_jobs_in_flight Number of queue messages currently being handled, per queue.
                 # TYPE statusengine_queue_jobs_in_flight gauge
-                statusengine_queue_jobs_in_flight 0
+                statusengine_queue_jobs_in_flight{queue_name="statusngin_hoststatus"} 0
+                statusengine_queue_jobs_in_flight{queue_name="statusngin_servicestatus"} 3
                 # HELP statusengine_queue_handler_duration_seconds Duration of handling one message, per queue.
                 # TYPE statusengine_queue_handler_duration_seconds histogram
                 statusengine_queue_handler_duration_seconds_bucket{queue_name="statusngin_hoststatus",le="0.01"} 2

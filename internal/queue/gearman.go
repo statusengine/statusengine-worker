@@ -27,19 +27,42 @@ const outboundBufferSize = 256
 const statsLogInterval = 30 * time.Second
 
 // GearmanConsumer implements queue.Consumer against a Gearman job server.
-// It registers one worker function per queue name present in its Router;
-// each job's payload is decoded and dispatched by the matching Handler.
+// It opens one connection per queue name present in its Router, each
+// registering exactly that one function; each job's payload is decoded and
+// dispatched by the matching Handler.
+//
+// One connection per queue rather than one carrying all twelve functions,
+// because the concurrency cap is otherwise a single budget that whichever
+// queue has a backlog holds entirely. The library's Work loop is one
+// goroutine ranging over one channel fed by every agent, and handleInPack
+// sends to worker.limit from inside it (worker.go:198); that send blocks
+// once the cap is reached, and while it blocks the loop reads nothing
+// further from any agent, for any function. Since a Handler blocks in
+// Enqueue for as long as MySQL needs (CLAUDE.md rule 3), a status backlog
+// parks every slot on MySQL's write rate - and notifications, downtimes
+// and core restarts are then not merely slow, they are not looked at at
+// all. That is a liveness problem, not a throughput one.
+//
+// Splitting the connections gives each queue its own Work loop and its own
+// budget, which is what makes the fix independent of the server: the Go
+// client only ever sends GRAB_JOB_UNIQ, so *which* queue it is offered is
+// gearmand's decision, and gearmand's --round-robin (off by default) would
+// only spread the shared budget around rather than remove the coupling.
+// This is also what the legacy PHP worker achieves by forking one client
+// per queue, and what the RabbitMQ consumer here already does with one
+// channel and one consumeLoop per queue.
 type GearmanConsumer struct {
 	addr   string
 	router Router
 
-	// maxConcurrentJobs caps how many job handlers may run at once. See
-	// NewGearmanConsumer for why this must never be gearman.Unlimited.
-	maxConcurrentJobs int
+	// maxConcurrentJobsPerQueue caps how many job handlers may run at once
+	// *for one queue*. See NewGearmanConsumer for why this must never be
+	// gearman.Unlimited.
+	maxConcurrentJobsPerQueue int
 
-	mu     sync.Mutex
-	worker *gearman.Worker
-	out    chan Message
+	mu      sync.Mutex
+	workers []*gearman.Worker
+	out     chan Message
 
 	stopOnce  sync.Once
 	statsDone chan struct{}
@@ -66,7 +89,9 @@ type GearmanConsumer struct {
 
 // NewGearmanConsumer creates a consumer that will connect to the Gearman
 // job server at addr (host:port) and handle every queue name in router,
-// running at most maxConcurrentJobs handlers at a time.
+// running at most maxConcurrentJobsPerQueue handlers at a time *per
+// queue* - so the worst case across the whole process is that number
+// times len(router).
 //
 // That cap is not a throughput knob, it is what keeps a backlog at the
 // job server instead of inside this process. The library dispatches every
@@ -79,90 +104,94 @@ type GearmanConsumer struct {
 // process runs out of memory. The worst moment for that is exactly the
 // one that produces the largest backlog: restarting after an outage.
 //
-// With a cap, the library's Work loop blocks handing out the next job
-// once the cap is reached, stops reading its socket, and the backpressure
+// With a cap, that queue's Work loop blocks handing out the next job once
+// the cap is reached, stops reading its socket, and the backpressure
 // reaches gearmand over TCP. The backlog then waits where it survives a
 // worker restart and is visible via `gearadmin --status`.
 //
-// maxConcurrentJobs must be >= 1: gearman.Unlimited is 0, so passing zero
-// would silently restore the unbounded behaviour this exists to prevent.
-func NewGearmanConsumer(addr string, router Router, maxConcurrentJobs int) *GearmanConsumer {
+// Per queue rather than shared: a shared budget is a budget one backlogged
+// queue takes all of, which starves every other queue outright - see the
+// type comment and TestOneQueueCannotConsumeTheWholeJobBudget. A per-queue
+// cap costs nothing for an idle queue, since a cap only binds when there
+// is traffic to bind.
+//
+// maxConcurrentJobsPerQueue must be >= 1: gearman.Unlimited is 0, so
+// passing zero would silently restore the unbounded behaviour this exists
+// to prevent.
+func NewGearmanConsumer(addr string, router Router, maxConcurrentJobsPerQueue int) *GearmanConsumer {
 	return &GearmanConsumer{
-		addr:              addr,
-		router:            router,
-		maxConcurrentJobs: maxConcurrentJobs,
-		statsDone:         make(chan struct{}),
+		addr:                      addr,
+		router:                    router,
+		maxConcurrentJobsPerQueue: maxConcurrentJobsPerQueue,
+		statsDone:                 make(chan struct{}),
 	}
 }
 
-// Start connects to the Gearman job server, registers a worker function
-// for every queue in the Router and begins processing jobs. It returns a
-// channel carrying a copy of every raw message received, for observability
-// - the actual decode/persist/broadcast work happens inside the Router's
-// Handlers, invoked synchronously as each job arrives.
+// Start connects to the Gearman job server - once per queue in the Router,
+// each connection registering only that queue's function - and begins
+// processing jobs. It returns a channel carrying a copy of every raw
+// message received, for observability; the actual decode/persist/broadcast
+// work happens inside the Router's Handlers, invoked synchronously as each
+// job arrives.
 func (c *GearmanConsumer) Start(ctx context.Context) (<-chan Message, error) {
-	// Not gearman.Unlimited - see NewGearmanConsumer. Note the library
-	// buffers limit-1 tokens (worker.go's New) and sends one only after
-	// spawning the job's goroutine, so New(n) permits exactly n
-	// concurrent handlers and New(1) serializes them. That is correct as
-	// written; it only looks like an off-by-one.
-	w := gearman.New(c.maxConcurrentJobs)
-	if err := w.AddServer(gearman.Network, c.addr); err != nil {
-		return nil, fmt.Errorf("gearman: connect to %s: %w", c.addr, err)
-	}
-	w.ErrorHandler = func(err error) {
-		slog.Warn("gearman: worker error", "error", err)
+	// Rejected rather than tolerated: the connections are opened inside
+	// the per-queue loop below, so an empty Router would mean Start
+	// returning success having connected to nothing and consuming nothing
+	// forever. Back when a single connection was opened before the loop,
+	// that case at least failed on an unreachable server; now it would
+	// not, and a misconfiguration that leaves the Router empty is exactly
+	// the kind that must not look healthy.
+	if len(c.router) == 0 {
+		return nil, errors.New("gearman: no queues to consume, the Router is empty")
 	}
 
 	out := make(chan Message, outboundBufferSize)
+	workers := make([]*gearman.Worker, 0, len(c.router))
 
-	for queueName, handle := range c.router {
-		queueName, handle := queueName, handle // capture per-iteration values for the closure
-		err := w.AddFunc(queueName, func(job gearman.Job) ([]byte, error) {
-			if !c.beginHandler() {
-				// Stop already ran: out may be closed, so this handler
-				// must not touch it. Report the job as failed rather than
-				// silently succeeding - it was genuinely not processed.
-				return nil, errConsumerStopped
-			}
-			defer c.handlerWG.Done()
-
-			payload := job.Data()
-			metrics.QueueMessagesReceivedTotal.WithLabelValues(queueName).Inc()
-
-			select {
-			case out <- Message{Queue: queueName, Payload: payload}:
-			default:
-				// Raw-message observation is best-effort; never block job
-				// processing on a slow/absent reader.
-			}
-
-			if err := observeHandler(ctx, queueName, handle, payload); err != nil {
-				c.errors.Add(1)
-				metrics.PipelineErrorsTotal.WithLabelValues(metrics.ComponentQueue).Inc()
-				slog.Warn("gearman: handler failed", "queue", queueName, "error", err)
-				return nil, err
-			}
-			c.processed.Add(1)
-			return nil, nil
-		}, 0)
-		if err != nil {
+	// Anything that fails partway through leaves the connections opened so
+	// far with nobody to close them, so unwind before returning.
+	fail := func(err error) (<-chan Message, error) {
+		for _, w := range workers {
 			w.Close()
-			return nil, fmt.Errorf("gearman: register function %q: %w", queueName, err)
 		}
+		return nil, err
 	}
 
-	if err := w.Ready(); err != nil {
-		w.Close()
-		return nil, fmt.Errorf("gearman: ready: %w", err)
+	for queueName, handle := range c.router {
+		// Not gearman.Unlimited - see NewGearmanConsumer. Note the library
+		// buffers limit-1 tokens (worker.go's New) and sends one only after
+		// spawning the job's goroutine, so New(n) permits exactly n
+		// concurrent handlers and New(1) serializes them. That is correct
+		// as written; it only looks like an off-by-one.
+		w := gearman.New(c.maxConcurrentJobsPerQueue)
+		if err := w.AddServer(gearman.Network, c.addr); err != nil {
+			return fail(fmt.Errorf("gearman: connect to %s for %q: %w", c.addr, queueName, err))
+		}
+		w.ErrorHandler = func(err error) {
+			slog.Warn("gearman: worker error", "queue", queueName, "error", err)
+		}
+
+		// Exactly one function per worker: that is the whole point of the
+		// split (see the type comment). Registering a second here would
+		// silently restore the shared budget for those two queues.
+		if err := w.AddFunc(queueName, c.jobHandler(ctx, queueName, handle, out), 0); err != nil {
+			return fail(fmt.Errorf("gearman: register function %q: %w", queueName, err))
+		}
+		if err := w.Ready(); err != nil {
+			return fail(fmt.Errorf("gearman: ready for %q: %w", queueName, err))
+		}
+
+		workers = append(workers, w)
 	}
 
 	c.mu.Lock()
-	c.worker = w
+	c.workers = workers
 	c.out = out
 	c.mu.Unlock()
 
-	go w.Work()
+	for _, w := range workers {
+		go w.Work()
+	}
 	go c.logStatsPeriodically(ctx)
 
 	go func() {
@@ -170,9 +199,67 @@ func (c *GearmanConsumer) Start(ctx context.Context) (<-chan Message, error) {
 		c.Stop()
 	}()
 
-	slog.Info("gearman: consumer started", "addr", c.addr, "queues", len(c.router))
+	slog.Info("gearman: consumer started",
+		"addr", c.addr, "queues", len(c.router),
+		"max_concurrent_jobs_per_queue", c.maxConcurrentJobsPerQueue)
 
 	return out, nil
+}
+
+// jobHandler builds the gearman.JobHandler for one queue. Extracted from
+// Start only so the per-queue setup loop above stays readable; it closes
+// over nothing that differs between workers except queueName and handle.
+func (c *GearmanConsumer) jobHandler(ctx context.Context, queueName string, handle Handler, out chan Message) gearman.JobFunc {
+	return func(job gearman.Job) ([]byte, error) {
+		if !c.beginHandler() {
+			// Stop already ran: out may be closed, so this handler must
+			// not touch it. Report the job as failed rather than silently
+			// succeeding - it was genuinely not processed.
+			return nil, errConsumerStopped
+		}
+		defer c.handlerWG.Done()
+
+		payload := job.Data()
+		metrics.QueueMessagesReceivedTotal.WithLabelValues(queueName).Inc()
+
+		select {
+		case out <- Message{Queue: queueName, Payload: payload}:
+		default:
+			// Raw-message observation is best-effort; never block job
+			// processing on a slow/absent reader.
+		}
+
+		if err := observeHandler(ctx, queueName, handle, payload); err != nil {
+			c.errors.Add(1)
+			metrics.PipelineErrorsTotal.WithLabelValues(metrics.ComponentQueue).Inc()
+			slog.Warn("gearman: handler failed", "queue", queueName, "error", err)
+			return nil, err
+		}
+		c.processed.Add(1)
+		return nil, nil
+	}
+}
+
+// closeWorkers shuts every per-queue connection down at the same time,
+// which is the whole reason it is a function rather than a loop body.
+//
+// Close drains the jobs already running on that worker before dropping
+// its connections, bounded by the fork's DrainTimeout (30s) - see Stop for
+// why that draining exists. One queue at a time would therefore make the
+// worst case len(workers) * DrainTimeout, turning a bounded shutdown into
+// a six-minute hang the moment more than one queue has a stuck handler.
+// Each Close is independent and touches only its own worker, so there is
+// nothing to serialize. TestCloseWorkersDrainsInParallel measures it.
+func closeWorkers(workers []*gearman.Worker) {
+	var closing sync.WaitGroup
+	for _, w := range workers {
+		closing.Add(1)
+		go func(w *gearman.Worker) {
+			defer closing.Done()
+			w.Close() // stops this queue's Work() and further job dispatch
+		}(w)
+	}
+	closing.Wait()
 }
 
 // errConsumerStopped is returned to the Gearman job server for a job that
@@ -215,11 +302,11 @@ func (c *GearmanConsumer) logStatsPeriodically(ctx context.Context) {
 	}
 }
 
-// Stop disconnects from the job server and closes the channel returned by
-// Start. It waits for any job handler already in flight to finish first,
-// so the output channel is never closed while a send to it might still be
-// in progress. Safe to call multiple times and safe to call without a
-// prior Start.
+// Stop disconnects every per-queue connection and closes the channel
+// returned by Start. It waits for any job handler already in flight to
+// finish first, so the output channel is never closed while a send to it
+// might still be in progress. Safe to call multiple times and safe to call
+// without a prior Start.
 //
 // Three upstream defects made this unsafe; all are fixed in the patched
 // fork this module points at (see go.mod's replace directive).
@@ -261,14 +348,14 @@ func (c *GearmanConsumer) Stop() error {
 		close(c.statsDone)
 
 		c.mu.Lock()
-		w, out := c.worker, c.out
+		workers, out := c.workers, c.out
 		c.mu.Unlock()
 
-		if w == nil {
+		if len(workers) == 0 {
 			return
 		}
 
-		w.Close() // stops Work() and further job dispatch
+		closeWorkers(workers)
 
 		// Close the gate before waiting: after this write lock is
 		// released, beginHandler can only ever return false, so the

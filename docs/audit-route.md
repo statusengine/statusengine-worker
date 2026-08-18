@@ -181,10 +181,14 @@ Bei laufendem Betrieb mit Gearman-Backend und einem verbundenen Dashboard:
 | `readPump`/`writePump` | 2 pro Client | `client.go:133` | Verbindungsende |
 
 Die Job-Handler sind der einzige unbegrenzt wachsende Posten — und genau
-deshalb gedeckelt. `-gearman-max-concurrent-jobs` (Default 64) ist kein
-Durchsatzregler, sondern der Schutz gegen unbegrenzten Speicherverbrauch beim
-Neustart nach einem Ausfall. Die Begründung steht ausführlich über
-`NewGearmanConsumer` in `gearman.go:67`.
+deshalb gedeckelt. `-gearman-max-concurrent-jobs-per-queue` (Default 8) ist
+kein Durchsatzregler, sondern der Schutz gegen unbegrenzten Speicherverbrauch
+beim Neustart nach einem Ausfall. Der Cap gilt **pro Queue**, weil jede Queue
+eine eigene Gearman-Verbindung mit eigener `Work`-Schleife hat; ein
+gemeinsames Budget wäre eines, das eine Queue mit Rückstand vollständig
+belegt, womit keine andere Queue mehr bedient würde. Prozessweit ist der
+schlimmste Fall also Cap × Anzahl Queues. Die Begründung steht ausführlich
+über `NewGearmanConsumer` und am `GearmanConsumer`-Typ in `gearman.go`.
 
 ### Die Kanäle
 
@@ -405,9 +409,13 @@ teuer wäre:
 - [ ] **`-mysql-max-open-conns` ≥ Anzahl Runner**, sonst serialisiert der Pool
       den Shutdown-Flush innerhalb des 10s-Budgets. Default 25 gegen 15 Runner
       passt; bei mehr Queues mitwachsen lassen.
-- [ ] **`-gearman-max-concurrent-jobs` ist nie 0.** `gearman.Unlimited` *ist*
-      0, ein versehentliches Nullen stellt genau das unbegrenzte Verhalten
-      wieder her, das der Cap verhindern soll.
+- [ ] **`-gearman-max-concurrent-jobs-per-queue` ist nie 0.**
+      `gearman.Unlimited` *ist* 0, ein versehentliches Nullen stellt genau
+      das unbegrenzte Verhalten wieder her, das der Cap verhindern soll.
+- [ ] **Der alte Schlüssel `gearman_max_concurrent_jobs` steht nicht mehr in
+      der `config.yml`.** Der Worker startet sonst gar nicht — bewusst: der
+      Cap gilt jetzt pro Queue, der alte Wert würde sich mit der Anzahl der
+      Queues multiplizieren.
 - [ ] **API-Keys sind gesetzt.** Ohne Konfiguration erzeugt `resolveAPIKeys`
       einen Zufallsschlüssel pro Start und loggt ihn als Warnung — der Stream
       ist nie offen, aber nach jedem Neustart anders.

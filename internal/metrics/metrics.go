@@ -55,6 +55,7 @@ func InitQueue(queueName string) {
 	QueueMessagesReceivedTotal.WithLabelValues(queueName)
 	QueuePayloadsRepairedTotal.WithLabelValues(queueName)
 	QueueHandlerDurationSeconds.WithLabelValues(queueName)
+	QueueJobsInFlight.WithLabelValues(queueName)
 }
 
 // InitStaleDiscards pre-creates the per-queue series on
@@ -110,17 +111,29 @@ var (
 	}, []string{"queue_name"})
 
 	// QueueJobsInFlight tracks how many queue messages are being handled
-	// right now, across every queue. It is the metric that shows whether
-	// the consumer's concurrency cap (-gearman-max-concurrent-jobs) is
-	// actually being hit: sitting at the cap means the broker is feeding
-	// faster than the pipeline drains, and the backlog is being held at
-	// the broker rather than piling up in this process.
-	QueueJobsInFlight = promauto.NewGauge(prometheus.GaugeOpts{
+	// right now, per queue. It is the metric that shows whether the
+	// consumer's concurrency cap (-gearman-max-concurrent-jobs-per-queue)
+	// is actually being hit: a queue sitting at the cap means the broker
+	// is feeding it faster than the pipeline drains, and its backlog is
+	// being held at the broker rather than piling up in this process.
+	//
+	// Labeled by queue because the Gearman consumer opens one connection
+	// per queue with a budget of its own (see queue.GearmanConsumer): the
+	// useful question is no longer "is the worker saturated" but "which
+	// queue is", and an unlabeled total cannot answer it - a sum of 64
+	// looks identical whether it is one queue starving the rest or twelve
+	// queues sharing the load evenly. sum(queue_jobs_in_flight) still
+	// gives the old process-wide number.
+	//
+	// Bounded by the number of queue names the Router registers, a
+	// compile-time constant set, so this label can never grow without
+	// limit. Pre-created at zero for all of them by InitQueue.
+	QueueJobsInFlight = promauto.NewGaugeVec(prometheus.GaugeOpts{
 		Namespace: "statusengine",
 		Subsystem: "queue",
 		Name:      "jobs_in_flight",
-		Help:      "Number of queue messages currently being handled.",
-	})
+		Help:      "Number of queue messages currently being handled, per queue.",
+	}, []string{"queue_name"})
 
 	// QueuePayloadsRepairedTotal counts payloads that were not valid
 	// UTF-8 and had their invalid bytes reinterpreted as Windows-1252

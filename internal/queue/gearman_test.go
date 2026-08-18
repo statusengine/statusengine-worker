@@ -107,10 +107,33 @@ func TestGearmanConsumerStopWithoutStartIsSafe(t *testing.T) {
 }
 
 func TestGearmanConsumerStartFailsFastWhenUnreachable(t *testing.T) {
-	c := NewGearmanConsumer("127.0.0.1:1", Router{}, 64) // port 1: nothing listens
+	// A non-empty Router, because the connections are opened per queue:
+	// with an empty one there is nothing to connect to and this would be
+	// testing the empty-Router guard instead (see the test below).
+	router := Router{"queue_pkg_test_unreachable": func(context.Context, []byte) error { return nil }}
+	c := NewGearmanConsumer("127.0.0.1:1", router, 64) // port 1: nothing listens
 	ctx, cancel := context.WithTimeout(context.Background(), 3*time.Second)
 	defer cancel()
 	if _, err := c.Start(ctx); err == nil {
 		t.Fatal("expected Start to fail against an unreachable job server")
+	}
+}
+
+// TestGearmanConsumerStartRejectsAnEmptyRouter guards the one case the
+// per-queue split could otherwise turn into a silent no-op: the
+// connections are opened inside the per-queue loop, so with no queues
+// Start would connect to nothing, consume nothing, and report success.
+func TestGearmanConsumerStartRejectsAnEmptyRouter(t *testing.T) {
+	c := NewGearmanConsumer(gearmanAddr, Router{}, 64)
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+
+	out, err := c.Start(ctx)
+	if err == nil {
+		c.Stop()
+		t.Fatal("expected Start to reject an empty Router instead of consuming nothing")
+	}
+	if out != nil {
+		t.Fatal("expected no output channel alongside the error")
 	}
 }

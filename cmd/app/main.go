@@ -38,27 +38,27 @@ import (
 // hardcoded default below applies. Defaults match the local dev setup
 // documented in .claude/specs/ressources.txt.
 type config struct {
-	configFile                string // path to an optional YAML config file - see config.example.yaml
-	consumerBackend           string // "gearman" or "rabbitmq"
-	gearmanAddr               string
-	gearmanMaxConcurrentJobs  int // cap on simultaneously running Gearman job handlers
-	rabbitMQURL               string
-	rabbitMQPrefetch          int // unacknowledged deliveries the broker may push per queue
-	mysqlDSN                  string
-	mysqlMaxOpenConns         int // upper bound on simultaneously open MySQL connections; also used as the idle limit
-	mysqlBatchSize            int // rows buffered before a bulk INSERT is flushed ahead of the 250ms ticker
-	graphiteBatchSize         int // metrics buffered before a Carbon write is flushed ahead of the 250ms ticker
-	listenAddr                string
-	metricsListenAddr         string
-	graphiteAddr              string
-	graphitePrefix            string // prepended to every Graphite path, e.g. "statusengine.<host>.<service>.<metric>"
-	perfdataRoute             string // "mysql", "graphite" or "both"
-	nodeName                  string // written into hoststatus/servicestatus rows' node_name column
-	apiKeys                   string // comma-separated; empty disables /ws authentication entirely
-	enableOpenITCockpitTweaks bool   // selects the core-restart hoststatus/servicestatus cleanup query
-	statusMaxAge              string // max age of a hoststatus/servicestatus event before it is discarded; "0" disables
-	logLevel                  string // "debug", "info", "warn" or "error"
-	logFormat                 string // "text" or "json"
+	configFile                       string // path to an optional YAML config file - see config.example.yaml
+	consumerBackend                  string // "gearman" or "rabbitmq"
+	gearmanAddr                      string
+	gearmanMaxConcurrentJobsPerQueue int // cap on simultaneously running Gearman job handlers, per queue
+	rabbitMQURL                      string
+	rabbitMQPrefetch                 int // unacknowledged deliveries the broker may push per queue
+	mysqlDSN                         string
+	mysqlMaxOpenConns                int // upper bound on simultaneously open MySQL connections; also used as the idle limit
+	mysqlBatchSize                   int // rows buffered before a bulk INSERT is flushed ahead of the 250ms ticker
+	graphiteBatchSize                int // metrics buffered before a Carbon write is flushed ahead of the 250ms ticker
+	listenAddr                       string
+	metricsListenAddr                string
+	graphiteAddr                     string
+	graphitePrefix                   string // prepended to every Graphite path, e.g. "statusengine.<host>.<service>.<metric>"
+	perfdataRoute                    string // "mysql", "graphite" or "both"
+	nodeName                         string // written into hoststatus/servicestatus rows' node_name column
+	apiKeys                          string // comma-separated; empty disables /ws authentication entirely
+	enableOpenITCockpitTweaks        bool   // selects the core-restart hoststatus/servicestatus cleanup query
+	statusMaxAge                     string // max age of a hoststatus/servicestatus event before it is discarded; "0" disables
+	logLevel                         string // "debug", "info", "warn" or "error"
+	logFormat                        string // "text" or "json"
 }
 
 // fileConfig mirrors config's fields for -config's optional YAML file (see
@@ -71,9 +71,17 @@ type config struct {
 // "the file didn't mention this key" apart from "the file explicitly set
 // it to false".
 type fileConfig struct {
-	Consumer                  string   `yaml:"consumer"`
-	GearmanAddr               string   `yaml:"gearman_addr"`
-	GearmanMaxConcurrentJobs  int      `yaml:"gearman_max_concurrent_jobs"`
+	Consumer                         string `yaml:"consumer"`
+	GearmanAddr                      string `yaml:"gearman_addr"`
+	GearmanMaxConcurrentJobsPerQueue int    `yaml:"gearman_max_concurrent_jobs_per_queue"`
+
+	// GearmanMaxConcurrentJobs is the retired name of the key above, kept
+	// only so a config carrying it is rejected instead of silently
+	// misread. It used to be a budget shared by every queue; it is now a
+	// per-queue one, so an existing 64 would mean 64 times the number of
+	// queues - the unbounded-memory situation the cap exists to prevent.
+	// A pointer, so "absent" is distinguishable from an explicit 0.
+	GearmanMaxConcurrentJobs  *int     `yaml:"gearman_max_concurrent_jobs"`
 	RabbitMQURL               string   `yaml:"rabbitmq_url"`
 	RabbitMQPrefetch          int      `yaml:"rabbitmq_prefetch"`
 	MySQLDSN                  string   `yaml:"mysql_dsn"`
@@ -148,6 +156,48 @@ func resolveInt(explicit map[string]bool, flagName string, flagVal int, envKey s
 	return flagVal
 }
 
+// rejectRetiredConcurrencyKey stops the worker if the old
+// gearman_max_concurrent_jobs setting is still present, in the config file
+// or the environment.
+//
+// The setting was not merely renamed, its unit changed: it used to be a
+// budget shared by every queue, and it is now a per-queue one, because a
+// shared budget is one a backlogged queue takes all of - which stops every
+// other queue from being served at all (see queue.GearmanConsumer).
+// Carrying the old value forward would therefore multiply it by the number
+// of queues: an existing 64 would become 768 concurrent handlers, each
+// holding a decoded payload, which is the unbounded-memory situation the
+// cap exists to prevent.
+//
+// Failing loudly rather than mapping the value across, because there is no
+// mapping that is right: 64 shared and 64 per queue are different
+// intentions, and only the operator knows which one they meant. The
+// retired CLI flag needs no handling here - flag.Parse rejects an unknown
+// flag by itself; the file and the environment are the two paths that
+// would otherwise be silently ignored and fall back to the default.
+func rejectRetiredConcurrencyKey(fc fileConfig) {
+	const (
+		oldKey = "gearman_max_concurrent_jobs"
+		oldEnv = "STATUSENGINE_GEARMAN_MAX_CONCURRENT_JOBS"
+		newKey = "gearman_max_concurrent_jobs_per_queue"
+	)
+
+	if fc.GearmanMaxConcurrentJobs != nil {
+		fatal("retired config key "+oldKey,
+			"value", *fc.GearmanMaxConcurrentJobs,
+			"use", newKey,
+			"why", "the cap is now per queue, not shared across all queues - reusing the old "+
+				"value would multiply it by the number of queues")
+	}
+	if v, ok := os.LookupEnv(oldEnv); ok {
+		fatal("retired environment variable "+oldEnv,
+			"value", v,
+			"use", "STATUSENGINE_GEARMAN_MAX_CONCURRENT_JOBS_PER_QUEUE",
+			"why", "the cap is now per queue, not shared across all queues - reusing the old "+
+				"value would multiply it by the number of queues")
+	}
+}
+
 // resolveBool is resolveString's counterpart for the one bool setting;
 // fileVal is a pointer so a key the file never mentioned (nil) is
 // distinguishable from one explicitly set to false.
@@ -176,9 +226,12 @@ func loadConfig() config {
 		`queue backend to use: "gearman" or "rabbitmq"`)
 	flag.StringVar(&cfg.gearmanAddr, "gearman-addr", "127.0.0.1:4730",
 		"Gearman job server address (host:port)")
-	flag.IntVar(&cfg.gearmanMaxConcurrentJobs, "gearman-max-concurrent-jobs", 64,
-		"maximum number of Gearman job handlers running at once; the cap that keeps a backlog "+
-			"queued at the job server instead of accumulating in this process")
+	flag.IntVar(&cfg.gearmanMaxConcurrentJobsPerQueue, "gearman-max-concurrent-jobs-per-queue", 8,
+		"maximum number of Gearman job handlers running at once *per queue*; the cap that keeps a "+
+			"backlog queued at the job server instead of accumulating in this process. Per queue, "+
+			"because a shared budget is one a backlogged queue takes all of, which stops every "+
+			"other queue from being served at all - so the process-wide worst case is this times "+
+			"the number of queues")
 	flag.StringVar(&cfg.rabbitMQURL, "rabbitmq-url", "amqp://statusengine:statusengine@127.0.0.1:5672/",
 		"RabbitMQ broker URL")
 	flag.IntVar(&cfg.rabbitMQPrefetch, "rabbitmq-prefetch", 100,
@@ -232,9 +285,11 @@ func loadConfig() config {
 		fc = loadFileConfig(cfg.configFile)
 	}
 
+	rejectRetiredConcurrencyKey(fc)
+
 	cfg.consumerBackend = resolveString(explicit, "consumer", cfg.consumerBackend, "STATUSENGINE_CONSUMER", fc.Consumer)
 	cfg.gearmanAddr = resolveString(explicit, "gearman-addr", cfg.gearmanAddr, "STATUSENGINE_GEARMAN_ADDR", fc.GearmanAddr)
-	cfg.gearmanMaxConcurrentJobs = resolveInt(explicit, "gearman-max-concurrent-jobs", cfg.gearmanMaxConcurrentJobs, "STATUSENGINE_GEARMAN_MAX_CONCURRENT_JOBS", fc.GearmanMaxConcurrentJobs)
+	cfg.gearmanMaxConcurrentJobsPerQueue = resolveInt(explicit, "gearman-max-concurrent-jobs-per-queue", cfg.gearmanMaxConcurrentJobsPerQueue, "STATUSENGINE_GEARMAN_MAX_CONCURRENT_JOBS_PER_QUEUE", fc.GearmanMaxConcurrentJobsPerQueue)
 	cfg.rabbitMQURL = resolveString(explicit, "rabbitmq-url", cfg.rabbitMQURL, "STATUSENGINE_RABBITMQ_URL", fc.RabbitMQURL)
 	cfg.rabbitMQPrefetch = resolveInt(explicit, "rabbitmq-prefetch", cfg.rabbitMQPrefetch, "STATUSENGINE_RABBITMQ_PREFETCH", fc.RabbitMQPrefetch)
 	cfg.mysqlDSN = resolveString(explicit, "mysql-dsn", cfg.mysqlDSN, "STATUSENGINE_MYSQL_DSN", fc.MySQLDSN)
@@ -259,8 +314,9 @@ func loadConfig() config {
 	// Both of these mean "unlimited" at zero in their respective
 	// libraries, which is exactly the unbounded behaviour they exist to
 	// prevent - so zero is rejected rather than passed through.
-	if cfg.gearmanMaxConcurrentJobs < 1 {
-		fatal("invalid -gearman-max-concurrent-jobs", "value", cfg.gearmanMaxConcurrentJobs, "want", "a positive number")
+	if cfg.gearmanMaxConcurrentJobsPerQueue < 1 {
+		fatal("invalid -gearman-max-concurrent-jobs-per-queue",
+			"value", cfg.gearmanMaxConcurrentJobsPerQueue, "want", "a positive number")
 	}
 	if cfg.rabbitMQPrefetch < 1 {
 		fatal("invalid -rabbitmq-prefetch", "value", cfg.rabbitMQPrefetch, "want", "a positive number")
@@ -661,7 +717,7 @@ func main() {
 	var consumer queue.Consumer
 	switch strings.ToLower(cfg.consumerBackend) {
 	case "gearman":
-		consumer = queue.NewGearmanConsumer(cfg.gearmanAddr, router, cfg.gearmanMaxConcurrentJobs)
+		consumer = queue.NewGearmanConsumer(cfg.gearmanAddr, router, cfg.gearmanMaxConcurrentJobsPerQueue)
 	case "rabbitmq":
 		consumer = queue.NewRabbitMQConsumer(cfg.rabbitMQURL, router, cfg.rabbitMQPrefetch)
 	default:

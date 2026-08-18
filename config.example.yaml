@@ -20,20 +20,33 @@ consumer: gearman
 # Gearman job server address (host:port). Only used when consumer: gearman.
 gearman_addr: 127.0.0.1:4730
 
-# Maximum number of Gearman job handlers running at once. This is not a
-# throughput knob: the library dispatches every assigned job on its own
-# goroutine and grabs the next without waiting, and a handler blocks on
-# MySQL once a bulk-insert buffer is full. Without a cap, a backlog
-# accumulates inside the worker (one goroutine plus a decoded payload per
-# job) instead of staying queued at the job server. Must be >= 1.
-gearman_max_concurrent_jobs: 64
+# Maximum number of Gearman job handlers running at once, PER QUEUE. This
+# is not a throughput knob: the library dispatches every assigned job on
+# its own goroutine and grabs the next without waiting, and a handler
+# blocks on MySQL once a bulk-insert buffer is full. Without a cap, a
+# backlog accumulates inside the worker (one goroutine plus a decoded
+# payload per job) instead of staying queued at the job server.
+#
+# Per queue, because the worker opens one Gearman connection per queue and
+# each has a Work loop of its own. A shared budget is a budget that one
+# backlogged queue takes all of - and since that loop stops reading its
+# socket once the budget is gone, every other queue stops being served
+# entirely, not merely slowly. The process-wide worst case is therefore
+# this value times the number of queues (12), so 8 here is 96 overall. An
+# idle queue costs nothing; a cap only binds when there is traffic.
+#
+# Must be >= 1. NOTE: this replaces the old `gearman_max_concurrent_jobs`,
+# which was a single budget shared by all queues. The worker refuses to
+# start if that key is still present rather than reinterpreting its value,
+# because carrying a 64 over would mean 768 concurrent handlers here.
+gearman_max_concurrent_jobs_per_queue: 8
 
 # RabbitMQ broker URL (amqp://user:pass@host:port/vhost). Only used when
 # consumer: rabbitmq.
 rabbitmq_url: amqp://statusengine:statusengine@127.0.0.1:5672/
 
 # Maximum unacknowledged deliveries the broker may push, per queue. The
-# RabbitMQ counterpart of gearman_max_concurrent_jobs: without it AMQP
+# RabbitMQ counterpart of gearman_max_concurrent_jobs_per_queue: without it AMQP
 # delivers as fast as it can and the whole backlog ends up buffered in
 # this process. Applies per queue, so the worst case in memory is this
 # value times the number of queues (currently 12). Must be >= 1.

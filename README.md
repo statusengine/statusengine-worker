@@ -125,7 +125,7 @@ Note that MySQL error **2006 ("MySQL server has gone away") never appears in Go*
 
 ### Waiting on an unreachable server is deliberate
 
-While MySQL is unreachable, the flush blocks — and so, in order, do the buffer's goroutine, `Enqueue`, and the queue handler. The consumer's concurrency cap (`-gearman-max-concurrent-jobs`, default 64) then fills, the worker stops taking jobs, and the surplus stays at the broker, where it survives a worker restart and is visible in `gearadmin --status`.
+While MySQL is unreachable, the flush blocks — and so, in order, do the buffer's goroutine, `Enqueue`, and the queue handler. That queue's concurrency cap (`-gearman-max-concurrent-jobs-per-queue`, default 8) then fills, the worker stops taking jobs **for that queue**, and the surplus stays at the broker, where it survives a worker restart and is visible in `gearadmin --status`. The cap is per queue rather than shared for exactly this reason — see [One connection per queue](#one-connection-per-queue).
 
 That is the point. A worker that kept accepting jobs and dropping batches would drain the queue into nowhere; measured against a five-second outage, that cost **29,400 of 150,000 events**. Holding instead turns the outage into catch-up time: the same test over a 16-second outage lost nothing.
 
@@ -200,6 +200,28 @@ The 700 ceiling is arithmetic, not taste. Every flush is sent as a server-side p
 
 Graphite gets a higher ceiling because Carbon's plaintext protocol has no equivalent limit; there the cap only bounds how many metrics a single failed write drops.
 
+## One connection per queue
+
+The Gearman consumer opens **one connection per queue**, each registering only that queue's function, rather than one connection carrying all twelve. That is not tidiness — a single connection lets one busy queue stop every other one.
+
+The library's `Work()` is a single goroutine ranging over a single channel fed by every connection, and it takes a slot from the concurrency budget from inside that loop. Once the budget is gone the send blocks, and while it blocks the loop reads nothing further — for any queue. Since a handler blocks in `Enqueue` for as long as MySQL needs, a `statusngin_servicestatus` backlog parks every slot on MySQL's write rate, and notifications, downtimes and core restarts are then not slow, they are never dispatched at all. It is a liveness problem, not a throughput one.
+
+Measured against a 2,000-job `servicestatus` backlog with 200 `hostchecks` jobs behind it:
+
+| | `hostchecks` after 5s | when it finished |
+|---|---|---|
+| one shared connection | **0 of 200** | only after the backlog cleared, ~6s |
+| one connection per queue | 200 of 200 | within 2s, backlog ~30% done |
+
+This is what the legacy PHP worker gets from forking one client per queue, and what the RabbitMQ consumer here already did with one channel and one consume loop per queue — the two backends were behaving differently, which was never intentional.
+
+Two consequences worth knowing:
+
+- **The concurrency cap is per queue** (`-gearman-max-concurrent-jobs-per-queue`, default `8`), so the process-wide worst case is that times the number of queues. It replaces `-gearman-max-concurrent-jobs`, and the old config key or environment variable makes the worker refuse to start — carrying a `64` over would mean 768 concurrent handlers, which is the unbounded-memory situation the cap exists to prevent.
+- **`statusengine_queue_jobs_in_flight` is labeled by `queue_name`.** A queue pinned at its cap is that queue falling behind; an unlabeled total cannot tell that apart from every queue being moderately busy. `sum()` without the label gives the old number.
+
+gearmand's `--round-robin` is a related but separate thing: it changes which queue the *server* offers next, and would have spread the shared budget around without removing the coupling, which lived in this process. It is also off by default on gearmand 1.x. Correctness here no longer depends on it.
+
 ## Discarding Superseded Status Events
 
 `statusngin_hoststatus` and `statusngin_servicestatus` carry a full snapshot of an object's current state, re-sent on every check and upserted into a table that holds exactly one row per object. A snapshot from ten minutes ago has no reader left: MySQL holds a newer one already, and a dashboard showing it would be showing something untrue.
@@ -252,6 +274,8 @@ Useful flags:
 - `-rabbitmq-url`: AMQP URL
 - `-mysql-dsn`: MySQL DSN
 - `-mysql-batch-size`: rows buffered per table before a bulk `INSERT` is flushed ahead of the 250ms ticker (default `100`, maximum `700`). See [Choosing a batch size](#choosing-a-batch-size)
+- `-gearman-max-concurrent-jobs-per-queue`: job handlers running at once **per queue** (default `8`). Per queue, not shared — see [One connection per queue](#one-connection-per-queue). Replaces `-gearman-max-concurrent-jobs`, whose value must not be carried over: the worker refuses to start if the old config key or environment variable is still set
+- `-rabbitmq-prefetch`: unacknowledged deliveries the broker may push, also per queue (default `100`)
 - `-listen-addr`: WebSocket server listen address (default `127.0.0.1:8080` — **loopback only**; exposing it on the network is an explicit opt-in, e.g. `-listen-addr :8080`)
 - `-api-keys`: comma-separated API keys accepted by `/ws`. Leaving this empty does **not** disable authentication — the worker generates a random key at startup and logs it as a warning instead, so an unconfigured worker is never an open event stream
 - `-metrics-listen-addr`: Prometheus server listen address (default `:9105`)

@@ -90,6 +90,7 @@ var queueMetricNames = []string{
 	"statusengine_queue_messages_received_total",
 	"statusengine_queue_payloads_repaired_total",
 	"statusengine_queue_handler_duration_seconds",
+	"statusengine_queue_jobs_in_flight",
 }
 
 // TestComponentSeriesExistAtZero pins the package's init: all four
@@ -103,7 +104,7 @@ func TestComponentSeriesExistAtZero(t *testing.T) {
 	}
 }
 
-func TestInitQueueCreatesAllThreeSeries(t *testing.T) {
+func TestInitQueueCreatesEverySeries(t *testing.T) {
 	const queueName = "metrics_test_init_queue"
 
 	for _, name := range queueMetricNames {
@@ -163,18 +164,20 @@ func TestInitIsIdempotentAndNonDestructive(t *testing.T) {
 	}
 }
 
-// TestUnlabeledMetricsNeedNoInit records why only five of the eleven
-// metrics are handled above: an unlabeled collector is exported from the
-// first scrape on its own, so there is nothing to pre-create. If one of
-// these ever grows a label, this test starts failing and points at the
-// Init* functions as the thing to extend.
+// TestUnlabeledMetricsNeedNoInit records why the remaining metrics are not
+// handled above: an unlabeled collector is exported from the first scrape
+// on its own, so there is nothing to pre-create. If one of these ever
+// grows a label, this test starts failing and points at the Init*
+// functions as the thing to extend - which is exactly how
+// queue_jobs_in_flight moved from this list into queueMetricNames when the
+// Gearman consumer gained a per-queue job budget.
 func TestUnlabeledMetricsNeedNoInit(t *testing.T) {
 	unlabeled := []string{
-		"statusengine_queue_jobs_in_flight",
 		"statusengine_db_batch_flush_duration_seconds",
 		"statusengine_db_batch_size_at_flush",
 		"statusengine_websocket_clients_active",
 		"statusengine_websocket_messages_broadcasted_total",
+		"statusengine_websocket_frames_sent_total",
 		"statusengine_websocket_messages_dropped_total",
 	}
 
