@@ -84,6 +84,31 @@ func readTopicMessage(t *testing.T, conn *gorillaws.Conn) (topic string, payload
 	return out.Topic, out.Payload
 }
 
+// decodeBatch unmarshals a frame's payload, which is always a JSON array
+// of events - one frame per queue job, never one per event. See
+// publishBatch.
+func decodeBatch[T any](t *testing.T, payload json.RawMessage) []T {
+	t.Helper()
+	var batch []T
+	if err := json.Unmarshal(payload, &batch); err != nil {
+		t.Fatalf("unmarshal payload batch: %v (payload: %s)", err, payload)
+	}
+	return batch
+}
+
+// expectNoFurtherMessage fails if another frame turns up. Together with a
+// length assertion on the first frame it is what distinguishes "one frame
+// holding N events" from "N frames holding one event each" - the latter
+// would satisfy every other assertion in these tests, since a one-element
+// array decodes into a one-element slice perfectly happily.
+func expectNoFurtherMessage(t *testing.T, conn *gorillaws.Conn) {
+	t.Helper()
+	conn.SetReadDeadline(time.Now().Add(200 * time.Millisecond))
+	if _, raw, err := conn.ReadMessage(); err == nil {
+		t.Fatalf("expected exactly one frame for the whole job, got a second: %s", raw)
+	}
+}
+
 func TestNewHandlerPersistsAndBroadcasts(t *testing.T) {
 	hub := websocket.NewHub()
 	ctx, cancel := context.WithCancel(context.Background())
@@ -108,13 +133,59 @@ func TestNewHandlerPersistsAndBroadcasts(t *testing.T) {
 	if topic != QueueHostChecks {
 		t.Fatalf("ws side: topic = %q, want %q", topic, QueueHostChecks)
 	}
-	var got types.HostCheckPayload
-	if err := json.Unmarshal(payload, &got); err != nil {
-		t.Fatalf("unmarshal payload: %v", err)
+	got := decodeBatch[types.HostCheckPayload](t, payload)
+	if len(got) != 1 || got[0].HostName != "localhost" {
+		t.Fatalf("ws side: unexpected payload batch: %+v", got)
 	}
-	if got.HostName != "localhost" {
-		t.Fatalf("ws side: unexpected payload: %+v", got)
+}
+
+// TestOneFrameCarriesTheWholeJob is the test the batching change exists
+// for. Every other websocket assertion in this package is satisfied just
+// as well by a handler that sends one frame per event, because a
+// single-element array is indistinguishable from a batch of one - so this
+// feeds a job holding three events and insists on seeing one frame with
+// three elements and nothing after it.
+func TestOneFrameCarriesTheWholeJob(t *testing.T) {
+	hub := websocket.NewHub()
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	go hub.Run(ctx)
+
+	conn := dialTopic(t, hub, QueueHostChecks)
+
+	// The fixture holds one message; repeat it to get a bulk job, which is
+	// what the broker actually delivers (CLAUDE.md rule 1).
+	var job struct {
+		Messages []json.RawMessage `json:"messages"`
+		Format   json.RawMessage   `json:"format,omitempty"`
 	}
+	if err := json.Unmarshal(readFixture(t, "statusngin_hostchecks.json"), &job); err != nil {
+		t.Fatalf("read fixture: %v", err)
+	}
+	job.Messages = []json.RawMessage{job.Messages[0], job.Messages[0], job.Messages[0]}
+	payload, err := json.Marshal(job)
+	if err != nil {
+		t.Fatalf("marshal job: %v", err)
+	}
+
+	fake := &fakeEnqueuer[hostCheckEvent]{}
+	handler := NewHandler(hub, QueueHostChecks, fake, decodeHostCheck)
+	if err := handler(ctx, payload); err != nil {
+		t.Fatalf("handler: %v", err)
+	}
+
+	if items := fake.snapshot(); len(items) != 3 {
+		t.Fatalf("db side: enqueued %d items, want 3", len(items))
+	}
+
+	topic, framePayload := readTopicMessage(t, conn)
+	if topic != QueueHostChecks {
+		t.Fatalf("topic = %q, want %q", topic, QueueHostChecks)
+	}
+	if got := decodeBatch[types.HostCheckPayload](t, framePayload); len(got) != 3 {
+		t.Fatalf("frame carried %d events, want all 3 of the job's", len(got))
+	}
+	expectNoFurtherMessage(t, conn)
 }
 
 func TestNewHandlerPropagatesEnqueueError(t *testing.T) {
@@ -158,13 +229,13 @@ func TestNewBroadcastHandlerSkipsDB(t *testing.T) {
 	if topic != QueueHostStatus {
 		t.Fatalf("topic = %q, want %q", topic, QueueHostStatus)
 	}
-	var got types.HostStatusPayload
-	if err := json.Unmarshal(payload, &got); err != nil {
-		t.Fatalf("unmarshal payload: %v", err)
+	// The fixture is a bulk job of two hosts, and both arrive in this one
+	// frame - the batch is the job, not one event out of it.
+	got := decodeBatch[types.HostStatusPayload](t, payload)
+	if len(got) != 2 || got[0].Name != "demo.statusengine.org" {
+		t.Fatalf("unexpected payload batch: %+v", got)
 	}
-	if got.Name != "demo.statusengine.org" {
-		t.Fatalf("unexpected payload: %+v", got)
-	}
+	expectNoFurtherMessage(t, conn)
 }
 
 func TestStateChangeHandlerRoutesHostVsService(t *testing.T) {

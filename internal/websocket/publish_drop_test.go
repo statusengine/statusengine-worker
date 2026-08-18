@@ -50,23 +50,32 @@ func TestPublishDropsAreCountedWhenTheHubBufferIsFull(t *testing.T) {
 
 	hub := NewHub()
 
+	// eventsPerFrame is deliberately not 1: a frame carries a whole job's
+	// worth of events, and the counter reports events rather than frames,
+	// so a Publish that counted frames would advance by overflow instead
+	// of overflow*eventsPerFrame and fail here. That distinction is the
+	// point of the metric - a dropped frame costs a dashboard a hundred
+	// events, not one.
 	const overflow = 5
+	const eventsPerFrame = 7
+
 	for i := 0; i < broadcastBufferSize+overflow; i++ {
-		hub.Publish("statusngin_hoststatus", []byte(`{}`))
+		hub.Publish("statusngin_hoststatus", []byte(`[{}]`), eventsPerFrame)
 	}
 
-	if got := hub.publishDropped.Load(); got != overflow {
-		t.Fatalf("hub counted %d dropped publishes, want %d", got, overflow)
+	const wantDropped = overflow * eventsPerFrame
+	if got := hub.publishDropped.Load(); got != wantDropped {
+		t.Fatalf("hub counted %d dropped events, want %d", got, wantDropped)
 	}
 
-	if got := counterValue(t, metricName) - before; got != overflow {
-		t.Fatalf("%s advanced by %v, want %d", metricName, got, overflow)
+	if got := counterValue(t, metricName) - before; got != wantDropped {
+		t.Fatalf("%s advanced by %v, want %d", metricName, got, wantDropped)
 	}
 
-	// The events that did fit must still be there - a full buffer must
+	// The frames that did fit must still be there - a full buffer must
 	// not cost the ones already accepted.
 	if got := len(hub.broadcast); got != broadcastBufferSize {
-		t.Fatalf("hub buffered %d events, want %d", got, broadcastBufferSize)
+		t.Fatalf("hub buffered %d frames, want %d", got, broadcastBufferSize)
 	}
 }
 
@@ -80,11 +89,11 @@ func TestPublishBelowCapacityDropsNothing(t *testing.T) {
 
 	hub := NewHub()
 	for i := 0; i < broadcastBufferSize; i++ {
-		hub.Publish("statusngin_hoststatus", []byte(`{}`))
+		hub.Publish("statusngin_hoststatus", []byte(`[{}]`), 7)
 	}
 
 	if got := hub.publishDropped.Load(); got != 0 {
-		t.Fatalf("hub dropped %d publishes while still under capacity, want 0", got)
+		t.Fatalf("hub dropped %d events while still under capacity, want 0", got)
 	}
 	if got := counterValue(t, metricName) - before; got != 0 {
 		t.Fatalf("%s advanced by %v while under capacity, want 0", metricName, got)

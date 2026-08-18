@@ -452,7 +452,13 @@ function connect() {
       appendLogEntry("(nicht parsbar)", event.data);
       return;
     }
-    appendLogEntry(data.topic || "(kein Topic)", data.payload);
+    // payload is an array: the worker sends one frame per queue job, and
+    // a job carries a bulk array of events. A non-array is still logged
+    // as one entry, so this page keeps working against a worker that
+    // sends one frame per event.
+    const topic = data.topic || "(kein Topic)";
+    const events = Array.isArray(data.payload) ? data.payload : [data.payload];
+    for (const event of events) appendLogEntry(topic, event);
   };
 
   ws.onclose = () => {

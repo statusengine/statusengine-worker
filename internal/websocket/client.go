@@ -19,6 +19,16 @@ const (
 	pongWait       = 60 * time.Second
 	pingPeriod     = (pongWait * 9) / 10
 	maxMessageSize = 8192
+
+	// sendBufferSize is how many frames may sit in a client's outbound
+	// buffer before the Hub starts dropping for it. It bounds *frames*, and
+	// a frame is a whole queue job, so the amount of slack this buys scales
+	// with how bulky the traffic is - which is exactly when slack is
+	// needed. That is the difference that matters here: at one event per
+	// frame, 256 frames is well under a tenth of a second of a busy feed,
+	// which is less than a single stall of a terminal or a garbage-
+	// collecting browser tab, so a client that could comfortably keep up on
+	// average still loses messages to every hiccup.
 	sendBufferSize = 256
 )
 
@@ -65,11 +75,12 @@ type Client struct {
 	// receive. An empty set means "subscribe to everything".
 	topics map[string]struct{}
 
-	// dropped counts messages the Hub could not hand to this client
-	// because its send buffer was full, reported once when it
-	// disconnects. Only ever touched from the Hub's Run goroutine (both
-	// dispatch and removeClient run there), so it needs no
-	// synchronization - see the Hub type comment.
+	// dropped counts events the Hub could not hand to this client because
+	// its send buffer was full, reported once when it disconnects. Counted
+	// in events rather than the frames they arrived in, so it means the
+	// same thing as the Hub-wide counter it complements. Only ever touched
+	// from the Hub's Run goroutine (both dispatch and removeClient run
+	// there), so it needs no synchronization - see the Hub type comment.
 	dropped uint64
 }
 

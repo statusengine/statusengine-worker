@@ -69,9 +69,21 @@ info:
 
     - **Server → client:** every event the worker's pipeline processes,
       wrapped in a small envelope: `{"topic": "<queue name>", "payload":
-      { ... }}`. `topic` is always one of the 12 queue names below;
-      `payload`'s shape depends on which one - see the *Schemas* section
-      and each topic's description below for a real example.
+      [ { ... }, { ... } ]}`. `topic` is always one of the 12 queue names
+      below; the elements of `payload` are that topic's event shape - see
+      the *Schemas* section and each topic's description below for a real
+      example.
+
+      **`payload` is always an array**, and one frame carries one queue
+      job. A job normally arrives from the monitoring core as a bulk array
+      of events, and the worker forwards it as a single frame rather than
+      splitting it - so a client parses, and a slow client's buffer holds,
+      one frame per job instead of one per event. The four queues that
+      deliver a single event per job (`statusngin_acknowledgements`,
+      `statusngin_contactnotificationmethod`, `statusngin_core_restart`,
+      `statusngin_downtimes`) still send an array, of one element, so a
+      client never has to branch on the payload's shape. Batch sizes are
+      whatever the core sent; nothing is delayed to fill a frame.
     - **Client → server:** at any time, a client may send a control frame
       to change which topics it receives:
       `{"subscribe": ["statusngin_hoststatus"]}` and/or
@@ -175,18 +187,26 @@ components:
     OutboundMessage:
       type: object
       description: |
-        The wire format for every server → client message. `payload`'s
+        The wire format for every server → client message: one frame per
+        queue job, carrying that job's events as an array. The element
         shape depends on `topic` - see the topic table in this document's
         top-level description, or browse the per-topic schemas below.
       required: [topic, payload]
       properties:
         topic:
           type: string
-          description: The queue name this event came from.
+          description: The queue name these events came from.
           example: statusngin_hoststatus
         payload:
-          type: object
-          description: See the schema matching `topic` (e.g. `HostStatusEvent` for `statusngin_hoststatus`).
+          type: array
+          minItems: 1
+          description: |
+            The job's events. Always an array, never a bare object - a
+            single-event job sends an array of one. Each element matches
+            the schema for `topic` (e.g. `HostStatusEvent` for
+            `statusngin_hoststatus`).
+          items:
+            type: object
 
     SubscriptionMessage:
       type: object
@@ -957,9 +977,10 @@ paths:
         | `statusengine_db_available` | gauge | - | 1 while bulk inserts are reaching MySQL, 0 from the first connection failure until one succeeds again. **This is the one to alert on.** While it is 0 no data is being lost - the batch is held and the backlog waits at the broker - but nothing is draining either, so the catch-up afterwards takes as long as the outage did. |
         | `statusengine_db_connection_retries_total` | counter | - | Flush attempts repeated because MySQL was unreachable. Unbounded by design, so this counts the *length* of an outage rather than the number of incidents - a 30-second MySQL restart adds roughly a dozen. |
         | `statusengine_websocket_clients_active` | gauge | - | Currently connected WebSocket clients. |
-        | `statusengine_websocket_messages_broadcasted_total` | counter | - | Messages successfully handed to a client's send buffer. |
-        | `statusengine_websocket_messages_dropped_total` | counter | - | Messages dropped because a client's send buffer was full - non-blocking broadcast. Deliberately unlabeled: a client id is unique per connection, so labeling by it would mint a permanent new time series on every reconnect. Which client was too slow is logged when that client disconnects. |
-        | `statusengine_websocket_publish_dropped_total` | counter | - | Events dropped because the Hub's *inbound* buffer was full, i.e. the broadcast goroutine could not keep up. Distinct from `messages_dropped_total` above and far more serious: that one means a single slow client missed a message, this one means the event reached no client at all. A non-zero rate here is what to alert on. |
+        | `statusengine_websocket_messages_broadcasted_total` | counter | - | **Events** successfully handed to a client's send buffer - events, not frames, so this stays comparable with `db_events_written_total` and the queue counters. One frame carries a whole job. |
+        | `statusengine_websocket_frames_sent_total` | counter | - | Frames handed to clients. Exists to be the denominator of `messages_broadcasted_total`: `rate(websocket_messages_broadcasted_total[1m]) / rate(websocket_frames_sent_total[1m])` is the average events per frame, from two plain counters and without histogram support - the same idiom as `db_events_written_total` / `db_flushes_total`. A ratio near 1.0 means jobs are arriving one event at a time; a rising one means the core is sending bulk, which is also when a client's send buffer is under pressure. |
+        | `statusengine_websocket_messages_dropped_total` | counter | - | **Events** dropped because a client's send buffer was full - non-blocking broadcast. Counted in events, so it can be read against the broadcast counter, but note the shape: a full buffer costs a whole frame, so this moves in steps of a job's batch size rather than one at a time - while moving far less often, since the same 256-frame buffer now holds a job's worth of events per slot. Deliberately unlabeled: a client id is unique per connection, so labeling by it would mint a permanent new time series on every reconnect. Which client was too slow is logged when that client disconnects. |
+        | `statusengine_websocket_publish_dropped_total` | counter | - | Events dropped because the Hub's *inbound* buffer was full, i.e. the broadcast goroutine could not keep up. Distinct from `messages_dropped_total` above and far more serious: that one means a single slow client missed a message, this one means the event reached no client at all. A non-zero rate here is what to alert on. The buffer holds 1024 *frames*, so a job's worth of events per slot - which is why this one became correspondingly hard to provoke. |
         | `statusengine_pipeline_errors_total` | counter | `component` (`mysql`, `websocket`, `graphite`, `queue`) | Errors encountered anywhere in the pipeline. |
 
         Plus the standard Go runtime/process metrics `promhttp.Handler()`
@@ -1032,10 +1053,13 @@ paths:
                 # HELP statusengine_websocket_clients_active Number of currently connected WebSocket clients.
                 # TYPE statusengine_websocket_clients_active gauge
                 statusengine_websocket_clients_active 3
-                # HELP statusengine_websocket_messages_dropped_total Total number of messages dropped for slow WebSocket clients.
+                # HELP statusengine_websocket_frames_sent_total Total number of WebSocket frames handed to clients. Denominator of messages_broadcasted_total.
+                # TYPE statusengine_websocket_frames_sent_total counter
+                statusengine_websocket_frames_sent_total 412
+                # HELP statusengine_websocket_messages_dropped_total Total number of events dropped for slow WebSocket clients (events, not frames).
                 # TYPE statusengine_websocket_messages_dropped_total counter
                 statusengine_websocket_messages_dropped_total 0
-                # HELP statusengine_websocket_publish_dropped_total Total number of events dropped because the Hub's inbound broadcast buffer was full.
+                # HELP statusengine_websocket_publish_dropped_total Total number of events dropped because the Hub's inbound broadcast buffer was full (events, not frames).
                 # TYPE statusengine_websocket_publish_dropped_total counter
                 statusengine_websocket_publish_dropped_total 0
                 # HELP statusengine_pipeline_errors_total Total number of errors encountered per pipeline component.

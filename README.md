@@ -27,14 +27,15 @@ A few words in this document mean something narrower than they might elsewhere �
 | **Broker** | The message broker the worker consumes from: **gearmand** (default) or RabbitMQ. When this document says "the backlog waits at the broker", it means jobs sitting in gearmand. | Naemon's **Event Broker Module** (NEB), the shared library loaded *into* the monitoring core. In this stack the NEB module is what *publishes* to the broker — [statusengine/broker](https://github.com/statusengine/broker) — it is not part of this worker and never talks to it directly. |
 | **Queue** | One named channel at the broker, e.g. `statusngin_hoststatus`. In Gearman terms this is a *function name*, in RabbitMQ terms a *queue*. Queue names double as WebSocket topics. | The in-process Go channels between the pipeline stages, which this document calls *buffers*. |
 | **Job** | One unit of work handed to the worker by the broker. A job carries one payload, which for most queues is a **bulk** array of many events. | A single event. One job typically contains 100, which is unrelated to the batch size below. |
-| **Event** | One decoded item out of a job's payload — one host check, one status snapshot, one notification. This is what becomes a row and what a WebSocket client receives. | A Naemon "event" in the NEB callback sense. |
-| **Handler** | The worker's function for one queue: decode the payload, publish each event to the hub, enqueue each event for insertion. Runs on its own goroutine, one per job. | Naemon's *event handler*, the command run on a state change. That one arrives here as ordinary event data (`event_handler` column). |
+| **Event** | One decoded item out of a job's payload — one host check, one status snapshot, one notification. This is what becomes a row, and what a WebSocket client ultimately reads out of a frame. | A Naemon "event" in the NEB callback sense. |
+| **Frame** | One WebSocket message: `{"topic": …, "payload": [ … ]}`, carrying **one job's** events as an array. The unit a client parses, and the unit the Hub buffers and drops. | An event. `payload` is always an array — a single-event job sends an array of one — so a frame usually carries many. |
+| **Handler** | The worker's function for one queue: decode the payload, publish the whole batch to the hub as one frame, then enqueue each event for insertion. Runs on its own goroutine, one per job. | Naemon's *event handler*, the command run on a state change. That one arrives here as ordinary event data (`event_handler` column). |
 | **Worker** | This process. | A Gearman "worker" in the protocol sense — though this process is one of those too, which is why `gearadmin --status` counts it in its last column. |
 | **Runner** | Anything with a `Run`/`Flush` pair the pipeline starts and drains: every `BulkInserter` plus the Graphite client. There are 15. | The queue consumer, which has its own `Start`/`Stop` lifecycle. |
 | **Batch** | The rows one `INSERT` statement carries — at most `-mysql-batch-size`, 100 by default. Cut purely by size and time, **never** along job boundaries. | A bulk payload. One batch can hold events from several jobs, and one job's events can span several batches. |
 | **Flush** | Executing the buffered rows as one bulk `INSERT` and clearing the buffer. Triggered by the batch size, by the 250ms ticker, or by shutdown. A shutdown flush is the one that can exceed the batch size — see below. | A Graphite flush, which is the same idea one stage further along. |
 | **Topic** | What a WebSocket client subscribes to. Always equal to a queue name. | — |
-| **Hub** | The WebSocket pub/sub broadcaster. Has an inbound buffer of its own, hence two distinct drop metrics. | The broker. Nothing is persisted in the hub; a client that is not connected misses the event permanently, by design. |
+| **Hub** | The WebSocket pub/sub broadcaster. Has an inbound buffer of its own, hence two distinct drop metrics. Both its buffers count frames, so their depth in events scales with how bulky the traffic is. | The broker. Nothing is persisted in the hub; a client that is not connected misses the event permanently, by design. |
 | **Stale** | For the two status queues only: an event whose envelope timestamp is older than `status_max_age`. Discarded before it reaches MySQL or the hub. | The `status_update_time`-based `DELETE` on core restart, which removes stale *rows* from a previous run. Related idea, different mechanism. |
 
 ## Why This Version
@@ -72,6 +73,7 @@ Compared to the legacy PHP worker, this Go implementation focuses on:
 		- `{"subscribe":["statusngin_hoststatus"]}`
 		- `{"unsubscribe":["statusngin_hoststatus"]}`
 - If no topics are set, the client receives all topics.
+- **One frame per job, not per event.** A server → client message is `{"topic": "<queue>", "payload": [ … ]}` and `payload` is *always* an array — see [WebSocket Frames](#websocket-frames).
 - Authentication is **always on** — configuring no key does not disable it, the worker generates a random one per run and logs it as a warning (see `-api-keys` below):
 	- Recommended for real clients: `Authorization: Bearer <key>` or `X-Api-Key: <key>` header.
 	- `?api_key=<key>` query parameter also accepted, for browser clients that can't set custom headers on a WebSocket handshake (e.g. `web/ws-test-client.html`).
@@ -146,6 +148,8 @@ Four places, in rough order of likelihood:
 3. **Shutting down while MySQL is unreachable** — the final flush gets a 10-second budget for all 15 runners; whatever cannot be written in that window is dropped. Restarting a worker during a database outage therefore costs its buffers.
 4. **Discarded stale status events** — by design, not by accident. `statusngin_hoststatus` and `statusngin_servicestatus` events older than `-status-max-age` (default `5m`) are dropped before MySQL and the WebSocket hub, because they are superseded snapshots. See [Discarding Superseded Status Events](#discarding-superseded-status-events).
 
+WebSocket delivery is deliberately not on that list: the hub drops rather than backpressures, by design, and a client that misses events has lost a view, not data. See [WebSocket Frames](#websocket-frames) for what a drop costs now that a frame is a whole job.
+
 ### What to watch
 
 | Metric | Healthy | What it means otherwise |
@@ -156,6 +160,8 @@ Four places, in rough order of likelihood:
 | `statusengine_db_batch_retries_total` | ~0 | Lock contention, in practice `db_cleanup` running against a busy table. |
 | `statusengine_db_batch_size_at_flush` | mixed | Constant at the batch size = flushes are batch- rather than ticker-triggered, i.e. saturated. Histogram; see below for the counter-only equivalent. |
 | `statusengine_db_flushes_total{table}` | rises with load | Successful bulk-insert statements per table. Only useful as the denominator of the row count — see below. |
+| `statusengine_websocket_publish_dropped_total` | `0` | The hub's own inbound buffer overflowed — every connected client went blind at once. Alert on this. |
+| `statusengine_websocket_messages_dropped_total` | non-zero is normal | One client could not keep up; everyone else got the frame. Counted in events, but lost a frame at a time. |
 
 `statusengine_db_events_written_total` counts every buffered row as written, including duplicates an upsert skipped, so it briefly overstates after a restart under load. It is a throughput signal, not an audit.
 
@@ -375,13 +381,41 @@ The simulator replays fixture payloads through the same decode/route/persist pip
 go run ./cmd/simulator/main.go
 ```
 
-## WebSocket Test Client
+## WebSocket Frames
 
-An interactive test client is included in:
+A server → client message is one **frame** per **job**:
 
-- `web/ws-test-client.html`
+```json
+{"topic": "statusngin_hoststatus", "payload": [ {"name": "localhost", ...}, {"name": "db01", ...} ]}
+```
 
-It can connect to `ws://localhost:8080/ws`, select topics, subscribe/unsubscribe dynamically, and display incoming event payloads live.
+`payload` is **always an array**. The four queues that deliver one event per job (`statusngin_acknowledgements`, `statusngin_contactnotificationmethod`, `statusngin_core_restart`, `statusngin_downtimes`) send an array of one, so a client never branches on the payload's shape.
+
+The batching boundary is not invented for the wire — it is the one the data already has. A job arrives from the core as a bulk array, and the worker forwards it whole instead of splitting it into one frame per event. Nothing is delayed to fill a frame, so this costs no latency: a batch is simply however many events the core sent in that job.
+
+What it buys, per job rather than per event: one `json.Marshal`, one hub dispatch, one slot in each client's send buffer, one `write` syscall. And a client's 256-frame buffer now holds 256 *jobs*, which is the difference between roughly a tenth of a second of slack on a busy feed and several seconds of it — enough to absorb a stalling terminal or a garbage-collecting browser tab, which is what a slow client's drops usually turn out to be.
+
+The trade is that a drop is coarser: a full send buffer costs that client the frame's whole batch, not one event. `statusengine_websocket_messages_dropped_total` counts events, so it reports the real loss; it just moves in steps. Frames are counted separately, which makes the average batch size readable without histogram support:
+
+```promql
+rate(statusengine_websocket_messages_broadcasted_total[1m])
+  /
+rate(statusengine_websocket_frames_sent_total[1m])
+```
+
+## WebSocket Test Clients
+
+Two interactive test clients are included:
+
+- `web/ws-test-client.html` — browser client: connect, select topics, subscribe/unsubscribe dynamically, watch payloads live.
+- `web/ws_client.py` — terminal client, same feature set (`pip install websockets`), plus a measuring mode.
+
+```bash
+python3 web/ws_client.py --api-key <key> --topics statusngin_hoststatus
+python3 web/ws_client.py --api-key <key> --quiet          # measure, don't print
+```
+
+`--quiet` is the mode to use when investigating dropped messages. Printing every event puts a terminal write on the path for each one, and a terminal that stalls for longer than the server's send buffer holds is enough to make the worker drop messages a client could easily have kept up with — so a run that prints measures the terminal, not the pipeline. `--quiet` reports events/s and frames/s once a second and prints nothing else.
 
 ## API Documentation
 

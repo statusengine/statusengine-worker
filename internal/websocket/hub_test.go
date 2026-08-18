@@ -33,8 +33,8 @@ func TestHubDispatchRespectsSubscription(t *testing.T) {
 	subscribed := newTestClient(hub, 4, "statusngin_hoststatus")
 	everything := newTestClient(hub, 4)
 
-	hub.Publish("statusngin_hoststatus", []byte(`{"name":"localhost"}`))
-	hub.Publish("statusngin_servicestatus", []byte(`{"description":"PING"}`))
+	hub.Publish("statusngin_hoststatus", []byte(`[{"name":"localhost"}]`), 1)
+	hub.Publish("statusngin_servicestatus", []byte(`[{"description":"PING"}]`), 1)
 
 	// Only the hoststatus event should reach the subscribed client.
 	select {
@@ -79,7 +79,7 @@ func TestHubDispatchNeverBlocksOnFullClientBuffer(t *testing.T) {
 	go func() {
 		defer close(done)
 		for i := 0; i < 50; i++ {
-			hub.Publish("statusngin_hoststatus", []byte(`{}`))
+			hub.Publish("statusngin_hoststatus", []byte(`[{}]`), 1)
 		}
 	}()
 

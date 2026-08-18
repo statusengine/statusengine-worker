@@ -65,7 +65,7 @@ func TestHubConcurrentStress(t *testing.T) {
 		go func(i int) {
 			defer wg.Done()
 			for j := 0; j < publishesPerGoroutine; j++ {
-				hub.Publish(fmt.Sprintf("topic-%d", j%5), []byte(`{"n":1}`))
+				hub.Publish(fmt.Sprintf("topic-%d", j%5), []byte(`[{"n":1}]`), 1)
 			}
 		}(i)
 	}

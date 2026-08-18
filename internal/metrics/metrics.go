@@ -282,13 +282,43 @@ var (
 		Help:      "Number of currently connected WebSocket clients.",
 	})
 
-	// WebsocketMessagesBroadcastedTotal counts messages successfully handed
-	// to a client's send buffer.
+	// WebsocketMessagesBroadcastedTotal counts events successfully handed to
+	// a client's send buffer.
+	//
+	// Events, not frames: one frame carries a whole queue job's worth of
+	// events (see websocket.Hub's wire format), so counting frames here
+	// would make this number silently incomparable with
+	// queue_events_discarded_stale_total and db_events_written_total, which
+	// are the two things anyone reading it wants to compare it against.
+	// WebsocketFramesSentTotal below is the frame count, and the ratio of
+	// the two is the average batch size per frame.
 	WebsocketMessagesBroadcastedTotal = promauto.NewCounter(prometheus.CounterOpts{
 		Namespace: "statusengine",
 		Subsystem: "websocket",
 		Name:      "messages_broadcasted_total",
-		Help:      "Total number of messages broadcasted to WebSocket clients.",
+		Help:      "Total number of events broadcasted to WebSocket clients (events, not frames).",
+	})
+
+	// WebsocketFramesSentTotal counts frames handed to a client's send
+	// buffer - the denominator of WebsocketMessagesBroadcastedTotal.
+	//
+	// It exists so the average number of events per frame is readable from
+	// two plain counters, without histogram support:
+	//
+	//	rate(websocket_messages_broadcasted_total[1m])
+	//	  / rate(websocket_frames_sent_total[1m])
+	//
+	// which is the same idiom as db_events_written_total /
+	// db_flushes_total. That ratio is what says whether batching is doing
+	// anything: at 1.0 every frame carries a single event and the pipeline
+	// is idle enough that jobs arrive one event at a time; a rising value
+	// means jobs are arriving in bulk, which is also when a client's send
+	// buffer is under pressure.
+	WebsocketFramesSentTotal = promauto.NewCounter(prometheus.CounterOpts{
+		Namespace: "statusengine",
+		Subsystem: "websocket",
+		Name:      "frames_sent_total",
+		Help:      "Total number of WebSocket frames handed to clients. Denominator of messages_broadcasted_total.",
 	})
 
 	// WebsocketMessagesDroppedTotal counts messages dropped because a
@@ -303,11 +333,18 @@ var (
 	// enough to turn one metric into six figures' worth of series. Which
 	// client was too slow is answered instead by the per-client
 	// "dropped" count the Hub logs when that client disconnects.
+	//
+	// Counted in events, like the broadcast counter above, so the two stay
+	// comparable. Note what batching changed about the shape of this
+	// number rather than its meaning: a single full send buffer now costs
+	// a whole job's worth of events at once instead of one, so this
+	// counter moves in coarser steps - while moving far less often, since
+	// the same 256-frame buffer now holds hundreds of times more events.
 	WebsocketMessagesDroppedTotal = promauto.NewCounter(prometheus.CounterOpts{
 		Namespace: "statusengine",
 		Subsystem: "websocket",
 		Name:      "messages_dropped_total",
-		Help:      "Total number of messages dropped for slow WebSocket clients.",
+		Help:      "Total number of events dropped for slow WebSocket clients (events, not frames).",
 	})
 
 	// WebsocketPublishDroppedTotal counts events dropped by Hub.Publish
@@ -330,7 +367,7 @@ var (
 		Namespace: "statusengine",
 		Subsystem: "websocket",
 		Name:      "publish_dropped_total",
-		Help:      "Total number of events dropped because the Hub's inbound broadcast buffer was full.",
+		Help:      "Total number of events dropped because the Hub's inbound broadcast buffer was full (events, not frames).",
 	})
 
 	// PipelineErrorsTotal counts errors encountered anywhere in the

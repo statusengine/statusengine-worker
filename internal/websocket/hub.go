@@ -26,16 +26,34 @@ const broadcastBufferSize = 1024
 // broadcasting (CLAUDE.md rule 4).
 const statsLogInterval = 30 * time.Second
 
-// Event is a single message published by the ingestion pipeline, tagged
-// with the topic (queue name, e.g. "statusngin_hoststatus") clients
-// subscribe to.
+// Event is one frame published by the ingestion pipeline, tagged with the
+// topic (queue name, e.g. "statusngin_hoststatus") clients subscribe to.
+//
+// A frame carries a whole queue job's worth of events, not one event:
+// Payload is an already-encoded JSON *array*. The batching boundary is not
+// invented here, it is the one the data already has - a job arrives from
+// the broker as a bulk array and queue.publishBatch forwards it as one
+// frame instead of exploding it into one frame per element. Everything
+// downstream of this - the encode cache, the per-client send buffer, the
+// write syscall in writePump - is therefore paid once per job rather than
+// once per event.
 type Event struct {
 	Topic   string
-	Payload []byte // already JSON-encoded event payload
+	Payload []byte // already JSON-encoded array of event payloads
+
+	// Events is how many events Payload contains, carried alongside it
+	// because the Hub never parses Payload and so cannot count them
+	// itself. Only the metrics need it: they report events rather than
+	// frames, so they stay comparable with the queue and db counters (see
+	// metrics.WebsocketMessagesBroadcastedTotal).
+	Events int
 }
 
 // outboundMessage is the wire format a client receives: the topic the
-// message was published under alongside its raw payload. It is the
+// message was published under alongside its raw payload, which is always a
+// JSON array of events - even where the queue delivers one event per job
+// (CLAUDE.md's bulk exceptions), in which case it is an array of one. A
+// client therefore has exactly one shape to handle. It is the
 // authoritative definition of that format (and what the tests decode
 // into), but the hot path does not marshal through it - see encode.
 type outboundMessage struct {
@@ -97,7 +115,8 @@ type Hub struct {
 	topicPrefix map[string][]byte
 
 	// publishDropped counts events dropped by Publish because the
-	// broadcast buffer was full. Publish is called from arbitrary
+	// broadcast buffer was full - events, not the frames they arrived in.
+	// Publish is called from arbitrary
 	// ingestion goroutines (not Run's), so this one counter is atomic;
 	// every other stat below is only ever touched from within Run and
 	// needs no synchronization.
@@ -108,9 +127,11 @@ type Hub struct {
 	clientCount atomic.Int64
 
 	// received/dispatched/dropped track broadcast throughput for the
-	// periodic stats log. dropped counts per-client sends skipped because
-	// that client's own send buffer was full (CLAUDE.md rule 4's
-	// non-blocking dispatch), distinct from publishDropped above.
+	// periodic stats log, all three counted in events rather than frames so
+	// they can be read against the queue's own event counts. dropped counts
+	// events in frames skipped because that client's own send buffer was
+	// full (CLAUDE.md rule 4's non-blocking dispatch), distinct from
+	// publishDropped above.
 	received   uint64
 	dispatched uint64
 	dropped    uint64
@@ -144,21 +165,25 @@ func (h *Hub) HasClients() bool {
 	return h.clientCount.Load() > 0
 }
 
-// Publish enqueues an event for broadcasting to subscribed clients. It
-// never blocks the caller: if the Hub's inbound buffer is full, the event
-// is dropped so the ingestion/DB pipeline is never slowed down by
-// WebSocket broadcasting. Drops are counted, not logged individually -
-// see statsLogInterval - since Publish sits on the hot ingestion path.
+// Publish enqueues one frame - payload being a JSON array holding events
+// events - for broadcasting to subscribed clients. It never blocks the
+// caller: if the Hub's inbound buffer is full, the frame is dropped so the
+// ingestion/DB pipeline is never slowed down by WebSocket broadcasting.
+// Drops are counted, not logged individually - see statsLogInterval -
+// since Publish sits on the hot ingestion path.
 //
-// A drop here means the event reached no client at all, unlike the
+// A drop here means the events reached no client at all, unlike the
 // per-client drops in dispatch, hence the separate
-// metrics.WebsocketPublishDroppedTotal counter.
-func (h *Hub) Publish(topic string, payload []byte) {
+// metrics.WebsocketPublishDroppedTotal counter. Note that
+// broadcastBufferSize now bounds *frames*, so the same 1024 slots hold a
+// job's worth of events each - which is why this drop, the one worth
+// alerting on, became correspondingly harder to provoke.
+func (h *Hub) Publish(topic string, payload []byte, events int) {
 	select {
-	case h.broadcast <- Event{Topic: topic, Payload: payload}:
+	case h.broadcast <- Event{Topic: topic, Payload: payload, Events: events}:
 	default:
-		h.publishDropped.Add(1)
-		metrics.WebsocketPublishDroppedTotal.Inc()
+		h.publishDropped.Add(uint64(events))
+		metrics.WebsocketPublishDroppedTotal.Add(float64(events))
 	}
 }
 
@@ -196,7 +221,7 @@ func (h *Hub) Run(ctx context.Context) {
 			h.applySubscriptionUpdate(update)
 
 		case event := <-h.broadcast:
-			h.received++
+			h.received += uint64(event.Events)
 			h.dispatch(event)
 
 		case <-statsTicker.C:
@@ -209,19 +234,22 @@ func (h *Hub) Run(ctx context.Context) {
 // counts rather than per-message logging, so observability never adds
 // overhead to the hot dispatch path (CLAUDE.md rule 4).
 func (h *Hub) logStats() {
+	// Every count here is in events, not frames - see the struct fields.
 	slog.Info("websocket: hub stats",
 		"clients", len(h.clients),
-		"received", h.received,
-		"dispatched", h.dispatched,
-		"dropped", h.dropped,
-		"publish_dropped", h.publishDropped.Load(),
+		"received_events", h.received,
+		"dispatched_events", h.dispatched,
+		"dropped_events", h.dropped,
+		"publish_dropped_events", h.publishDropped.Load(),
 	)
 }
 
-// dispatch fans an event out to every currently subscribed client, never
+// dispatch fans one frame out to every currently subscribed client, never
 // blocking on a slow client's send buffer. The wire message is built lazily
-// on the first client that actually wants the topic, so an event nobody
-// subscribed to costs nothing beyond the map walk.
+// on the first client that actually wants the topic, so a frame nobody
+// subscribed to costs nothing beyond the map walk - and, since a frame is
+// a whole job, that map walk now happens once per job instead of once per
+// event.
 func (h *Hub) dispatch(event Event) {
 	var msg []byte
 
@@ -238,17 +266,22 @@ func (h *Hub) dispatch(event Event) {
 
 		select {
 		case client.send <- msg:
-			h.dispatched++
-			metrics.WebsocketMessagesBroadcastedTotal.Inc()
+			h.dispatched += uint64(event.Events)
+			metrics.WebsocketMessagesBroadcastedTotal.Add(float64(event.Events))
+			metrics.WebsocketFramesSentTotal.Inc()
 		default:
-			// Client's buffer is full - drop the message for this client
+			// Client's buffer is full - drop the frame for this client
 			// instead of blocking the dispatch loop (and, transitively,
 			// the ingestion pipeline behind Publish's buffered channel).
 			// Counted, not logged per-drop, for the same reason as Publish
 			// above; the per-client total is reported on disconnect.
-			h.dropped++
-			client.dropped++
-			metrics.WebsocketMessagesDroppedTotal.Inc()
+			//
+			// One drop costs this client the frame's whole batch, so the
+			// counters move in events rather than frames - a client that
+			// misses 400 events should not look like one that missed one.
+			h.dropped += uint64(event.Events)
+			client.dropped += uint64(event.Events)
+			metrics.WebsocketMessagesDroppedTotal.Add(float64(event.Events))
 		}
 	}
 }
@@ -303,8 +336,8 @@ func (h *Hub) removeClient(client *Client) {
 // overwhelmingly common case of a client that kept up.
 func (h *Hub) logClientGone(client *Client) {
 	if client.dropped > 0 {
-		slog.Warn("websocket: client disconnected after dropped messages",
-			"client_id", client.id, "dropped", client.dropped)
+		slog.Warn("websocket: client disconnected after dropped events",
+			"client_id", client.id, "dropped_events", client.dropped)
 	}
 }
 

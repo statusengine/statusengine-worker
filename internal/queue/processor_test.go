@@ -2,7 +2,6 @@ package queue
 
 import (
 	"context"
-	"encoding/json"
 	"sync"
 	"testing"
 
@@ -100,12 +99,10 @@ func TestNewPerfdataHandlerRouteMySQLOnly(t *testing.T) {
 	if topic != QueueServicePerfdata {
 		t.Fatalf("topic = %q, want %q", topic, QueueServicePerfdata)
 	}
-	var got types.ServiceCheckPayload
-	if err := json.Unmarshal(payload, &got); err != nil {
-		t.Fatalf("unmarshal payload: %v", err)
-	}
-	if got.HostName != "localhost" {
-		t.Fatalf("unexpected broadcast payload: %+v", got)
+	// All three servicechecks in the fixture's job arrive in one frame.
+	got := decodeBatch[types.ServiceCheckPayload](t, payload)
+	if len(got) != 3 || got[0].HostName != "localhost" {
+		t.Fatalf("unexpected broadcast payload batch: %+v", got)
 	}
 }
 

@@ -7,6 +7,7 @@ import (
 	"strings"
 
 	"statusengine-worker/internal/graphite"
+	"statusengine-worker/internal/types"
 	"statusengine-worker/internal/websocket"
 )
 
@@ -119,9 +120,20 @@ func NewPerfdataHandler(hub *websocket.Hub, topic string, route PerfdataRoute, m
 			return decodeError(topic, err)
 		}
 
-		for _, ev := range events {
-			publish(hub, topic, ev.ServiceCheckPayload)
+		// The batch is the servicecheck payloads only - perfdataEvent's own
+		// Timestamp field is a decode detail, and this topic has always
+		// broadcast the payload unchanged. Built inside the HasClients
+		// guard so a worker with nobody attached does not allocate a slice
+		// per job, same reasoning as publishFiltered.
+		if hub.HasClients() {
+			payloads := make([]types.ServiceCheckPayload, 0, len(events))
+			for _, ev := range events {
+				payloads = append(payloads, ev.ServiceCheckPayload)
+			}
+			publishBatch(hub, topic, payloads)
+		}
 
+		for _, ev := range events {
 			for _, p := range parsePerfData(ev.PerfData) {
 				metric := perfdataMetric{
 					HostName:           ev.HostName,

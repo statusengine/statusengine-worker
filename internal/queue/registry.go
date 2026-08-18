@@ -232,12 +232,14 @@ func newContactNotificationMethodHandler(hub *websocket.Hub, topic string, hostI
 			return decodeError(topic, err)
 		}
 
+		publishFiltered(hub, topic, events, func(ev notificationMethodEvent) bool {
+			return ev.Type == notificationTypeContactNotificationMethodEnd
+		})
+
 		for _, ev := range events {
 			if ev.Type != notificationTypeContactNotificationMethodEnd {
 				continue
 			}
-
-			publish(hub, topic, ev)
 
 			ins := hostIns
 			if ev.ServiceDescription != "" {
@@ -284,12 +286,14 @@ func newNotificationHandler(hub *websocket.Hub, topic string, hostIns, serviceIn
 			return decodeError(topic, err)
 		}
 
+		publishFiltered(hub, topic, events, func(ev notificationLogEvent) bool {
+			return ev.Type == notificationTypeEnd && ev.ContactsNotified > 0
+		})
+
 		for _, ev := range events {
 			if ev.Type != notificationTypeEnd || ev.ContactsNotified <= 0 {
 				continue
 			}
-
-			publish(hub, topic, ev)
 
 			ins := hostIns
 			if ev.ServiceDescription != "" {
@@ -564,9 +568,9 @@ func newStateChangeHandler(hub *websocket.Hub, topic string, hostIns, serviceIns
 			return decodeError(topic, err)
 		}
 
-		for _, ev := range events {
-			publish(hub, topic, ev)
+		publishBatch(hub, topic, events)
 
+		for _, ev := range events {
 			// statechange_type distinguishes host (0) from service (1) state
 			// history the same way it's persisted into 'state_change' below -
 			// see hostStateHistoryRow/serviceStateHistoryRow for why.
@@ -589,9 +593,9 @@ func newAcknowledgementHandler(hub *websocket.Hub, topic string, hostIns, servic
 			return decodeError(topic, err)
 		}
 
-		for _, ev := range events {
-			publish(hub, topic, ev)
+		publishBatch(hub, topic, events)
 
+		for _, ev := range events {
 			// In the broker_acknowledgement_data callback, acknowledgement type is used to determine if it is a host or service acknowledgement
 			// This is a differente behavior than the broker_host_status and broker_service_status callbacks have -.-
 			// 0 = HOST_ACKNOWLEDGEMENT

@@ -2,7 +2,6 @@ package queue
 
 import (
 	"context"
-	"encoding/json"
 	"fmt"
 	"strings"
 	"testing"
@@ -120,14 +119,14 @@ func TestStaleStatusEventsReachNeitherDestination(t *testing.T) {
 		t.Fatalf("handler (fresh): %v", err)
 	}
 	_, payload := readTopicMessage(t, conn)
-	var got struct {
+	batch := decodeBatch[struct {
 		Timestamp int64  `json:"timestamp"`
 		Name      string `json:"name"`
+	}](t, payload)
+	if len(batch) != 1 {
+		t.Fatalf("ws side: first frame carried %d events, want only the fresh one", len(batch))
 	}
-	if err := json.Unmarshal(payload, &got); err != nil {
-		t.Fatalf("unmarshal: %v", err)
-	}
-	if age := time.Since(time.Unix(got.Timestamp, 0)); age > time.Minute {
+	if age := time.Since(time.Unix(batch[0].Timestamp, 0)); age > time.Minute {
 		t.Fatalf("ws side: first message received was %s old - the stale event was broadcast", age)
 	}
 }

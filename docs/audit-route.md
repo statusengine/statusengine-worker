@@ -86,7 +86,7 @@ flowchart TD
     G --> H[decodeHostStatus<br/>JSON-Bulk-Array]
     H --> S{älter als<br/>status-max-age?<br/>nur hier + servicestatus}
     S -->|ja| Y[verwerfen, zählen<br/>weder MySQL noch Hub]
-    S -->|nein| I[pro Item: publish<br/>Hub, nicht blockierend]
+    S -->|nein| I[publishBatch: ein Frame<br/>für den ganzen Job, nicht blockierend]
     S -->|nein| J[pro Item: Enqueue<br/>BLOCKIERT bei vollem Puffer]
     J --> K[BulkInserter.Run<br/>eigene Goroutine]
     K --> L{mysql_batch_size<br/>Zeilen oder 250ms?}
@@ -114,13 +114,24 @@ Die Kette in Dateien:
 `NewHandler` in `router.go:106` ist das Muster. Nur drei Queues nutzen sie
 direkt (`hostchecks`, `servicechecks`, `logentries`) und zwei weitere die
 gefilterte Variante darunter, aber alle übrigen Handler sind Varianten
-derselben vier Zeilen: decode → publish → Enqueue. Wenn Sie die verstanden
-haben, verstehen Sie den Großteil des Routers.
+derselben vier Zeilen: decode → publishBatch → Enqueue. Wenn Sie die
+verstanden haben, verstehen Sie den Großteil des Routers.
 
-`publish` in `router.go:233` prüft `hub.HasClients()` und überspringt das
-JSON-Marshalling komplett, wenn niemand verbunden ist. Das ist der heißeste
-Pfad im Worker. Die Konsequenz ist bewusst in Kauf genommen: die Antwort ist
-eine Momentaufnahme, ein sich gerade verbindender Client verpasst das Event.
+Beachten Sie die Reihenfolge: **`publishBatch` steht vor der Enqueue-Schleife,
+nicht darin.** Früher wechselten sich die beiden pro Event ab, womit die
+Übertragung eines Events auf den Datenbankschreibvorgang des vorherigen
+wartete — und `Enqueue` blockiert, sobald MySQL der Engpass ist. Genau das
+soll Regel 2 verhindern.
+
+`publishBatch` prüft `hub.HasClients()` und überspringt das JSON-Marshalling
+komplett, wenn niemand verbunden ist. Das ist der heißeste Pfad im Worker. Die
+Konsequenz ist bewusst in Kauf genommen: die Antwort ist eine Momentaufnahme,
+ein sich gerade verbindender Client verpasst das Event.
+
+Ein Frame trägt **einen Job**, nicht ein Event: `payload` ist immer ein JSON-
+Array. Die Batch-Grenze wird dabei nicht erfunden, sie ist die, die die Daten
+ohnehin haben — der Broker liefert den Job als Bulk-Array an. Verzögert wird
+nichts, um ein Frame zu füllen.
 
 `Enqueue` in `db/db.go:185` ist die Stelle, an der der Datenpfad **wartet statt
 zu verwerfen.** Wenn `b.in` (Kapazität = `mysql_batch_size`, Standard 100) voll
@@ -181,14 +192,21 @@ Neustart nach einem Ausfall. Die Begründung steht ausführlich über
 |---|---|---|
 | `BulkInserter.in` | `mysql_batch_size` (100) | **blockiert** — der einzige Rückstaupunkt |
 | `BulkInserter.flushReq` / `pauseReq` | 0 | Rendezvous mit `Run` |
-| `Hub.broadcast` | 1024 | verwirft, zählt `publish_dropped_total` |
+| `Hub.broadcast` | 1024 **Frames** | verwirft, zählt `publish_dropped_total` |
 | `Hub.register` / `unregister` | 0 | Rendezvous mit `Run` |
-| `Client.send` | 256 | verwirft für diesen Client |
+| `Client.send` | 256 **Frames** | verwirft für diesen Client |
 | Consumer-`out` | 256 | verwirft (nur Observability) |
 
 Die Asymmetrie ist die Kernaussage von Regel 4: **auf dem Weg zur Datenbank
 wird gewartet, auf dem Weg zum WebSocket wird verworfen.** Ein langsamer
 Browser darf die Ingestion nie ausbremsen.
+
+Die beiden WebSocket-Kapazitäten zählen **Frames**, also ganze Jobs. Dieselben
+Zahlen fassen damit ein Vielfaches an Events, und zwar genau dann am meisten,
+wenn der Andrang am größten ist. Verworfen wird dafür gröber: ein volles
+`Client.send` kostet diesen Client den ganzen Batch des Frames. Die Zähler
+berichten deshalb in Events, nicht in Frames — sonst stünde dort `1`, wo
+hundert Events fehlen.
 
 ### Wer auf wen wartet
 
@@ -402,6 +420,11 @@ teuer wäre:
       `messages_dropped_total`. Der erste bedeutet, dass der Hub insgesamt
       nicht mehr mitkommt; der zweite ist bei einem langsamen Browser-Tab
       normal.
+- [ ] **Bei gemeldeten WebSocket-Verlusten zuerst den Client ohne Ausgabe
+      messen** (`web/ws_client.py --quiet`). Ein Client, der jedes Event
+      ausgibt, misst sein Terminal, nicht die Pipeline — dessen Aussetzer
+      reichen aus, um den Sendepuffer zu überlaufen, obwohl der Client im
+      Mittel um ein Vielfaches schneller ist als der Datenstrom.
 - [ ] **`statusengine_queue_jobs_in_flight` dauerhaft am Cap** heißt: der
       Rückstau liegt beim Broker. Ein zweiter Worker-Prozess macht das
       schlimmer, nicht besser — der Engpass liegt hinter der Annahme.

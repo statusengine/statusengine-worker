@@ -174,12 +174,15 @@ func TestDowntimeHandlerAdd(t *testing.T) {
 	if topic != QueueDowntimes {
 		t.Fatalf("ws topic = %q, want %q", topic, QueueDowntimes)
 	}
-	var got types.DowntimeMessage
-	if err := json.Unmarshal(payload, &got); err != nil {
-		t.Fatalf("unmarshal broadcast payload: %v", err)
+	// statusngin_downtimes is one of CLAUDE.md's bulk exceptions - one
+	// event per job - but the frame is still an array, of one, so a client
+	// never has to branch on the payload's shape.
+	got := decodeBatch[types.DowntimeMessage](t, payload)
+	if len(got) != 1 {
+		t.Fatalf("frame carried %d events, want 1", len(got))
 	}
-	if got.Type != types.EventTypeDowntimeAdd || got.Downtime.DowntimeID != 42 {
-		t.Fatalf("unexpected broadcast payload: %+v", got)
+	if got[0].Type != types.EventTypeDowntimeAdd || got[0].Downtime.DowntimeID != 42 {
+		t.Fatalf("unexpected broadcast payload: %+v", got[0])
 	}
 }
 

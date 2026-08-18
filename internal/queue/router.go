@@ -99,10 +99,12 @@ type enqueuer[P any] interface {
 
 // NewHandler builds a Handler for a queue whose decoded items must reach
 // both MySQL and WebSocket subscribers: decode turns the raw payload into
-// its individual items; each item is enqueued on ins for bulk-insertion and
-// published on hub under topic (CLAUDE.md rule 2 - the actual DB write and
-// WebSocket dispatch happen asynchronously in ins's and hub's own
-// goroutines, decoupled from this call by their respective channels).
+// its individual items; the whole batch is published on hub under topic as
+// one frame, then each item is enqueued on ins for bulk-insertion
+// (CLAUDE.md rule 2 - the actual DB write and WebSocket dispatch happen
+// asynchronously in ins's and hub's own goroutines, decoupled from this
+// call by their respective channels). Broadcasting first is deliberate;
+// see publishBatch.
 func NewHandler[P any](hub *websocket.Hub, topic string, ins enqueuer[P], decode func([]byte) ([]P, error)) Handler {
 	return func(ctx context.Context, payload []byte) error {
 		items, err := decode(payload)
@@ -110,9 +112,9 @@ func NewHandler[P any](hub *websocket.Hub, topic string, ins enqueuer[P], decode
 			return decodeError(topic, err)
 		}
 
-		for _, item := range items {
-			publish(hub, topic, item)
+		publishBatch(hub, topic, items)
 
+		for _, item := range items {
 			if err := ins.Enqueue(ctx, item); err != nil {
 				return fmt.Errorf("queue: enqueue %s event: %w", topic, err)
 			}
@@ -176,6 +178,13 @@ func NewStaleDroppingHandler[P timestamped](hub *websocket.Hub, topic string, in
 		// the worker.
 		cutoff := time.Now().Add(-maxAge).Unix()
 
+		// The same cutoff the loop below applies, so subscribers see
+		// exactly what MySQL gets - a stale snapshot is no more use to a
+		// dashboard than it is to the database.
+		publishFiltered(hub, topic, items, func(item P) bool {
+			return item.eventTimestamp() >= cutoff
+		})
+
 		var dropped int
 		for _, item := range items {
 			if item.eventTimestamp() < cutoff {
@@ -183,8 +192,6 @@ func NewStaleDroppingHandler[P timestamped](hub *websocket.Hub, topic string, in
 				metrics.QueueEventsDiscardedStaleTotal.WithLabelValues(topic).Inc()
 				continue
 			}
-
-			publish(hub, topic, item)
 
 			if err := ins.Enqueue(ctx, item); err != nil {
 				return fmt.Errorf("queue: enqueue %s event: %w", topic, err)
@@ -213,32 +220,81 @@ func NewBroadcastHandler[P any](hub *websocket.Hub, topic string, decode func([]
 			return decodeError(topic, err)
 		}
 
-		for _, item := range items {
-			publish(hub, topic, item)
-		}
+		publishBatch(hub, topic, items)
 		return nil
 	}
 }
 
-// publish JSON-encodes item and publishes it to hub under topic, logging
-// (rather than failing the whole dispatch) on encode errors - a single
-// unencodable event must never take down the surrounding batch.
+// publishBatch JSON-encodes items as one array and publishes it to hub
+// under topic as a single frame, logging (rather than failing the whole
+// dispatch) on encode errors - one unencodable batch must never take down
+// the job around it.
+//
+// One frame per job, not per event, and the batching boundary is the one
+// the data already has: a job arrives from the broker as a bulk array, and
+// exploding it into N frames only to have every stage downstream pay N
+// times is work this pipeline was creating for itself. Per job instead of
+// per event, that is one json.Marshal, one Hub channel send, one dispatch
+// map walk, one entry in each client's send buffer and one write syscall
+// in writePump.
+//
+// It also fixes an ordering problem that batching makes unavoidable to
+// notice: every caller used to alternate publish and Enqueue per event, so
+// an event's broadcast waited on the previous event's database write - and
+// Enqueue blocks whenever MySQL is the bottleneck (CLAUDE.md rule 3).
+// Publishing the whole batch before the enqueue loop is what rule 2 asks
+// for and what the old shape quietly wasn't.
 //
 // Encoding is skipped entirely when no client is connected. This sits on
-// the hottest path in the worker - it runs once per decoded event, for
-// every queue - and a production worker normally has nobody attached to
-// /ws at all, so without this check every ingested event pays for a full
-// reflection-driven marshal (and the garbage that comes with it) to
-// produce bytes that are then immediately discarded by Publish.
+// the hottest path in the worker - it runs once per job, for every queue -
+// and a production worker normally has nobody attached to /ws at all, so
+// without this check every ingested job pays for a full reflection-driven
+// marshal (and the garbage that comes with it) to produce bytes that are
+// then immediately discarded by Publish.
+func publishBatch[P any](hub *websocket.Hub, topic string, items []P) {
+	if len(items) == 0 || !hub.HasClients() {
+		return
+	}
+
+	raw, err := json.Marshal(items)
+	if err != nil {
+		slog.Error("queue: failed to encode events for websocket",
+			"topic", topic, "events", len(items), "error", err)
+		return
+	}
+	hub.Publish(topic, raw, len(items))
+}
+
+// publish is publishBatch for the queues that deliver one event per job
+// (CLAUDE.md's bulk exceptions). It still sends an array, of one element,
+// so clients never have to branch on the payload's shape.
 func publish[P any](hub *websocket.Hub, topic string, item P) {
 	if !hub.HasClients() {
 		return
 	}
+	publishBatch(hub, topic, []P{item})
+}
 
-	raw, err := json.Marshal(item)
-	if err != nil {
-		slog.Error("queue: failed to encode event for websocket", "topic", topic, "error", err)
+// publishFiltered publishes only the items keep returns true for, as one
+// frame. For the handlers that persist a subset of a job's events and
+// broadcast exactly that same subset.
+//
+// The filtered slice is built inside the HasClients guard rather than
+// reusing the one the caller's enqueue loop walks: those loops skip with
+// continue and allocate nothing, and a worker with no /ws client attached -
+// the normal case - should not start allocating a slice per job just
+// because someone might connect later. Evaluating keep a second time is
+// cheaper than that, and only happens while a client is actually watching.
+func publishFiltered[P any](hub *websocket.Hub, topic string, items []P, keep func(P) bool) {
+	if !hub.HasClients() {
 		return
 	}
-	hub.Publish(topic, raw)
+
+	kept := make([]P, 0, len(items))
+	for _, item := range items {
+		if keep(item) {
+			kept = append(kept, item)
+		}
+	}
+	publishBatch(hub, topic, kept)
 }
