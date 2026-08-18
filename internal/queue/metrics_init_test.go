@@ -123,4 +123,27 @@ func TestNewRouterPreCreatesMetricSeries(t *testing.T) {
 			t.Errorf("statusengine_db_events_written_total has no series for table=%q", table)
 		}
 	}
+
+	// db_flushes_total is deliberately NOT the same set. It is the
+	// denominator of the rows-per-flush ratio, and the four downtime tables
+	// write one row per statement without batching at all - a 0 there under
+	// a climbing events_written_total would make that ratio read +Inf rather
+	// than "not applicable", so the series must be absent, not zero.
+	flushes := gatheredLabelValues(t, "statusengine_db_flushes_total", "table")
+	batched := want[:14]
+	notBatched := want[14:]
+
+	for _, table := range batched {
+		if !flushes[table] {
+			t.Errorf("statusengine_db_flushes_total has no series for table=%q", table)
+		}
+	}
+	for _, table := range notBatched {
+		if flushes[table] {
+			t.Errorf("statusengine_db_flushes_total has a series for table=%q, which never batches - rows/flushes would be meaningless there", table)
+		}
+	}
+	if len(flushes) != len(batched) {
+		t.Errorf("statusengine_db_flushes_total has %d series, want %d", len(flushes), len(batched))
+	}
 }

@@ -154,9 +154,27 @@ Four places, in rough order of likelihood:
 | `statusengine_pipeline_errors_total{component="mysql"}` | flat | A batch was dropped. Every increment is up to `-mysql-batch-size` lost rows. |
 | `statusengine_db_connection_retries_total` | flat | Climbs for the duration of an outage; measures its length, not a count of incidents. |
 | `statusengine_db_batch_retries_total` | ~0 | Lock contention, in practice `db_cleanup` running against a busy table. |
-| `statusengine_db_batch_size_at_flush` | mixed | Constant at the batch size = flushes are batch- rather than ticker-triggered, i.e. saturated. |
+| `statusengine_db_batch_size_at_flush` | mixed | Constant at the batch size = flushes are batch- rather than ticker-triggered, i.e. saturated. Histogram; see below for the counter-only equivalent. |
+| `statusengine_db_flushes_total{table}` | rises with load | Successful bulk-insert statements per table. Only useful as the denominator of the row count — see below. |
 
 `statusengine_db_events_written_total` counts every buffered row as written, including duplicates an upsert skipped, so it briefly overstates after a restart under load. It is a throughput signal, not an audit.
+
+### Average batch size without histograms
+
+`statusengine_db_batch_size_at_flush` is a histogram, and it carries no `table` label. Two plain counters give the same answer per table, which is what a monitoring system that ingests only counters needs:
+
+```promql
+# Average rows per bulk INSERT, per table
+rate(statusengine_db_events_written_total[1m])
+  /
+rate(statusengine_db_flushes_total[1m])
+```
+
+Both counters are incremented in the same branch — successful flushes only — so numerator and denominator always describe the same set of statements. A failed flush appears in `statusengine_pipeline_errors_total{component="mysql"}` instead, rather than dragging the average down for a reason unrelated to batching.
+
+An average approaching `-mysql-batch-size` means flushes are triggered by the batch size rather than the 250ms ticker: that table is saturated. Well below it means the ticker fires first and raising the batch size would change nothing.
+
+The four downtime tables have **no** `db_flushes_total` series. They bypass the buffer and write one row per statement, so the ratio does not apply there — the series is absent rather than zero, which keeps the expression from returning `+Inf`.
 
 ### Choosing a batch size
 

@@ -193,8 +193,11 @@ type BulkInserter[T any] struct {
 func NewBulkInserter[T any](db *sql.DB, table string, columns []string, toRow RowFunc[T], opts ...Option) *BulkInserter[T] {
 	// Register this table's series at zero right away, so /metrics reports
 	// events_written_total{table="..."} 0 from the first scrape instead of
-	// omitting the table until its first successful flush.
+	// omitting the table until its first successful flush. InitFlushes is
+	// separate and deliberately only called here, where batching actually
+	// happens - see its comment.
 	metrics.InitTable(table)
+	metrics.InitFlushes(table)
 
 	o := inserterOptions{maxBatchSize: DefaultMaxBatchSize}
 	for _, opt := range opts {
@@ -513,6 +516,9 @@ func (b *BulkInserter[T]) flushBuffer(ctx context.Context) error {
 	} else {
 		total := b.processed.Add(uint64(rows))
 		metrics.DBEventsWrittenTotal.WithLabelValues(b.table).Add(float64(rows))
+		// The denominator for that counter: rows/flushes is the average
+		// batch size, per table and without needing histogram buckets.
+		metrics.DBFlushesTotal.WithLabelValues(b.table).Inc()
 		slog.Info("db: bulk insert flushed",
 			"table", b.table, "rows", rows, "duration", duration, "total_processed", total)
 	}

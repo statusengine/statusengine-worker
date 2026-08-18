@@ -7,6 +7,7 @@ import (
 	"time"
 
 	sqlmock "github.com/DATA-DOG/go-sqlmock"
+	"github.com/prometheus/client_golang/prometheus"
 )
 
 // TestRunFlushesOnConfiguredBatchSize is the point of the whole change: an
@@ -159,4 +160,120 @@ func TestMaxConfigurableBatchSizeLeavesRoomForTheWidestTable(t *testing.T) {
 	}
 	t.Logf("batch size %d, worst case %d of %d placeholders, room for %d more columns",
 		MaxConfigurableBatchSize, worst, MaxPlaceholdersPerStatement, headroom)
+}
+
+// labeledCounterValue reads one series of a labeled counter family back
+// through the gatherer, the same way a Prometheus scrape would see it.
+func labeledCounterValue(t *testing.T, name, label, value string) float64 {
+	t.Helper()
+
+	families, err := prometheus.DefaultGatherer.Gather()
+	if err != nil {
+		t.Fatalf("gather: %v", err)
+	}
+	for _, family := range families {
+		if family.GetName() != name {
+			continue
+		}
+		for _, series := range family.GetMetric() {
+			for _, pair := range series.GetLabel() {
+				if pair.GetName() == label && pair.GetValue() == value {
+					return series.GetCounter().GetValue()
+				}
+			}
+		}
+		t.Fatalf("%s: no series with %s=%q", name, label, value)
+	}
+	t.Fatalf("%s: no such metric family in the default registry", name)
+	return 0
+}
+
+// TestFlushesTotalIsTheDenominatorOfTheBatchSize is the property the counter
+// exists for: rows / flushes must come out as the average batch size, per
+// table and without touching a histogram bucket. That is what lets a
+// monitoring system which ingests only counters compute
+//
+//	rate(db_events_written_total[1m]) / rate(db_flushes_total[1m])
+//
+// Three flushes of a known, deliberately uneven size, so a counter that
+// merely tracked rows or merely counted 1 per row would produce the wrong
+// ratio rather than the right one by accident.
+func TestFlushesTotalIsTheDenominatorOfTheBatchSize(t *testing.T) {
+	const table = "flushes_ratio_events"
+
+	mockDB, mock, err := sqlmock.New()
+	if err != nil {
+		t.Fatalf("sqlmock.New: %v", err)
+	}
+	defer mockDB.Close()
+
+	inserter := NewBulkInserter[row](mockDB, table, []string{"id", "name"}, toRow)
+
+	beforeRows := labeledCounterValue(t, "statusengine_db_events_written_total", "table", table)
+	beforeFlushes := labeledCounterValue(t, "statusengine_db_flushes_total", "table", table)
+
+	// Pre-created at zero by the constructor, so a dashboard reads 0 rather
+	// than "No data" on a worker that has not flushed this table yet.
+	if beforeFlushes != 0 {
+		t.Fatalf("flushes_total started at %v, want a freshly pre-created 0", beforeFlushes)
+	}
+
+	ctx := context.Background()
+	sizes := []int{7, 20, 3}
+	for _, size := range sizes {
+		mock.ExpectExec(`^INSERT INTO ` + table).WillReturnResult(sqlmock.NewResult(0, int64(size)))
+		for i := 0; i < size; i++ {
+			inserter.buffer = append(inserter.buffer, row{id: i})
+		}
+		if err := inserter.flushBuffer(ctx); err != nil {
+			t.Fatalf("flushBuffer: %v", err)
+		}
+	}
+
+	gotRows := labeledCounterValue(t, "statusengine_db_events_written_total", "table", table) - beforeRows
+	gotFlushes := labeledCounterValue(t, "statusengine_db_flushes_total", "table", table) - beforeFlushes
+
+	if wantRows := float64(7 + 20 + 3); gotRows != wantRows {
+		t.Errorf("events_written_total rose by %v, want %v", gotRows, wantRows)
+	}
+	if gotFlushes != float64(len(sizes)) {
+		t.Errorf("flushes_total rose by %v, want %v", gotFlushes, len(sizes))
+	}
+	if got, want := gotRows/gotFlushes, 10.0; got != want {
+		t.Errorf("rows/flushes = %v, want %v - the ratio is the whole point of this counter", got, want)
+	}
+
+	if err := mock.ExpectationsWereMet(); err != nil {
+		t.Errorf("expectations: %v", err)
+	}
+}
+
+// TestFailedFlushIsNotCounted keeps numerator and denominator describing the
+// same set of statements. A failed flush writes no rows, so counting it here
+// would drag the average batch size down for a reason that has nothing to do
+// with batching - and the failure already has its own counter,
+// pipeline_errors_total{component="mysql"}.
+func TestFailedFlushIsNotCounted(t *testing.T) {
+	const table = "flushes_failed_events"
+
+	mockDB, mock, err := sqlmock.New()
+	if err != nil {
+		t.Fatalf("sqlmock.New: %v", err)
+	}
+	defer mockDB.Close()
+
+	inserter := NewBulkInserter[row](mockDB, table, []string{"id", "name"}, toRow)
+	mock.ExpectExec(`^INSERT INTO ` + table).WillReturnError(duplicateEntry())
+
+	inserter.buffer = append(inserter.buffer, row{id: 1}, row{id: 2})
+	if err := inserter.flushBuffer(context.Background()); err == nil {
+		t.Fatal("flushBuffer returned nil for a failing exec")
+	}
+
+	if got := labeledCounterValue(t, "statusengine_db_flushes_total", "table", table); got != 0 {
+		t.Errorf("flushes_total = %v after a failed flush, want 0", got)
+	}
+	if got := labeledCounterValue(t, "statusengine_db_events_written_total", "table", table); got != 0 {
+		t.Errorf("events_written_total = %v after a failed flush, want 0", got)
+	}
 }

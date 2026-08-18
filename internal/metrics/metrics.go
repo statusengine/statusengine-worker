@@ -65,6 +65,17 @@ func InitStaleDiscards(queueName string) {
 	QueueEventsDiscardedStaleTotal.WithLabelValues(queueName)
 }
 
+// InitFlushes pre-creates the per-table series on DBFlushesTotal. Separate
+// from InitTable because only tables written through a BulkInserter batch at
+// all: the four downtime tables bypass it and write one row per statement
+// (see execDowntimeAction in internal/queue/registry.go). Pre-creating this
+// for them would advertise batching they do not do, and - worse - would leave
+// a permanent 0 denominator under a climbing events_written_total, so the
+// rows-per-flush ratio would read +Inf rather than "not applicable".
+func InitFlushes(table string) {
+	DBFlushesTotal.WithLabelValues(table)
+}
+
 // InitTable pre-creates the per-table series on DBEventsWrittenTotal.
 // Called from db.NewBulkInserter, so every table this worker can write to
 // is covered automatically - including one added later, which is the
@@ -164,6 +175,30 @@ var (
 		Subsystem: "db",
 		Name:      "events_written_total",
 		Help:      "Total number of events successfully written per table.",
+	}, []string{"table"})
+
+	// DBFlushesTotal counts successful bulk-insert statements per table -
+	// the denominator DBEventsWrittenTotal needs to become an average batch
+	// size:
+	//
+	//	rate(db_events_written_total[1m]) / rate(db_flushes_total[1m])
+	//
+	// DBBatchSizeAtFlush already observes that distribution, but it is a
+	// histogram and carries no table label, so it can neither be broken down
+	// per table nor read at all by a monitoring system that only ingests
+	// counters. Two counters can do both.
+	//
+	// Counted in the same branch as DBEventsWrittenTotal - successful
+	// flushes only - so numerator and denominator always describe the same
+	// set of statements. Failed flushes are counted by
+	// PipelineErrorsTotal{component="mysql"} instead; mixing them in here
+	// would drag the average down for a reason that has nothing to do with
+	// batching.
+	DBFlushesTotal = promauto.NewCounterVec(prometheus.CounterOpts{
+		Namespace: "statusengine",
+		Subsystem: "db",
+		Name:      "flushes_total",
+		Help:      "Total number of successful bulk-insert statements per table.",
 	}, []string{"table"})
 
 	// DBBatchFlushDurationSeconds observes how long each bulk-insert
