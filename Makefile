@@ -22,7 +22,7 @@ LDFLAGS := -X $(PKG).Version=$(VERSION) -X $(PKG).Date=$(DATE)
 BINDIR  := bin
 BINARIES := worker db_cleanup db_verifier simulator gearman_publisher rabbitmq_publisher losstest
 
-.PHONY: all build test test-all vet fmt clean install-systemd
+.PHONY: all build test test-all vet fmt clean install install-systemd
 
 all: build
 
@@ -56,7 +56,13 @@ fmt:
 clean:
 	rm -rf $(BINDIR)
 
-## install-systemd: install the unit file; does not enable or start it
+## install: install the two long-running binaries under the names the unit
+## files expect. Everything else in bin/ is a development tool and stays out.
+install: build
+	install -m 0755 $(BINDIR)/worker /usr/local/bin/statusengine-worker
+	install -m 0755 $(BINDIR)/db_cleanup /usr/local/bin/statusengine-db-cleanup
+
+## install-systemd: install the unit files; does not enable or start them
 install-systemd:
 	install -m 0644 packaging/systemd/statusengine-worker.service /etc/systemd/system/
 	install -m 0644 packaging/systemd/statusengine-db-cleanup.service /etc/systemd/system/

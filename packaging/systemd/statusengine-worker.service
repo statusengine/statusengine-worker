@@ -1,0 +1,67 @@
+[Unit]
+Description=Statusengine Worker (Go)
+Documentation=https://github.com/statusengine/statusengine-worker
+# The worker survives all three being unavailable - it retries MySQL and
+# reconnects to the broker - so these are ordering hints, not requirements.
+# Requires= would make a MySQL restart take the worker down with it, which
+# is exactly the case its retry logic exists to handle.
+After=network-online.target mysql.service mariadb.service gearman-job-server.service
+Wants=network-online.target
+
+[Service]
+Type=simple
+User=statusengine
+Group=statusengine
+
+# API keys do not belong on the command line, where every user on the box
+# can read them out of /proc. The leading "-" makes the file optional, so
+# the unit still starts without it.
+EnvironmentFile=-/etc/statusengine/worker.env
+ExecStart=/usr/local/bin/statusengine-worker -config /etc/statusengine/config.yml
+
+Restart=always
+RestartSec=5s
+
+# THE ONE SETTING NOT TO SHORTEN.
+#
+# On SIGTERM the worker stops consuming, drains jobs still in flight, and
+# flushes its buffers before exiting. Its worst case is the sum of three
+# bounded waits:
+#
+#   30s  Gearman drain (gearman.DrainTimeout; the connections are closed
+#        in parallel, so it is 30s total and not 30s x 12)
+#   10s  final bulk-insert flush (shutdownFlushTimeout)
+#    5s  HTTP server shutdown
+#   ---
+#   45s
+#
+# systemd sends SIGKILL when TimeoutStopSec expires. Setting it below 45s
+# therefore kills the worker *during* the flush and loses exactly the
+# buffered rows the graceful shutdown exists to write - and the job
+# acknowledgements with them, so the broker redelivers and the upserts
+# (CLAUDE.md rule 6) become the only thing standing between you and
+# duplicate rows. 90s leaves headroom over the arithmetic; it is stated
+# here rather than left to systemd's default so that raising DrainTimeout
+# has an obvious place to be reflected.
+TimeoutStopSec=90s
+
+# The worker writes nothing to disk - logs go to the journal - so it can
+# run against a fully read-only filesystem.
+NoNewPrivileges=yes
+PrivateTmp=yes
+PrivateDevices=yes
+ProtectSystem=strict
+ProtectHome=yes
+ProtectKernelTunables=yes
+ProtectKernelModules=yes
+ProtectControlGroups=yes
+RestrictAddressFamilies=AF_INET AF_INET6 AF_UNIX
+RestrictNamespaces=yes
+LockPersonality=yes
+
+# One connection per queue, a MySQL pool, plus every WebSocket client.
+# Comfortably above anything this reaches, and cheap.
+LimitNOFILE=65535
+
+[Install]
+WantedBy=multi-user.target

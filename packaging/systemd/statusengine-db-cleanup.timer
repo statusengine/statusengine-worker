@@ -1,0 +1,18 @@
+[Unit]
+Description=Run Statusengine data retention daily
+Documentation=https://github.com/statusengine/statusengine-worker
+
+[Timer]
+OnCalendar=daily
+# Catch up after downtime rather than skipping a day silently - retention
+# that quietly stops running is only noticed when the disk fills.
+Persistent=true
+# Spread the load off the top of the hour. Note this randomises within one
+# host only: in a cluster, run this timer on exactly ONE node, or give each
+# node a clearly different OnCalendar. Several nodes deleting from the same
+# tables at once is the realistic source of the lock contention that
+# statusengine_db_batch_retries_total counts.
+RandomizedDelaySec=1h
+
+[Install]
+WantedBy=timers.target

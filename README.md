@@ -356,6 +356,47 @@ Settings can also be read from a YAML config file via `-config path/to/config.ya
 
 Precedence for every setting is: explicit CLI flag > environment variable > config file > built-in default. This lets the config file hold your normal settings while flags/environment variables (handy in Docker/CI) can still override anything for a one-off run.
 
+## Running as a systemd service
+
+Unit files are in `packaging/systemd/`. Install them, or copy the settings into whatever you already use — the one value that matters is explained below.
+
+```bash
+sudo useradd --system --no-create-home --shell /usr/sbin/nologin statusengine
+sudo mkdir -p /etc/statusengine
+sudo cp config.example.yaml /etc/statusengine/config.yml
+
+sudo make install            # binaries into /usr/local/bin under their service names
+sudo make install-systemd    # unit files, without enabling anything
+
+sudo systemctl enable --now statusengine-worker
+sudo systemctl enable --now statusengine-db-cleanup.timer
+```
+
+API keys go in `/etc/statusengine/worker.env`, not in `ExecStart` — anything on the command line is readable by every user on the box via `/proc`:
+
+```bash
+STATUSENGINE_API_KEYS=key-one,key-two
+```
+
+### `TimeoutStopSec` is the one setting not to shorten
+
+On `SIGTERM` the worker stops consuming, drains jobs still in flight, and flushes its buffers. The worst case is the sum of three bounded waits:
+
+| | |
+|---|---|
+| Gearman drain (`gearman.DrainTimeout`, connections closed in parallel) | 30s |
+| Final bulk-insert flush (`shutdownFlushTimeout`) | 10s |
+| HTTP server shutdown | 5s |
+| **Total** | **45s** |
+
+systemd sends `SIGKILL` when `TimeoutStopSec` expires. Set below 45s it kills the worker *during* the flush and loses exactly the buffered rows the graceful shutdown exists to write — along with the job acknowledgements, so the broker redelivers and the idempotent writes become the only thing preventing duplicates. The unit sets `90s` explicitly rather than relying on systemd's default, so that raising `DrainTimeout` has an obvious place to be reflected.
+
+### Retention runs from a timer, not from the worker
+
+`statusengine-db-cleanup.timer` runs daily with `Persistent=true`, so a missed day is caught up rather than silently skipped — retention that quietly stops running is noticed when the disk fills. `RandomizedDelaySec` spreads it off the top of the hour, but only within one host: **in a cluster, enable the timer on exactly one node**, or give each node a clearly different `OnCalendar`. Several nodes deleting from the same tables at once is the realistic source of the lock contention `statusengine_db_batch_retries_total` counts.
+
+The units are hardened to run with a read-only filesystem (`ProtectSystem=strict` and friends), which the worker tolerates because it writes nothing to disk — logs go to the journal. See [Logging](#logging) for why that journal stays small.
+
 ## Run Database Cleanup
 
 The worker only ever appends to the history tables. `cmd/db_cleanup` is the counterpart that enforces retention: it deletes rows older than a configured number of days and exits, so it belongs in cron or a systemd timer rather than next to the worker.

@@ -1,0 +1,27 @@
+[Unit]
+Description=Statusengine data retention (deletes rows older than the configured age)
+Documentation=https://github.com/statusengine/statusengine-worker
+After=network-online.target mysql.service mariadb.service
+Wants=network-online.target
+
+[Service]
+Type=oneshot
+User=statusengine
+Group=statusengine
+
+# Reads the *same* config file as the worker; each binary ignores the
+# other's keys. Retention is configured there with the legacy age_* keys.
+ExecStart=/usr/local/bin/statusengine-db-cleanup -config /etc/statusengine/config.yml
+
+# It deletes in batches and stops cleanly between them on SIGTERM, so it
+# never needs to be killed mid-statement. Generous anyway: the first run
+# against a database that has never been cleaned can be long.
+TimeoutStopSec=300s
+
+NoNewPrivileges=yes
+PrivateTmp=yes
+PrivateDevices=yes
+ProtectSystem=strict
+ProtectHome=yes
+RestrictAddressFamilies=AF_INET AF_INET6 AF_UNIX
+LockPersonality=yes
