@@ -70,22 +70,39 @@ jobs:
       # gearmand has no official image, so it is installed on the runner
       # rather than run as a service container. The Ubuntu package starts
       # it on 127.0.0.1:4730, which is where the tests look.
-      - name: Install gearmand
+      # gearmand has no official image, so it is installed on the runner
+      # rather than run as a service container. The package is in Ubuntu's
+      # universe component, which runners have enabled.
+      - name: Install and start gearmand
         run: |
+          set -eu
           sudo apt-get update
           sudo apt-get install -y gearman-job-server
-          sudo systemctl start gearman-job-server || sudo service gearman-job-server start
 
-      - name: Wait for gearmand
-        run: |
-          for i in $(seq 1 30); do
-            if (exec 3<>/dev/tcp/127.0.0.1/4730) 2>/dev/null; then
-              echo "gearmand is up"; exit 0
-            fi
-            sleep 1
-          done
-          echo "gearmand never came up on 127.0.0.1:4730" >&2
-          exit 1
+          up() { (exec 3<>/dev/tcp/127.0.0.1/4730) 2>/dev/null; }
+          wait_up() {
+            for _ in $(seq 1 "$1"); do up && return 0; sleep 1; done
+            return 1
+          }
+
+          # Preferred path: the packaged unit, which listens on
+          # 127.0.0.1:4730 out of the box.
+          sudo systemctl start gearman-job-server \
+            || sudo service gearman-job-server start \
+            || true
+
+          # Fallback, because the packaged service starting is the one part
+          # of this job that cannot be checked before pushing: run the
+          # daemon directly. Either way the tests get a broker, and a
+          # gearmand that comes up neither way fails here rather than
+          # inside the first test that needs it.
+          if ! wait_up 20; then
+            echo "packaged service did not start, launching gearmand directly" >&2
+            sudo /usr/sbin/gearmand --listen=127.0.0.1 --port=4730 --daemon \
+              --pid-file=/tmp/gearmand.pid --log-file=/tmp/gearmand.log
+            wait_up 20 || { echo "gearmand never came up on 127.0.0.1:4730" >&2; cat /tmp/gearmand.log >&2 || true; exit 1; }
+          fi
+          echo "gearmand is up"
 
       # The dump is the schema CLAUDE.md treats as authoritative, and the
       # same file TestRedeliverySafePKColumnsMatchSchema parses. It carries

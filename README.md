@@ -578,6 +578,17 @@ Use it locally too when you want to be sure you ran everything. The services it 
 
 `.github/workflows/ci.yml`, on every push to `main` and every pull request: `gofmt -l`, `go vet`, `go build ./...` (every binary, not just the tested packages) and the suite above with `-race`. MySQL and RabbitMQ come from service containers, gearmand is installed on the runner because it has no official image, and `.claude/specs/mysql_schema.sql` is loaded into the throwaway database — never into a real one, it starts with 22 `DROP TABLE` statements.
 
+The two container-based halves were verified against real containers before the first push, rather than on the first red build:
+
+| Check | Result |
+|---|---|
+| Schema loads into `mysql:8.0` | exit 0, no warnings, all 22 tables |
+| Loaded schema vs. the dev database | 295 columns, 56 primary-key columns and every index **identical** |
+| The five MySQL-backed tests against an **empty** database | pass — none of them depends on leftover rows |
+| All eight RabbitMQ tests against `rabbitmq:3-alpine` | pass under `-race` with `STATUSENGINE_TEST_REQUIRE_SERVICES=1` |
+
+The gearmand step is the part that could not be rehearsed locally, so it does not assume: it starts the packaged service, waits, and falls back to launching `/usr/sbin/gearmand` directly if that did not bring the port up — failing the step either way if nothing is listening after both attempts.
+
 `cmd/losstest` is deliberately not part of CI. It needs a sustained multi-second load and a `SIGTERM` timed into the middle of it; see [Verify No Events Are Lost](#verify-no-events-are-lost) and run it before a release.
 
 ## Notes on Queue Payload Shape
