@@ -95,8 +95,11 @@ func init() {
 		PipelineErrorsTotal.WithLabelValues(component)
 	}
 	// A worker that has not written anything yet is not a worker whose
-	// database is down - see DBAvailable.
+	// database is down - see DBAvailable. Same for Carbon, where it also
+	// covers the default -perfdata-route mysql, in which the Graphite
+	// client is built and never asked to write anything.
 	DBAvailable.Set(1)
+	GraphiteAvailable.Set(1)
 }
 
 var (
@@ -285,6 +288,75 @@ var (
 		Name:      "batch_size_at_flush",
 		Help:      "Number of rows contained in each bulk-insert flush.",
 		Buckets:   []float64{1, 5, 10, 25, 50, 100, 250, 500, 700, 1400},
+	})
+
+	// GraphiteMetricsWrittenTotal counts metrics successfully written to
+	// Carbon, and GraphiteFlushesTotal the write calls that carried them.
+	// The pair is the same counter-ratio idiom as
+	// db_events_written_total / db_flushes_total, for the same reason:
+	// average metrics per flush, per rate(), without needing a histogram
+	// (openITCOCKPIT ingests counters only).
+	//
+	// "Written" here means the TCP write returned without error. Carbon's
+	// plaintext protocol has no acknowledgement of any kind, so this
+	// cannot mean "stored" - a Carbon that accepts the bytes and discards
+	// them looks identical from here. That is a property of the protocol,
+	// not a gap in the instrumentation, and it is why the drop counter
+	// below is the more important of the two.
+	GraphiteMetricsWrittenTotal = promauto.NewCounter(prometheus.CounterOpts{
+		Namespace: "statusengine",
+		Subsystem: "graphite",
+		Name:      "metrics_written_total",
+		Help:      "Total number of metrics written to Carbon.",
+	})
+
+	GraphiteFlushesTotal = promauto.NewCounter(prometheus.CounterOpts{
+		Namespace: "statusengine",
+		Subsystem: "graphite",
+		Name:      "flushes_total",
+		Help:      "Total number of successful writes to Carbon. Denominator for metrics_written_total.",
+	})
+
+	// GraphiteMetricsDroppedTotal counts metrics thrown away because a
+	// dial or a write to Carbon failed. This is the one Graphite metric
+	// worth alerting on, and it exists because the Graphite path fails
+	// differently from the MySQL one *by design*: an unreachable MySQL
+	// blocks the pipeline and holds its batch (CLAUDE.md rule 3), an
+	// unreachable Carbon drops it. Retrying here would either stall the
+	// database path behind Graphite or grow the buffer without bound, so
+	// MySQL wins and the metrics are lost.
+	//
+	// That is a deliberate trade, but until now it was an invisible one:
+	// pipeline_errors_total{component="graphite"} counts failed *flushes*,
+	// so one increment could be one metric or a thousand. This counts the
+	// metrics themselves, which is what "how much did we lose" means.
+	// Every increment is data that no longer exists anywhere - unlike the
+	// MySQL case, there is no backlog at the broker to recover it from.
+	GraphiteMetricsDroppedTotal = promauto.NewCounter(prometheus.CounterOpts{
+		Namespace: "statusengine",
+		Subsystem: "graphite",
+		Name:      "metrics_dropped_total",
+		Help:      "Total number of metrics dropped because Carbon was unreachable or the write failed.",
+	})
+
+	// GraphiteAvailable is 1 while writes to Carbon are succeeding and 0
+	// from the moment a dial or write fails until one succeeds again -
+	// the counterpart to DBAvailable, with one important difference in
+	// what it implies. DBAvailable at 0 means the pipeline is stalled but
+	// intact; GraphiteAvailable at 0 means metrics are being dropped for
+	// as long as it stays there.
+	//
+	// Pre-set to 1 in init below, like DBAvailable: Prometheus' default of
+	// 0 would read as "Carbon is down" on every worker that has not
+	// flushed yet - which includes every worker running the default
+	// -perfdata-route mysql, where this client is constructed and never
+	// used. It only ever drops to 0 after a write was actually attempted
+	// and failed.
+	GraphiteAvailable = promauto.NewGauge(prometheus.GaugeOpts{
+		Namespace: "statusengine",
+		Subsystem: "graphite",
+		Name:      "available",
+		Help:      "1 if writes are reaching Carbon, 0 while metrics are being dropped.",
 	})
 
 	// WebsocketClientsActive tracks currently connected WebSocket clients.

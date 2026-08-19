@@ -36,10 +36,18 @@ func gatherFamily(t *testing.T, name string) *familyView {
 				labels[pair.GetName()] = pair.GetValue()
 			}
 
-			// Counters carry their value directly; a histogram's
-			// equivalent "has anything been recorded" number is its
-			// sample count.
+			// Counters and gauges carry their value directly; a
+			// histogram's equivalent "has anything been recorded"
+			// number is its sample count. Gauges have to be read
+			// explicitly: GetCounter() on a gauge returns nil and
+			// therefore 0, so leaving them out does not fail, it
+			// silently reports every gauge as zero - which is exactly
+			// the kind of quietly-wrong assertion these tests exist to
+			// avoid.
 			value := metric.GetCounter().GetValue()
+			if g := metric.GetGauge(); g != nil {
+				value = g.GetValue()
+			}
 			if h := metric.GetHistogram(); h != nil {
 				value = float64(h.GetSampleCount())
 			}
@@ -179,6 +187,9 @@ func TestUnlabeledMetricsNeedNoInit(t *testing.T) {
 		"statusengine_websocket_messages_broadcasted_total",
 		"statusengine_websocket_frames_sent_total",
 		"statusengine_websocket_messages_dropped_total",
+		"statusengine_graphite_metrics_written_total",
+		"statusengine_graphite_flushes_total",
+		"statusengine_graphite_metrics_dropped_total",
 	}
 
 	for _, name := range unlabeled {
@@ -193,6 +204,34 @@ func TestUnlabeledMetricsNeedNoInit(t *testing.T) {
 		}
 		if len(family.series[0].labels) != 0 {
 			t.Errorf("%s carries labels %v - it now needs an Init* entry", name, family.series[0].labels)
+		}
+	}
+}
+
+// TestAvailabilityGaugesStartAtOne covers the *default* configuration
+// rather than a failure. Prometheus initialises a gauge to 0, which for
+// these two reads as "the dependency is down" - on every worker that has
+// simply not written anything yet, and permanently on the majority of
+// installations for Graphite, where -perfdata-route defaults to "mysql"
+// and the client is constructed and never used. An alert on either would
+// fire forever and be turned off, which is how a monitoring signal dies.
+//
+// This lives here rather than in internal/graphite because that package's
+// own tests deliberately push graphite_available to 0; a test binary where
+// nothing has touched it is the only place the init-time value is
+// observable.
+func TestAvailabilityGaugesStartAtOne(t *testing.T) {
+	for _, name := range []string{
+		"statusengine_db_available",
+		"statusengine_graphite_available",
+	} {
+		family := gatherFamily(t, name)
+		if family == nil || len(family.series) != 1 {
+			t.Errorf("%s is not exported as exactly one series", name)
+			continue
+		}
+		if got := family.series[0].value; got != 1 {
+			t.Errorf("%s = %v at startup, want 1", name, got)
 		}
 	}
 }

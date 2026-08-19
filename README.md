@@ -190,6 +190,8 @@ WebSocket delivery is deliberately not on that list: the hub drops rather than b
 | `statusengine_db_batch_retries_total` | ~0 | Lock contention, in practice `db_cleanup` running against a busy table. |
 | `statusengine_db_batch_size_at_flush` | mixed | Constant at the batch size = flushes are batch- rather than ticker-triggered, i.e. saturated. Histogram; see below for the counter-only equivalent. |
 | `statusengine_db_flushes_total{table}` | rises with load | Successful bulk-insert statements per table. Only useful as the denominator of the row count — see below. |
+| `statusengine_graphite_metrics_dropped_total` | `0` | Metrics lost because Carbon was unreachable. Alert on this — unlike the MySQL path there is no backlog to recover them from. |
+| `statusengine_graphite_available` | `1` | `0` = metrics are being dropped right now, not merely delayed. |
 | `statusengine_websocket_publish_dropped_total` | `0` | The hub's own inbound buffer overflowed — every connected client went blind at once. Alert on this. |
 | `statusengine_websocket_messages_dropped_total` | non-zero is normal | One client could not keep up; everyone else got the frame. Counted in events, but lost a frame at a time. |
 

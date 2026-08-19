@@ -316,6 +316,7 @@ func (c *Client) flushBuffer(ctx context.Context) error {
 	if err := c.ensureConn(ctx); err != nil {
 		slog.Error("graphite: dial failed, metrics dropped", "addr", c.addr, "metrics", metrics, "error", err)
 		metricsPkg.PipelineErrorsTotal.WithLabelValues(metricsPkg.ComponentGraphite).Inc()
+		c.recordDrop(metrics)
 		c.buffer = c.buffer[:0]
 		return err
 	}
@@ -345,11 +346,18 @@ func (c *Client) flushBuffer(ctx context.Context) error {
 		slog.Error("graphite: write failed, metrics dropped",
 			"addr", c.addr, "metrics", metrics, "duration", duration, "error", err)
 		metricsPkg.PipelineErrorsTotal.WithLabelValues(metricsPkg.ComponentGraphite).Inc()
+		c.recordDrop(metrics)
 		c.closeConn()
 	} else {
 		total := c.processed.Add(uint64(metrics))
 		c.flushesSinceStats++
 		c.metricsSinceStats += uint64(metrics)
+
+		metricsPkg.GraphiteMetricsWrittenTotal.Add(float64(metrics))
+		// The denominator for that counter: written/flushes is the
+		// average batch size, without needing histogram buckets.
+		metricsPkg.GraphiteFlushesTotal.Inc()
+		metricsPkg.GraphiteAvailable.Set(1)
 
 		// Debug, not Info: one line per flush, and a flush happens every
 		// time the batch fills or the 250ms ticker expires with anything
@@ -362,6 +370,22 @@ func (c *Client) flushBuffer(ctx context.Context) error {
 
 	c.buffer = c.buffer[:0]
 	return err
+}
+
+// recordDrop books a batch that will never reach Carbon, from either
+// failure path. Both are counted the same way on purpose: from a
+// dashboard's point of view "could not dial" and "write failed" are the
+// same event - that many metrics no longer exist anywhere.
+//
+// Unlike the MySQL path there is nothing to recover them from. An
+// unreachable MySQL holds its batch and backpressures to the broker, where
+// the backlog survives a restart (CLAUDE.md rule 3); Carbon's batch is
+// simply gone, because retrying here would stall the database path behind
+// Graphite or grow the buffer without bound. That trade is deliberate and
+// stays - this just makes its cost visible instead of implicit.
+func (c *Client) recordDrop(metrics int) {
+	metricsPkg.GraphiteMetricsDroppedTotal.Add(float64(metrics))
+	metricsPkg.GraphiteAvailable.Set(0)
 }
 
 // ensureConn dials addr if there is no live connection yet.
