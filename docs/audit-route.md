@@ -175,7 +175,7 @@ Bei laufendem Betrieb mit Gearman-Backend und einem verbundenen Dashboard:
 | `/ws`- und `/metrics`-Server | 2 | `main.go:583`, `:595` | `Shutdown()` |
 | `rawMessages`-Drain | 1 | `main.go:651` | Kanal geschlossen |
 | `w.Work()` (Bibliothek) | 1 | `gearman.go:165` | `w.Close()` |
-| Job-Handler | 0…64 | von der Bibliothek | pro Job |
+| Job-Handler | 0…8 pro Queue | von der Bibliothek | pro Job |
 | `logStatsPeriodically` | 1 | `gearman.go:166` | `statsDone` oder ctx |
 | ctx-Wächter | 1 | `gearman.go:168` | ruft `Stop()` |
 | `readPump`/`writePump` | 2 pro Client | `client.go:133` | Verbindungsende |
@@ -230,6 +230,50 @@ Drei Wartepunkte, alle beim Herunterfahren:
 Core-Restart-Handler hält den BulkInserter an, um selbst ein Statement gegen
 dieselbe Tabelle abzusetzen. Wenn Sie eine Deadlock-Quelle suchen, ist das die
 interessanteste Stelle im Repo.
+
+---
+
+## Durchgang 3a — Was im Log landet
+
+Eine Stelle, an der die richtige Frage nicht „ist das korrekt?" lautet,
+sondern „wie oft passiert das?". Bei `-log-level info` — dem Default —
+protokolliert der Worker ausschließlich Lebenszyklus-Ereignisse und
+periodische Zusammenfassungen. Nichts pro Job, pro Batch oder pro Zeile.
+
+Das ist keine Kosmetik. Unter systemd geht das Log ins Journal, und eine
+Zeile pro Flush sind bei gemessenen 1,96 Mio. Zeilen in 76 Sekunden 19.616
+Einträge, also rund **145 MB/Stunde**; mit den Zusammenfassungen sind es 20
+Zeilen (0,13 MB/Stunde).
+
+| Meldung | Level | Ort |
+|---|---|---|
+| `db: bulk insert flushed` | Debug | `db/db.go`, `flushBuffer` |
+| `graphite: metrics flushed` | Debug | `graphite/graphite.go`, `flushBuffer` |
+| `queue: downtime write` | Debug | `queue/registry.go`, `execDowntimeAction` |
+| `db: write stats` | Info, alle 30 s je Tabelle | `db/db.go`, `logStats` |
+| `graphite: write stats` | Info, alle 30 s | `graphite/graphite.go`, `logStats` |
+
+Beim Prüfen dieser Stelle sind zwei Eigenschaften die interessanten:
+
+- **Ist das Detail noch da?** Die Demotion darf nicht zum Löschen werden.
+  `TestFlushesAreNotLoggedAtInfo` und `TestMetricsFlushedIsNotLoggedAtInfo`
+  prüfen beide Hälften: bei Info keine Zeile, bei Debug exakt so viele wie
+  Flushes.
+- **Schweigt eine untätige Tabelle?** `logStats` gibt bei null Flushes gar
+  nichts aus. Es gibt 14 Inserter, die meisten Tabellen sehen auf den
+  meisten Installationen keinen Verkehr, und Perfdata geht per Default nur
+  nach MySQL — eine bedingungslose Zeile wären 30 Einträge pro Minute mit
+  dem Inhalt „nichts passiert".
+
+Die `logStats`-Zähler sind bewusst einfache `uint64` ohne Atomics: jeder
+`flushBuffer`-Aufruf liegt in der Goroutine von `Run`, und das ist dieselbe,
+die sie ausliest. Wer hier einen zweiten Aufrufer einbaut, braucht entweder
+Atomics oder ein Mutex — `-race` findet es, aber erst, wenn der Pfad in einem
+Test auch wirklich vorkommt.
+
+Fehler sind davon ausgenommen: ein verworfener Batch, ein nicht erreichbares
+MySQL, ein fehlgeschlagener Graphite-Write werden bei jedem einzelnen
+Vorkommen geloggt, nie aggregiert.
 
 ---
 

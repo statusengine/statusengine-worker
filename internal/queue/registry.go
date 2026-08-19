@@ -518,7 +518,13 @@ func execDowntimeAction(ctx context.Context, sqlDB *sql.DB, action DowntimeActio
 	}
 
 	metrics.DBEventsWrittenTotal.WithLabelValues(table).Add(1)
-	slog.Info("queue: downtime write", "table", table, "action", action.Action, "duration", duration)
+	// Debug, for the same reason as the bulk-insert flush line: one entry
+	// per row written. Downtimes are normally low-volume, but scheduling
+	// downtime across a host group produces one of these per host times
+	// the actions its lifecycle triggers, so the quiet case is not the one
+	// to size the log for. db_events_written_total carries the four
+	// downtime tables, which is the throughput answer at Info level.
+	slog.Debug("queue: downtime write", "table", table, "action", action.Action, "duration", duration)
 	return nil
 }
 

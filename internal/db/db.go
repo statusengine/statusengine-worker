@@ -67,6 +67,12 @@ const (
 	// truncated value grows linearly with it.
 	MaxConfigurableBatchSize = 700
 
+	// StatsLogInterval is how often a running inserter summarises what it
+	// wrote, and it is the only thing this package logs at Info during
+	// normal operation. Matches the consumer's and the Hub's own stats
+	// interval so a log read at Info has one rhythm rather than three.
+	StatsLogInterval = 30 * time.Second
+
 	// FlushInterval is the ticker period that triggers a flush of whatever
 	// is buffered, even if the batch size hasn't been reached.
 	FlushInterval = 250 * time.Millisecond
@@ -174,6 +180,14 @@ type BulkInserter[T any] struct {
 	maxBatchSize int
 
 	buffer []T
+
+	// flushesSinceStats/rowsSinceStats accumulate what the periodic stats
+	// line reports, and are reset every time it fires. Plain ints, no
+	// atomics: every flushBuffer call happens inside Run's goroutine (the
+	// ticker, the batch-size trigger, the Flush request and the final
+	// drain all run there), which is the same goroutine that logs them.
+	flushesSinceStats uint64
+	rowsSinceStats    uint64
 
 	// processed is the running total of rows successfully flushed to db,
 	// reported on every flush log line so operators can see throughput
@@ -378,6 +392,14 @@ func (b *BulkInserter[T]) Run(ctx context.Context) {
 	ticker := time.NewTicker(FlushInterval)
 	defer ticker.Stop()
 
+	statsTicker := time.NewTicker(StatsLogInterval)
+	defer statsTicker.Stop()
+
+	// One last summary on the way out, so rows written since the previous
+	// tick are still reported rather than lost because the shutdown
+	// happened to land mid-interval.
+	defer b.logStats()
+
 	for {
 		select {
 		case <-ctx.Done():
@@ -405,6 +427,9 @@ func (b *BulkInserter[T]) Run(ctx context.Context) {
 		case <-ticker.C:
 			b.flushBuffer(ctx)
 			ticker.Reset(FlushInterval)
+
+		case <-statsTicker.C:
+			b.logStats()
 
 		case req := <-b.flushReq:
 			// Same race as ctx.Done() above: an item already accepted by
@@ -465,6 +490,33 @@ func (b *BulkInserter[T]) finalFlush() {
 	b.flushBuffer(ctx)
 }
 
+// logStats emits one summary of what this table has written since the
+// last call, and is the periodic Info-level replacement for logging every
+// individual flush.
+//
+// Silent when nothing was written, which is what keeps an idle worker's
+// journal genuinely idle: there are fourteen of these, and most tables see
+// no traffic on most installations, so an unconditional line would mean 28
+// lines a minute saying nothing happened. A table that stops appearing has
+// stopped writing - that absence is the signal.
+//
+// Only ever called from Run's goroutine, like the counters it reads.
+func (b *BulkInserter[T]) logStats() {
+	if b.flushesSinceStats == 0 {
+		return
+	}
+
+	slog.Info("db: write stats",
+		"table", b.table,
+		"flushes", b.flushesSinceStats,
+		"rows", b.rowsSinceStats,
+		"rows_per_flush", b.rowsSinceStats/b.flushesSinceStats,
+		"total_processed", b.processed.Load())
+
+	b.flushesSinceStats = 0
+	b.rowsSinceStats = 0
+}
+
 // flushBuffer executes the buffered rows as a single bulk INSERT and
 // clears the buffer, reusing its underlying array. A failed insert is
 // logged and the batch is dropped, with two exceptions that are retried
@@ -519,7 +571,19 @@ func (b *BulkInserter[T]) flushBuffer(ctx context.Context) error {
 		// The denominator for that counter: rows/flushes is the average
 		// batch size, per table and without needing histogram buckets.
 		metrics.DBFlushesTotal.WithLabelValues(b.table).Inc()
-		slog.Info("db: bulk insert flushed",
+
+		b.flushesSinceStats++
+		b.rowsSinceStats += uint64(rows)
+
+		// Debug, not Info: this fires once per flush per table, and a
+		// flush happens every time the batch fills or the 250ms ticker
+		// expires with anything buffered. Fourteen tables under load is
+		// tens of lines a second - enough to bury every other line in the
+		// journal, and a real disk-space problem for a systemd unit
+		// within the hour. The Info-level answer to "is it writing?" is
+		// logStats below; the per-flush detail is one -log-level debug
+		// away when a specific flush needs explaining.
+		slog.Debug("db: bulk insert flushed",
 			"table", b.table, "rows", rows, "duration", duration, "total_processed", total)
 	}
 

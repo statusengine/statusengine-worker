@@ -166,6 +166,14 @@ enable_openitcockpit_tweaks: false
 status_max_age: 5m
 
 # Minimum log level: "debug", "info", "warn" or "error".
+#
+# At "info" the worker logs lifecycle events and one summary per 30 seconds
+# per active table ("db: write stats", "graphite: write stats") - nothing per
+# job, per batch or per row. Leave it there for a service: "debug" adds one
+# line per bulk-insert flush, which was measured at ~145 MB of journal per
+# hour under sustained load. Use "debug" to explain a specific flush, not to
+# watch a healthy worker. Errors are logged at every occurrence regardless of
+# this setting.
 log_level: info
 
 # Structured log output format: "text" or "json".

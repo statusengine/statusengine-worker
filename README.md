@@ -96,6 +96,34 @@ This guarantees buffered MySQL rows are written before process exit.
 
 Flushing the buffers is only half of it, though. Queue delivery is at-least-once: a worker that is killed between finishing a job and its acknowledgement reaching the broker gets that job again on restart, with its rows already in MySQL. Every table that can collide on its PRIMARY KEY is therefore written as an upsert, so a redelivery is skipped instead of aborting the whole multi-row `INSERT` and taking the rest of the batch with it. See [MySQL Write Behavior](#mysql-write-behavior) for the full picture and [Verify No Events Are Lost](#verify-no-events-are-lost) for the tool that measures it end to end.
 
+## Logging
+
+At the default `-log-level info` the worker logs **lifecycle events and periodic summaries only** — nothing per job, per batch or per row. That is a deliberate constraint rather than an accident of what happened to be written: under systemd the log goes to the journal, and one line per bulk-insert flush is enough to fill a disk.
+
+Measured over a 76-second sustained run writing ~1.96 million rows across two tables:
+
+| | Lines | Log volume |
+|---|---|---|
+| one line per flush (the old behaviour) | 19,616 | ~145 MB/hour |
+| periodic summaries (now) | 20 | ~0.13 MB/hour |
+
+The information is not lost, only aggregated. Every running `BulkInserter` and the Graphite client emit one summary per 30 seconds, matching the interval the consumer and the WebSocket hub already used, so a log read at Info has one rhythm rather than four:
+
+```
+level=INFO msg="db: write stats" table=statusengine_hostchecks flushes=4155 rows=415500 rows_per_flush=100 total_processed=741300
+level=INFO msg="graphite: write stats" addr=127.0.0.1:2003 flushes=112 metrics=11200 metrics_per_flush=100 total_processed=44800
+```
+
+A summary is **skipped entirely when nothing was written**, which is what keeps an idle worker's journal idle: there are fourteen inserters and most tables see no traffic on most installations, and perfdata routes to MySQL only by default, so the Graphite client is usually constructed and never used. A table that stops appearing has stopped writing — that absence is the signal, and `statusengine_db_events_written_total` is the metric that makes it precise. Run's shutdown path emits one final summary, so rows written since the last tick are still reported when a shutdown lands mid-interval.
+
+The per-flush detail still exists and is one flag away:
+
+```bash
+./worker -log-level debug   # adds "bulk insert flushed", "metrics flushed", per-row downtime writes
+```
+
+Use it to explain a specific flush, not to watch a healthy worker. Errors are unaffected by any of this — a dropped batch, an unreachable MySQL and a failed Graphite write are logged at Warn or Error every single time they happen, never aggregated.
+
 ## MySQL Write Behavior
 
 Every rule below exists because dropping a batch was measured to cost real events, twice. This section describes what happens when a write fails, when it is retried, and where data can still be lost.

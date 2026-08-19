@@ -42,6 +42,12 @@ const (
 	// is buffered, even if the batch size hasn't been reached.
 	FlushInterval = 250 * time.Millisecond
 
+	// StatsLogInterval is how often a running client summarises what it
+	// shipped, and is the only thing this package logs at Info during
+	// normal operation. Same value as internal/db's, so a log read at Info
+	// has one rhythm rather than several.
+	StatsLogInterval = 30 * time.Second
+
 	dialTimeout  = 5 * time.Second
 	writeTimeout = 5 * time.Second
 )
@@ -111,6 +117,13 @@ type Client struct {
 	// a full batch of lines - and stays there. Owned by Run's goroutine,
 	// like buffer and conn.
 	writeBuf []byte
+
+	// flushesSinceStats/metricsSinceStats accumulate what the periodic
+	// stats line reports, and are reset every time it fires. Plain ints,
+	// no atomics: every flushBuffer call happens inside Run's goroutine,
+	// which is also the goroutine that logs them.
+	flushesSinceStats uint64
+	metricsSinceStats uint64
 
 	// processed is the running total of metrics successfully written,
 	// reported on every flush log line. Only ever incremented from
@@ -182,7 +195,16 @@ func (c *Client) Flush(ctx context.Context) error {
 func (c *Client) Run(ctx context.Context) {
 	ticker := time.NewTicker(FlushInterval)
 	defer ticker.Stop()
+
+	statsTicker := time.NewTicker(StatsLogInterval)
+	defer statsTicker.Stop()
+
 	defer c.closeConn()
+
+	// One last summary on the way out, so metrics shipped since the
+	// previous tick are still reported rather than lost because the
+	// shutdown happened to land mid-interval.
+	defer c.logStats()
 
 	for {
 		select {
@@ -210,6 +232,9 @@ func (c *Client) Run(ctx context.Context) {
 		case <-ticker.C:
 			c.flushBuffer(ctx)
 			ticker.Reset(FlushInterval)
+
+		case <-statsTicker.C:
+			c.logStats()
 
 		case req := <-c.flushReq:
 			c.drainPending()
@@ -246,6 +271,30 @@ func (c *Client) finalFlush() {
 	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
 	defer cancel()
 	c.flushBuffer(ctx)
+}
+
+// logStats emits one summary of what this client has shipped since the
+// last call, and is the periodic Info-level replacement for logging every
+// individual flush.
+//
+// Silent when nothing was written, so a worker with perfdata routed to
+// MySQL only - the default - never mentions Graphite at all rather than
+// reporting zeroes forever. Only ever called from Run's goroutine, like
+// the counters it reads.
+func (c *Client) logStats() {
+	if c.flushesSinceStats == 0 {
+		return
+	}
+
+	slog.Info("graphite: write stats",
+		"addr", c.addr,
+		"flushes", c.flushesSinceStats,
+		"metrics", c.metricsSinceStats,
+		"metrics_per_flush", c.metricsSinceStats/c.flushesSinceStats,
+		"total_processed", c.processed.Load())
+
+	c.flushesSinceStats = 0
+	c.metricsSinceStats = 0
 }
 
 // flushBuffer writes the buffered metrics as newline-delimited plaintext
@@ -299,7 +348,15 @@ func (c *Client) flushBuffer(ctx context.Context) error {
 		c.closeConn()
 	} else {
 		total := c.processed.Add(uint64(metrics))
-		slog.Info("graphite: metrics flushed",
+		c.flushesSinceStats++
+		c.metricsSinceStats += uint64(metrics)
+
+		// Debug, not Info: one line per flush, and a flush happens every
+		// time the batch fills or the 250ms ticker expires with anything
+		// buffered - several a second on a busy perfdata queue, which
+		// fills a systemd journal fast. logStats is the Info-level
+		// summary; this stays available at -log-level debug.
+		slog.Debug("graphite: metrics flushed",
 			"addr", c.addr, "metrics", metrics, "duration", duration, "total_processed", total)
 	}
 
