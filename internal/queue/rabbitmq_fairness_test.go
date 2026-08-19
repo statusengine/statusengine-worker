@@ -86,30 +86,46 @@ func TestRabbitMQOneQueueCannotStarveAnother(t *testing.T) {
 	if err != nil {
 		t.Fatalf("amqp dial: %v", err)
 	}
-	defer conn.Close()
 	ch, err := conn.Channel()
 	if err != nil {
 		t.Fatalf("open channel: %v", err)
 	}
-	defer ch.Close()
 
-	// The queues are declared by the consumer with these exact arguments;
-	// publishing to them needs no declaration of its own, but cleaning up
-	// does need a handle, so delete them at the end either way.
+	// Teardown order matters here and is easy to get wrong: Go runs a
+	// test's defers when the function returns and its t.Cleanup callbacks
+	// only afterwards. An earlier version of this test closed the
+	// connection with `defer conn.Close()` and deleted the queues from a
+	// t.Cleanup, so the deletion ran against a connection that was already
+	// gone, silently did nothing (conn.Channel() just errors), and left a
+	// fresh pair of queues on the broker on every single run - one of them
+	// still holding the 50 held messages. The names carry a run id, so it
+	// was litter that accumulated rather than being overwritten.
+	//
+	// Everything therefore goes through t.Cleanup, registered so that LIFO
+	// gives the right order: connection first (runs last), queue deletion
+	// second (runs before it).
+	t.Cleanup(func() { conn.Close() })
 	t.Cleanup(func() {
 		cleanCh, err := conn.Channel()
 		if err != nil {
+			t.Errorf("cleanup: open channel: %v - test queues were left on the broker", err)
 			return
 		}
 		defer cleanCh.Close()
 		for _, q := range []string{busyQueue, quietQueue} {
 			// Purge before delete: an unacked delivery is redelivered on
-			// channel close, and a queue left behind on a shared dev
-			// broker is litter.
-			cleanCh.QueuePurge(q, false)
-			cleanCh.QueueDelete(q, false, false, false)
+			// channel close, and a queue left behind on a shared broker is
+			// litter.
+			if _, err := cleanCh.QueuePurge(q, false); err != nil {
+				t.Errorf("cleanup: purge %s: %v", q, err)
+				continue
+			}
+			if _, err := cleanCh.QueueDelete(q, false, false, false); err != nil {
+				t.Errorf("cleanup: delete %s: %v", q, err)
+			}
 		}
 	})
+	t.Cleanup(func() { ch.Close() })
 
 	publish := func(queue string, n int) {
 		t.Helper()
