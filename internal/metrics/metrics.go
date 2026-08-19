@@ -90,6 +90,13 @@ func InitTable(table string) {
 // queue names and table names, this package owns the full set of values
 // itself, so there is nothing for a caller to pass in and no way for a
 // caller to get it right that this package could not.
+// SetBuildInfo publishes the running binary's identity as the single
+// statusengine_build_info series. Called once at startup; calling it twice
+// with different values would leave both series exported, so it is not.
+func SetBuildInfo(version, revision, goVersion string) {
+	BuildInfo.WithLabelValues(version, revision, goVersion).Set(1)
+}
+
 func init() {
 	for _, component := range Components {
 		PipelineErrorsTotal.WithLabelValues(component)
@@ -454,6 +461,29 @@ var (
 		Name:      "publish_dropped_total",
 		Help:      "Total number of events dropped because the Hub's inbound broadcast buffer was full (events, not frames).",
 	})
+
+	// BuildInfo is the standard Prometheus build-info idiom: a gauge that
+	// is always 1, carrying the interesting values as labels. It answers
+	// "which build is running?" from the same scrape that shows the
+	// behaviour, which is when the question actually gets asked - a stale
+	// binary and a real regression look identical in a log.
+	//
+	// Joining on it is what makes it useful:
+	//
+	//	statusengine_db_events_written_total * on() group_left(version)
+	//	  statusengine_build_info
+	//
+	// The labels are bounded by definition (one build per process), so
+	// this is the one case where labeling with a free-form string does not
+	// risk unbounded cardinality - unlike a client id or a hostname.
+	// Populated by SetBuildInfo below rather than at declaration, so this
+	// package does not depend on internal/version.
+	BuildInfo = promauto.NewGaugeVec(prometheus.GaugeOpts{
+		Namespace: "statusengine",
+		Subsystem: "",
+		Name:      "build_info",
+		Help:      "Always 1. Carries the build identity of the running worker in its labels.",
+	}, []string{"version", "revision", "go_version"})
 
 	// PipelineErrorsTotal counts errors encountered anywhere in the
 	// pipeline, labeled by the component that hit them (ComponentMySQL,

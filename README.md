@@ -299,12 +299,29 @@ The following queue names are also the WebSocket subscription topics:
 ## Build
 
 ```bash
-go build -o simulator ./cmd/simulator
-go build -o gearman_publisher ./cmd/gearman_publisher
-go build -o rabbitmq_publisher ./cmd/rabbitmq_publisher
-go build -o db_verifier ./cmd/db_verifier
-go build -o db_cleanup ./cmd/db_cleanup
-go build -o losstest ./cmd/losstest
+make build          # every binary into bin/, stamped with version information
+make test           # go test ./... -race
+make test-all       # the same, but a missing MySQL/gearmand/RabbitMQ fails
+```
+
+`make build` passes the version through `-ldflags`, which plain `go build` does not, so the binaries can say what they are:
+
+```console
+$ ./bin/worker -version
+statusengine-worker 1.4.0 (commit 8706d2f41f28, built 2026-08-19T17:33:16Z, go1.26.5)
+```
+
+`VERSION` comes from `git describe`; override it for a release built outside a checkout with `make VERSION=1.4.0`. The commit is *not* passed in — `go build` stamps the VCS revision itself, including a `-dirty` marker when the working tree has uncommitted changes, which is worth seeing before trusting a bug report against that binary. A build without the Makefile reports version `dev`, deliberately not `0.0.0`: it should not be mistakable for a release.
+
+The same identity is exported as `statusengine_build_info`, the standard always-1 gauge that carries its information in labels, so "which build is running?" is answerable from the same scrape as the behaviour:
+
+```promql
+statusengine_db_events_written_total * on() group_left(version) statusengine_build_info
+```
+
+Plain `go build` still works for a quick local binary:
+
+```bash
 go build -o worker ./cmd/app
 ```
 

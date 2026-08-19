@@ -235,3 +235,36 @@ func TestAvailabilityGaugesStartAtOne(t *testing.T) {
 		}
 	}
 }
+
+// TestSetBuildInfoExportsExactlyOneSeries. build_info is the one place in
+// this package where a free-form string becomes a label, which is normally
+// how a metric grows unbounded cardinality. It is safe only because there
+// is exactly one build per process and SetBuildInfo is called once - so
+// this pins both halves: the series appears, and there is only ever one of
+// it. A second call with different values would leave both exported, and
+// then a join on build_info silently doubles every joined series.
+func TestSetBuildInfoExportsExactlyOneSeries(t *testing.T) {
+	SetBuildInfo("1.2.3", "abcdef123456", "go1.26.5")
+
+	family := gatherFamily(t, "statusengine_build_info")
+	if family == nil || len(family.series) == 0 {
+		t.Fatal("statusengine_build_info is not exported")
+	}
+	if len(family.series) != 1 {
+		t.Fatalf("statusengine_build_info has %d series, want exactly 1", len(family.series))
+	}
+
+	series := family.series[0]
+	if series.value != 1 {
+		t.Errorf("build_info = %v, want 1 - the value carries no information, the labels do", series.value)
+	}
+	for label, want := range map[string]string{
+		"version":    "1.2.3",
+		"revision":   "abcdef123456",
+		"go_version": "go1.26.5",
+	} {
+		if got := series.labels[label]; got != want {
+			t.Errorf("build_info label %s = %q, want %q", label, got, want)
+		}
+	}
+}

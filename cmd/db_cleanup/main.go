@@ -31,6 +31,7 @@ import (
 	"time"
 
 	"statusengine-worker/internal/cleanup"
+	"statusengine-worker/internal/version"
 
 	_ "github.com/go-sql-driver/mysql"
 	"gopkg.in/yaml.v3"
@@ -347,7 +348,16 @@ func loadConfig() config {
 				t.table, t.column))
 	}
 
+	showVersion := flag.Bool("version", false,
+		"print the build identity and exit")
 	flag.Parse()
+
+	// Worth having on this one too: it runs from cron or a timer, where
+	// nobody watches it start, and it is the binary that deletes rows.
+	if *showVersion {
+		fmt.Println("statusengine-db-cleanup", version.String())
+		os.Exit(0)
+	}
 
 	explicit := make(map[string]bool)
 	flag.Visit(func(f *flag.Flag) { explicit[f.Name] = true })

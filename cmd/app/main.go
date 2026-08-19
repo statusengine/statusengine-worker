@@ -27,7 +27,9 @@ import (
 
 	"statusengine-worker/internal/db"
 	"statusengine-worker/internal/graphite"
+	"statusengine-worker/internal/metrics"
 	"statusengine-worker/internal/queue"
+	"statusengine-worker/internal/version"
 	"statusengine-worker/internal/websocket"
 )
 
@@ -275,7 +277,18 @@ func loadConfig() config {
 		`minimum log level: "debug", "info", "warn" or "error"`)
 	flag.StringVar(&cfg.logFormat, "log-format", "text",
 		`structured log output format: "text" or "json"`)
+	showVersion := flag.Bool("version", false,
+		"print the build identity and exit")
 	flag.Parse()
+
+	// Before anything else can fail: -version has to work on a machine
+	// with no config file, no database and no broker, because "which build
+	// is this?" is a question people ask about a binary that is not
+	// running properly.
+	if *showVersion {
+		fmt.Println("statusengine-worker", version.String())
+		os.Exit(0)
+	}
 
 	explicit := make(map[string]bool)
 	flag.Visit(func(f *flag.Flag) { explicit[f.Name] = true })
@@ -614,6 +627,15 @@ func logConnectionCharset(ctx context.Context, db *sql.DB) {
 func main() {
 	cfg := loadConfig()
 	setupLogger(cfg)
+
+	// The first line in the journal, deliberately: every question that
+	// starts "the worker is doing X" is easier to answer knowing which
+	// build X came from, and a stale binary looks exactly like a
+	// regression until someone checks.
+	slog.Info("statusengine-worker starting",
+		"version", version.Version, "revision", version.Revision(), "go", version.GoVersion())
+	metrics.SetBuildInfo(version.Version, version.Revision(), version.GoVersion())
+
 	if cfg.configFile != "" {
 		slog.Info("config: loaded settings from file", "path", cfg.configFile)
 	}
