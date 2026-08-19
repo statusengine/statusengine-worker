@@ -33,7 +33,7 @@ func TestGearmanConsumerEndToEnd(t *testing.T) {
 
 	out, err := consumer.Start(ctx)
 	if err != nil {
-		t.Skipf("no reachable dev Gearman job server at %s: %v", gearmanAddr, err)
+		skipOrFailService(t, "no reachable dev Gearman job server at %s: %v", gearmanAddr, err)
 	}
 	defer consumer.Stop()
 

@@ -1,0 +1,123 @@
+# The point of this pipeline is not that `go test` passes - it is that the
+# tests which need a broker or a database actually RUN. Fourteen call sites
+# across eight files skip when their service is unreachable, and they cover
+# the properties this worker was hardest to get right: that one busy queue
+# cannot starve another, that a redelivered job does not duplicate rows,
+# that Stop drains instead of dropping. Without the services below, `go
+# test ./...` prints "ok" having verified none of that - green and
+# meaningless. STATUSENGINE_TEST_REQUIRE_SERVICES=1 turns every one of
+# those skips into a failure, so a broken service container fails the build
+# instead of quietly reducing what is covered.
+name: CI
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+
+# A second push to the same branch cancels the first run still in flight.
+concurrency:
+  group: ci-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  test:
+    runs-on: ubuntu-latest
+
+    # Started by the runner before the steps and torn down afterwards, with
+    # their ports published on 127.0.0.1 - which is exactly where the tests
+    # look, so no code needs to know it is running in CI. The health
+    # options make the runner wait until each one answers rather than
+    # racing the first test against a container that is still booting.
+    services:
+      mysql:
+        image: mysql:8.0
+        env:
+          MYSQL_ROOT_PASSWORD: root
+          MYSQL_DATABASE: statusengine-dev
+          MYSQL_USER: statusengine-dev
+          MYSQL_PASSWORD: statusengine-dev
+        ports:
+          - 3306:3306
+        options: >-
+          --health-cmd="mysqladmin ping -h 127.0.0.1 -uroot -proot"
+          --health-interval=5s
+          --health-timeout=5s
+          --health-retries=30
+
+      rabbitmq:
+        image: rabbitmq:3-alpine
+        env:
+          RABBITMQ_DEFAULT_USER: statusengine
+          RABBITMQ_DEFAULT_PASS: statusengine
+        ports:
+          - 5672:5672
+        options: >-
+          --health-cmd="rabbitmq-diagnostics -q ping"
+          --health-interval=5s
+          --health-timeout=10s
+          --health-retries=30
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-go@v5
+        with:
+          # Read from go.mod so the toolchain is never pinned in two places.
+          go-version-file: go.mod
+          cache: true
+
+      # gearmand has no official image, so it is installed on the runner
+      # rather than run as a service container. The Ubuntu package starts
+      # it on 127.0.0.1:4730, which is where the tests look.
+      - name: Install gearmand
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y gearman-job-server
+          sudo systemctl start gearman-job-server || sudo service gearman-job-server start
+
+      - name: Wait for gearmand
+        run: |
+          for i in $(seq 1 30); do
+            if (exec 3<>/dev/tcp/127.0.0.1/4730) 2>/dev/null; then
+              echo "gearmand is up"; exit 0
+            fi
+            sleep 1
+          done
+          echo "gearmand never came up on 127.0.0.1:4730" >&2
+          exit 1
+
+      # The dump is the schema CLAUDE.md treats as authoritative, and the
+      # same file TestRedeliverySafePKColumnsMatchSchema parses. It carries
+      # DROP TABLE statements, which is why it is only ever loaded into a
+      # throwaway database like this one.
+      - name: Load MySQL schema
+        run: |
+          mysql -h 127.0.0.1 -P 3306 -u statusengine-dev -pstatusengine-dev \
+            statusengine-dev < .claude/specs/mysql_schema.sql
+          mysql -h 127.0.0.1 -P 3306 -u statusengine-dev -pstatusengine-dev \
+            statusengine-dev -e "SHOW TABLES;"
+
+      - name: gofmt
+        run: |
+          unformatted=$(gofmt -l ./cmd ./internal)
+          if [ -n "$unformatted" ]; then
+            echo "not gofmt-clean:" >&2
+            echo "$unformatted" >&2
+            exit 1
+          fi
+
+      - name: go vet
+        run: go vet ./...
+
+      # Every binary, not just the ones with tests - a cmd/ tool that stops
+      # compiling is a broken release even if no test covers it.
+      - name: Build
+        run: go build ./...
+
+      - name: Test
+        env:
+          # The line that makes this pipeline mean something. See the
+          # comment at the top of this file.
+          STATUSENGINE_TEST_REQUIRE_SERVICES: "1"
+        run: go test ./... -race -count=1

@@ -28,7 +28,7 @@ func TestRabbitMQConsumerEndToEnd(t *testing.T) {
 
 	out, err := consumer.Start(ctx)
 	if err != nil {
-		t.Skipf("no reachable dev RabbitMQ broker at %s: %v", rabbitmqURL, err)
+		skipOrFailService(t, "no reachable dev RabbitMQ broker at %s: %v", rabbitmqURL, err)
 	}
 	defer consumer.Stop()
 
@@ -107,7 +107,7 @@ func TestRabbitMQConsumerReconnectsAfterConnectionDrop(t *testing.T) {
 	defer cancel()
 
 	if _, err := consumer.Start(ctx); err != nil {
-		t.Skipf("no reachable dev RabbitMQ broker at %s: %v", rabbitmqURL, err)
+		skipOrFailService(t, "no reachable dev RabbitMQ broker at %s: %v", rabbitmqURL, err)
 	}
 	defer consumer.Stop()
 

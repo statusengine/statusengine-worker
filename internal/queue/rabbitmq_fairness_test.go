@@ -73,7 +73,7 @@ func TestRabbitMQOneQueueCannotStarveAnother(t *testing.T) {
 	defer cancel()
 
 	if _, err := consumer.Start(ctx); err != nil {
-		t.Skipf("no reachable dev RabbitMQ broker at %s: %v", rabbitmqURL, err)
+		skipOrFailService(t, "no reachable dev RabbitMQ broker at %s: %v", rabbitmqURL, err)
 	}
 	// close(release) before Stop, or Stop waits out its drain timeout on
 	// handlers this test is deliberately holding.

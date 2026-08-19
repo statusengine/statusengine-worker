@@ -69,7 +69,7 @@ func TestOneQueueCannotConsumeTheWholeJobBudget(t *testing.T) {
 
 	cli, err := gearmanClient.New(gearmanClient.Network, gearmanAddr)
 	if err != nil {
-		t.Skipf("no reachable dev Gearman job server at %s: %v", gearmanAddr, err)
+		skipOrFailService(t, "no reachable dev Gearman job server at %s: %v", gearmanAddr, err)
 	}
 	defer cli.Close()
 
@@ -78,7 +78,7 @@ func TestOneQueueCannotConsumeTheWholeJobBudget(t *testing.T) {
 	defer cancel()
 
 	if _, err := consumer.Start(ctx); err != nil {
-		t.Skipf("no reachable dev Gearman job server at %s: %v", gearmanAddr, err)
+		skipOrFailService(t, "no reachable dev Gearman job server at %s: %v", gearmanAddr, err)
 	}
 	// LIFO: release the held handlers first, so Stop's handlerWG.Wait can
 	// return and no job is left queued on the shared dev server.
@@ -141,7 +141,7 @@ func TestCloseWorkersDrainsInParallel(t *testing.T) {
 
 	cli, err := gearmanClient.New(gearmanClient.Network, gearmanAddr)
 	if err != nil {
-		t.Skipf("no reachable dev Gearman job server at %s: %v", gearmanAddr, err)
+		skipOrFailService(t, "no reachable dev Gearman job server at %s: %v", gearmanAddr, err)
 	}
 	defer cli.Close()
 
@@ -169,7 +169,7 @@ func TestCloseWorkersDrainsInParallel(t *testing.T) {
 
 		w := gearman.New(1)
 		if err := w.AddServer(gearman.Network, gearmanAddr); err != nil {
-			t.Skipf("no reachable dev Gearman job server at %s: %v", gearmanAddr, err)
+			skipOrFailService(t, "no reachable dev Gearman job server at %s: %v", gearmanAddr, err)
 		}
 		w.ErrorHandler = func(error) {} // the drain timeout is expected here
 		if err := w.AddFunc(fnNames[i], func(gearman.Job) ([]byte, error) {

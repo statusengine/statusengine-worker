@@ -1,5 +1,7 @@
 # Statusengine Worker (Go)
 
+[![CI](https://github.com/statusengine/statusengine-worker/actions/workflows/ci.yml/badge.svg)](https://github.com/statusengine/statusengine-worker/actions/workflows/ci.yml)
+
 This project is the next-generation successor to the original PHP Statusengine Worker:
 https://github.com/statusengine/worker
 
@@ -499,8 +501,24 @@ then visit `http://localhost:8000`.
 ## Testing
 
 ```bash
-go test ./... -v -race
+go test ./... -race -count=1
 ```
+
+Tests that need a real MySQL, gearmand or RabbitMQ **skip** when it is not reachable, so the suite is usable without setting up all three. That is a convenience locally and a trap in a pipeline: fourteen call sites across eight files skip that way, and they cover the properties that were hardest to get right — that one busy queue cannot starve another, that a redelivered job does not duplicate rows, that `Stop` drains rather than drops. A CI job without those services prints `ok` having verified none of it.
+
+So CI sets one environment variable, and every one of those skips becomes a failure instead:
+
+```bash
+STATUSENGINE_TEST_REQUIRE_SERVICES=1 go test ./... -race -count=1
+```
+
+Use it locally too when you want to be sure you ran everything. The services it expects are the dev ones documented in `.claude/specs/ressources.txt`: MySQL on `127.0.0.1:3306` (`statusengine-dev`/`statusengine-dev`), gearmand on `127.0.0.1:4730`, RabbitMQ on `127.0.0.1:5672` (`statusengine`/`statusengine`).
+
+### What CI runs
+
+`.github/workflows/ci.yml`, on every push to `main` and every pull request: `gofmt -l`, `go vet`, `go build ./...` (every binary, not just the tested packages) and the suite above with `-race`. MySQL and RabbitMQ come from service containers, gearmand is installed on the runner because it has no official image, and `.claude/specs/mysql_schema.sql` is loaded into the throwaway database — never into a real one, it starts with 22 `DROP TABLE` statements.
+
+`cmd/losstest` is deliberately not part of CI. It needs a sustained multi-second load and a `SIGTERM` timed into the middle of it; see [Verify No Events Are Lost](#verify-no-events-are-lost) and run it before a release.
 
 ## Notes on Queue Payload Shape
 

@@ -49,7 +49,7 @@ func readSchema(t *testing.T) string {
 	t.Helper()
 	raw, err := os.ReadFile(schemaPath)
 	if err != nil {
-		t.Skipf("schema dump unavailable: %v", err)
+		skipOrFailService(t, "schema dump unavailable: %v", err)
 	}
 	return string(raw)
 }

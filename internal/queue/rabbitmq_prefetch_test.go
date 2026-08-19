@@ -49,7 +49,7 @@ func TestRabbitMQConsumerPrefetchKeepsBacklogAtTheBroker(t *testing.T) {
 
 	conn, err := amqp.Dial(rabbitmqURL)
 	if err != nil {
-		t.Skipf("no reachable dev RabbitMQ broker at %s: %v", rabbitmqURL, err)
+		skipOrFailService(t, "no reachable dev RabbitMQ broker at %s: %v", rabbitmqURL, err)
 	}
 	defer conn.Close()
 	ch, err := conn.Channel()
@@ -90,7 +90,7 @@ func TestRabbitMQConsumerPrefetchKeepsBacklogAtTheBroker(t *testing.T) {
 	}
 
 	if _, err := consumer.Start(ctx); err != nil {
-		t.Skipf("no reachable dev RabbitMQ broker at %s: %v", rabbitmqURL, err)
+		skipOrFailService(t, "no reachable dev RabbitMQ broker at %s: %v", rabbitmqURL, err)
 	}
 
 	// Let the broker push whatever it is willing to push.

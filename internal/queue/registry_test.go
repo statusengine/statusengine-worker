@@ -24,14 +24,14 @@ func openTestDB(t *testing.T) *sql.DB {
 	t.Helper()
 	sqlDB, err := sql.Open("mysql", testDSN)
 	if err != nil {
-		t.Skipf("mysql driver open: %v", err)
+		skipOrFailService(t, "mysql driver open: %v", err)
 	}
 	t.Cleanup(func() { sqlDB.Close() })
 
 	pingCtx, cancel := context.WithTimeout(context.Background(), 2*time.Second)
 	defer cancel()
 	if err := sqlDB.PingContext(pingCtx); err != nil {
-		t.Skipf("no reachable dev MySQL at %s: %v", testDSN, err)
+		skipOrFailService(t, "no reachable dev MySQL at %s: %v", testDSN, err)
 	}
 	return sqlDB
 }

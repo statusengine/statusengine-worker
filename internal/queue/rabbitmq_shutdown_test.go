@@ -47,7 +47,7 @@ func TestRabbitMQConsumerStopUnderLoadClosesOutputSafely(t *testing.T) {
 
 	out, err := consumer.Start(ctx)
 	if err != nil {
-		t.Skipf("no reachable dev RabbitMQ broker at %s: %v", rabbitmqURL, err)
+		skipOrFailService(t, "no reachable dev RabbitMQ broker at %s: %v", rabbitmqURL, err)
 	}
 	defer consumer.Stop()
 
