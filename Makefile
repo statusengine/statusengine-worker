@@ -1,18 +1,18 @@
-# Build entry point for this repository. Its main job is that the binaries
-# know what they are: `go build` on its own produces a worker that reports
-# version "dev", which is honest but not useful in a changelog or a bug
-# report.
+# A command runner, deliberately - every target is .PHONY and nothing here
+# declares a file dependency.
 #
-# VERSION comes from the closest git tag, so a tagged build reports that
-# tag and an untagged one reports the tag plus how far past it the commit
-# is. Override it for a release built outside git:
+# That is not laziness, it is the correct shape for a Go repository. Go
+# already has a build cache that tracks source contents, imports and build
+# flags, so `go build` on an unchanged tree is near-instant and on a
+# changed one is correct. Layering make's timestamp rules on top of that
+# adds no speed and one new way to be wrong: an earlier version of this
+# file declared `bin/worker` as a target with no prerequisites on the
+# sources, so once the binary existed `make build` reported "Nothing to be
+# done" and happily kept shipping a stale binary after every edit. A build
+# system that silently produces yesterday's artefact is worse than no build
+# system at all.
 #
-#	make VERSION=1.4.0
-#
-# The commit is not passed in: `go build` stamps the VCS revision into the
-# binary by itself, including a -dirty marker when the working tree has
-# uncommitted changes, and re-deriving it here would only risk disagreeing
-# with the toolchain.
+# So: make decides *what to run*, Go decides *what to rebuild*.
 
 VERSION ?= $(shell git describe --tags --always --dirty 2>/dev/null || echo dev)
 DATE    ?= $(shell date -u +%Y-%m-%dT%H:%M:%SZ)
@@ -20,46 +20,55 @@ PKG     := statusengine-worker/internal/version
 LDFLAGS := -X $(PKG).Version=$(VERSION) -X $(PKG).Date=$(DATE)
 
 BINDIR  := bin
-BINARIES := worker db_cleanup db_verifier simulator gearman_publisher rabbitmq_publisher losstest
+GO      := go
 
-.PHONY: all build test test-all vet fmt clean install install-systemd
+# The commit is deliberately not passed in: `go build` stamps the VCS
+# revision itself, including a -dirty marker, and re-deriving it here would
+# only risk disagreeing with the toolchain.
+BUILD   := $(GO) build -ldflags "$(LDFLAGS)"
+
+.PHONY: all build test test-all vet fmt clean install install-systemd help
 
 all: build
 
-## build: compile every binary into bin/ with version information
-build: $(addprefix $(BINDIR)/,$(BINARIES))
+## help: list the targets
+help:
+	@grep -E '^## ' $(MAKEFILE_LIST) | sed 's/^## /  /'
 
-$(BINDIR)/worker: | $(BINDIR)
-	go build -ldflags "$(LDFLAGS)" -o $@ ./cmd/app
+## build: compile every binary into bin/, stamped with version information
+build:
+	@mkdir -p $(BINDIR)
+	$(BUILD) -o $(BINDIR)/worker             ./cmd/app
+	$(BUILD) -o $(BINDIR)/db_cleanup         ./cmd/db_cleanup
+	$(BUILD) -o $(BINDIR)/db_verifier        ./cmd/db_verifier
+	$(BUILD) -o $(BINDIR)/simulator          ./cmd/simulator
+	$(BUILD) -o $(BINDIR)/gearman_publisher  ./cmd/gearman_publisher
+	$(BUILD) -o $(BINDIR)/rabbitmq_publisher ./cmd/rabbitmq_publisher
+	$(BUILD) -o $(BINDIR)/losstest           ./cmd/losstest
 
-$(BINDIR)/%: | $(BINDIR)
-	go build -ldflags "$(LDFLAGS)" -o $@ ./cmd/$*
-
-$(BINDIR):
-	mkdir -p $(BINDIR)
-
-## test: run the suite, skipping tests whose services are unavailable
+## test: run the suite; tests whose service is unreachable skip
 test:
-	go test ./... -race -count=1
+	$(GO) test ./... -race -count=1
 
-## test-all: run the suite and FAIL if MySQL, gearmand or RabbitMQ is missing
-## (what CI runs - see .github/workflows/ci.yml)
+## test-all: run the suite; a missing MySQL/gearmand/RabbitMQ FAILS (what CI runs)
 test-all:
-	STATUSENGINE_TEST_REQUIRE_SERVICES=1 go test ./... -race -count=1
+	STATUSENGINE_TEST_REQUIRE_SERVICES=1 $(GO) test ./... -race -count=1
 
+## vet: go vet ./...
 vet:
-	go vet ./...
+	$(GO) vet ./...
 
+## fmt: list files that are not gofmt-clean (prints nothing when clean)
 fmt:
-	gofmt -l ./cmd ./internal
+	@gofmt -l ./cmd ./internal
 
+## clean: remove bin/
 clean:
 	rm -rf $(BINDIR)
 
-## install: install the two long-running binaries under the names the unit
-## files expect. Everything else in bin/ is a development tool and stays out.
+## install: install the two long-running binaries under the names the units expect
 install: build
-	install -m 0755 $(BINDIR)/worker /usr/local/bin/statusengine-worker
+	install -m 0755 $(BINDIR)/worker     /usr/local/bin/statusengine-worker
 	install -m 0755 $(BINDIR)/db_cleanup /usr/local/bin/statusengine-db-cleanup
 
 ## install-systemd: install the unit files; does not enable or start them

@@ -302,7 +302,10 @@ The following queue names are also the WebSocket subscription topics:
 make build          # every binary into bin/, stamped with version information
 make test           # go test ./... -race
 make test-all       # the same, but a missing MySQL/gearmand/RabbitMQ fails
+make help           # list the targets
 ```
+
+The Makefile is a command runner and nothing more: every target is `.PHONY`, none declares a file dependency. Go's build cache already tracks source contents, imports and build flags, so make's timestamp rules would add no speed and one way to be wrong — an earlier version of this file did exactly that, reporting "Nothing to be done" after a source edit and shipping a stale binary. Rebuilding all seven binaries on an unchanged tree takes about 2.7s, almost all of it linking.
 
 `make build` passes the version through `-ldflags`, which plain `go build` does not, so the binaries can say what they are:
 
