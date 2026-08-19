@@ -243,6 +243,21 @@ Measured against a 2,000-job `servicestatus` backlog with 200 `hostchecks` jobs 
 
 This is what the legacy PHP worker gets from forking one client per queue, and what the RabbitMQ consumer here already did with one channel and one consume loop per queue — the two backends were behaving differently, which was never intentional.
 
+### Does RabbitMQ have the same problem?
+
+No, and this is measured rather than inferred from the shape of the code (`TestRabbitMQOneQueueCannotStarveAnother`). The shape alone does not settle it: one channel per queue still means every channel is multiplexed over a **single TCP connection**, and amqp091-go reads that connection in one goroutine which dispatches frames to channels synchronously — structurally the same hazard as the Gearman `Work()` loop above.
+
+What breaks the coupling is inside the library: every consumer gets its own goroutine holding an unbounded buffer between the connection reader and the delivery channel the application ranges over. A handler stuck behind MySQL backs up into that buffer, not into the connection, and `Qos(prefetch)` bounds how far it can back up per channel. The counter-proof — one shared dispatch goroutine across all queues — fails the test deterministically.
+
+One difference between the backends *is* real and worth knowing, because it is not what the flag name suggests:
+
+| | Concurrent handlers per queue | What the cap bounds |
+|---|---|---|
+| Gearman | `-gearman-max-concurrent-jobs-per-queue` (default 8) | concurrency |
+| RabbitMQ | **always 1** | `-rabbitmq-prefetch` bounds *buffered unacked messages*, not concurrency |
+
+`consumeLoop` calls its handler synchronously from a plain `for range` over the delivery channel, so a RabbitMQ queue processes one message at a time no matter how high the prefetch is (measured at prefetch 20: max 1 concurrent handler, 40 × 20 ms of work in 819 ms). Per-queue throughput on the RabbitMQ backend is therefore bounded by one handler's latency. Gearman is the production backend, so this is recorded rather than changed — adding concurrency there would give up in-order processing per queue, which is a design decision rather than a tuning knob.
+
 Two consequences worth knowing:
 
 - **The concurrency cap is per queue** (`-gearman-max-concurrent-jobs-per-queue`, default `8`), so the process-wide worst case is that times the number of queues. It replaces `-gearman-max-concurrent-jobs`, and the old config key or environment variable makes the worker refuse to start — carrying a `64` over would mean 768 concurrent handlers, which is the unbounded-memory situation the cap exists to prevent.
@@ -303,7 +318,7 @@ Useful flags:
 - `-mysql-dsn`: MySQL DSN
 - `-mysql-batch-size`: rows buffered per table before a bulk `INSERT` is flushed ahead of the 250ms ticker (default `100`, maximum `700`). See [Choosing a batch size](#choosing-a-batch-size)
 - `-gearman-max-concurrent-jobs-per-queue`: job handlers running at once **per queue** (default `8`). Per queue, not shared — see [One connection per queue](#one-connection-per-queue). Replaces `-gearman-max-concurrent-jobs`, whose value must not be carried over: the worker refuses to start if the old config key or environment variable is still set
-- `-rabbitmq-prefetch`: unacknowledged deliveries the broker may push, also per queue (default `100`)
+- `-rabbitmq-prefetch`: unacknowledged deliveries the broker may push, also per queue (default `100`). This bounds buffered messages, not concurrency — a RabbitMQ queue always processes one message at a time, see [One connection per queue](#one-connection-per-queue)
 - `-listen-addr`: WebSocket server listen address (default `127.0.0.1:8080` — **loopback only**; exposing it on the network is an explicit opt-in, e.g. `-listen-addr :8080`)
 - `-api-keys`: comma-separated API keys accepted by `/ws`. Leaving this empty does **not** disable authentication — the worker generates a random key at startup and logs it as a warning instead, so an unconfigured worker is never an open event stream
 - `-metrics-listen-addr`: Prometheus server listen address (default `:9105`)
