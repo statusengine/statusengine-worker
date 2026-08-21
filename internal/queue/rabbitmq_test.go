@@ -2,6 +2,7 @@ package queue
 
 import (
 	"context"
+	"os"
 	"testing"
 	"time"
 
@@ -9,8 +10,38 @@ import (
 )
 
 // rabbitmqURL points at the local dev RabbitMQ broker documented in
-// .claude/specs/ressources.txt.
-const rabbitmqURL = "amqp://statusengine:statusengine@127.0.0.1:5672/"
+// .claude/specs/ressources.txt, unless STATUSENGINE_TEST_RABBITMQ_URL says
+// otherwise. That override is what makes "run the suite against a different
+// broker version" a command rather than a source edit - and the durable
+// queue declaration these tests share exists precisely because RabbitMQ 4
+// refuses the non-durable one, which is a claim only a run against a
+// RabbitMQ 4 broker can settle.
+var rabbitmqURL = envOrDefaultTest("STATUSENGINE_TEST_RABBITMQ_URL",
+	"amqp://statusengine:statusengine@127.0.0.1:5672/")
+
+func envOrDefaultTest(key, fallback string) string {
+	if v := os.Getenv(key); v != "" {
+		return v
+	}
+	return fallback
+}
+
+// declareTestQueue declares a queue with the exact argument list
+// RabbitMQConsumer.connect uses (internal/queue/rabbitmq.go). A test that
+// publishes into a queue the consumer also declares has to match it
+// argument for argument, or whichever declaration arrives second is
+// answered with a 406 PRECONDITION_FAILED - so this is one helper rather
+// than a literal repeated across files, where the copies drift apart
+// silently until a test fails for a reason that has nothing to do with
+// what it tests.
+func declareTestQueue(t *testing.T, ch *amqp.Channel, name string) amqp.Queue {
+	t.Helper()
+	q, err := ch.QueueDeclare(name, true, false, false, false, nil)
+	if err != nil {
+		t.Fatalf("declare queue %s: %v", name, err)
+	}
+	return q
+}
 
 func TestRabbitMQConsumerEndToEnd(t *testing.T) {
 	received := make(chan []byte, 1)

@@ -114,12 +114,11 @@ func main() {
 	defer ch.Close()
 
 	// Declared with the exact same arguments RabbitMQConsumer uses (see
-	// internal/queue/rabbitmq.go's connect) - not durable, matching how the
-	// real broker's statusngin_* queues are already declared (see
-	// .claude/specs/ressources.txt) - so this tool works whether it or the
-	// consumer connects first, and a mismatched redeclare never trips
-	// RabbitMQ's 406 PRECONDITION_FAILED check.
-	if _, err := ch.QueueDeclare(*queueName, false, false, false, false, nil); err != nil {
+	// internal/queue/rabbitmq.go's connect, which explains why durable) - so
+	// this tool works whether it or the consumer connects first, and a
+	// mismatched redeclare never trips RabbitMQ's 406 PRECONDITION_FAILED
+	// check. If that argument list ever changes, it changes in both places.
+	if _, err := ch.QueueDeclare(*queueName, true, false, false, false, nil); err != nil {
 		fatal("declare queue failed", "queue", *queueName, "error", err)
 	}
 

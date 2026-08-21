@@ -269,6 +269,42 @@ Two consequences worth knowing:
 
 gearmand's `--round-robin` is a related but separate thing: it changes which queue the *server* offers next, and would have spread the shared budget around without removing the coupling, which lived in this process. It is also off by default on gearmand 1.x. Correctness here no longer depends on it.
 
+## RabbitMQ Queue Durability
+
+Every queue is declared **durable**, and the events inside it stay **transient**. Those are two different AMQP properties, and keeping them apart is the whole point of this section.
+
+### Why durable
+
+A queue that is neither durable nor exclusive is RabbitMQ's deprecated `transient_nonexcl_queues` feature. That is not just a warning any more:
+
+| Broker | State of `transient_nonexcl_queues` | Effect on this worker |
+|---|---|---|
+| 3.9 | not yet flagged | works |
+| 3.13 | `permitted_by_default` | works, one deprecation warning per broker start |
+| 4.x | **`denied_by_default`** | every `queue.declare` refused — the worker declares nothing and consumes nothing |
+
+Measured against RabbitMQ 4.3.5: with non-durable declarations, 5 of the 8 RabbitMQ tests fail — every one that needs a connection. With durable ones, 8 of 8 pass. Durable queues have worked since AMQP 0-9-1, so this is the only setting that works on every broker version, and CI now runs the suite against both `rabbitmq:3-alpine` and `rabbitmq:4-alpine`.
+
+### Durable does not mean the events go to disk
+
+Queue durability stores the queue *definition*. Whether a **message** survives a restart is set per message by the publisher, and nothing here marks messages persistent — neither the [NEB broker module](https://github.com/statusengine/broker) (`amqp_basic_publish(..., properties=nullptr, ...)`) nor `cmd/rabbitmq_publisher`. From the RabbitMQ documentation: *"Messages published as transient will be discarded during recovery, even if they were stored in durable queues."*
+
+So the behaviour that matters is unchanged: queues buffer in RAM while no worker is connected, and a broker restart empties them. Verified rather than assumed — 5 messages in a durable queue, `docker restart`, queue still there with **0 messages**. Publishing throughput is unaffected: 20,000 events took 0.22–0.23 s with durable queues and 0.22–0.23 s without, three runs each.
+
+### Both sides must agree, and migrating costs one deletion
+
+The NEB broker declares these same queues, with durability from its `DurableQueues` setting — whose default changed to `true` alongside this. AMQP does not reconcile a mismatch, it refuses it: whichever side declares second gets a **406 PRECONDITION_FAILED**, and for the broker that means it fails to connect at all.
+
+Existing installations therefore need a one-off migration, because the queues already exist as non-durable:
+
+1. Stop the monitoring core (and so the NEB module) and the worker.
+2. Delete the `statusngin_*` queues and the `statusengine` exchange.
+3. Start both again — whichever comes first re-creates them, durable.
+
+Messages sitting in those queues are lost in step 2. That is acceptable for the same reason the whole design is: they are transient and would not have survived a broker restart either, so the natural moment for this is a restart that was going to happen anyway.
+
+Both start orders were verified against a real Naemon with the real broker module — worker first, then Naemon, and the other way round — with no 406 in either.
+
 ## Discarding Superseded Status Events
 
 `statusngin_hoststatus` and `statusngin_servicestatus` carry a full snapshot of an object's current state, re-sent on every check and upserted into a table that holds exactly one row per object. A snapshot from ten minutes ago has no reader left: MySQL holds a newer one already, and a dashboard showing it would be showing something untrue.
@@ -577,9 +613,22 @@ STATUSENGINE_TEST_REQUIRE_SERVICES=1 go test ./... -race -count=1
 
 Use it locally too when you want to be sure you ran everything. The services it expects are the dev ones documented in `.claude/specs/ressources.txt`: MySQL on `127.0.0.1:3306` (`statusengine-dev`/`statusengine-dev`), gearmand on `127.0.0.1:4730`, RabbitMQ on `127.0.0.1:5672` (`statusengine`/`statusengine`).
 
+`STATUSENGINE_TEST_RABBITMQ_URL` overrides the last of those, which is how the suite gets pointed at a broker of a different version — the check behind [RabbitMQ Queue Durability](#rabbitmq-queue-durability), and the reason it is a command rather than a source edit:
+
+```bash
+docker run -d --name se-rmq4 -p 5673:5672 --user 0:0 \
+  -e RABBITMQ_DEFAULT_USER=statusengine -e RABBITMQ_DEFAULT_PASS=statusengine \
+  rabbitmq:4-alpine
+
+STATUSENGINE_TEST_RABBITMQ_URL=amqp://statusengine:statusengine@127.0.0.1:5673/ \
+  STATUSENGINE_TEST_REQUIRE_SERVICES=1 go test ./internal/queue/ -race -count=1 -run RabbitMQ
+```
+
 ### What CI runs
 
 `.github/workflows/ci.yml`, on every push to `main` and every pull request: `gofmt -l`, `go vet`, `go build ./...` (every binary, not just the tested packages) and the suite above with `-race`. MySQL and RabbitMQ come from service containers, gearmand is installed on the runner because it has no official image, and `.claude/specs/mysql_schema.sql` is loaded into the throwaway database — never into a real one, it starts with 22 `DROP TABLE` statements.
+
+The RabbitMQ container is a **matrix axis** over `3-alpine` and `4-alpine`, so the job runs twice. That is not thoroughness for its own sake: the worker was already broken by a RabbitMQ version once, and the only trace was a deprecation warning in a container log. See [RabbitMQ Queue Durability](#rabbitmq-queue-durability).
 
 The two container-based halves were verified against real containers before the first push, rather than on the first red build:
 
@@ -589,6 +638,7 @@ The two container-based halves were verified against real containers before the 
 | Loaded schema vs. the dev database | 295 columns, 56 primary-key columns and every index **identical** |
 | The five MySQL-backed tests against an **empty** database | pass — none of them depends on leftover rows |
 | All eight RabbitMQ tests against `rabbitmq:3-alpine` | pass under `-race` with `STATUSENGINE_TEST_REQUIRE_SERVICES=1` |
+| All eight RabbitMQ tests against `rabbitmq:4-alpine` (4.3.5) | pass — and fail 5 of 8 if the queue declaration is put back to non-durable |
 
 The gearmand step is the part that could not be rehearsed locally, so it does not assume: it starts the packaged service, waits, and falls back to launching `/usr/sbin/gearmand` directly if that did not bring the port up — failing the step either way if nothing is listening after both attempts.
 

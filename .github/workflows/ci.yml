@@ -24,6 +24,20 @@ jobs:
   test:
     runs-on: ubuntu-latest
 
+    # The RabbitMQ version is a matrix axis because the worker has already
+    # been broken by one: declaring a queue that is neither durable nor
+    # exclusive is the deprecated transient_nonexcl_queues feature, which
+    # 4.x refuses outright - the worker declared nothing and consumed
+    # nothing, and the only trace was a deprecation warning in a container
+    # log nobody reads. Both versions run so that the fix is proven on 4
+    # *and* proven not to have broken 3, since installations run both.
+    strategy:
+      fail-fast: false
+      matrix:
+        rabbitmq: ["3-alpine", "4-alpine"]
+
+    name: test (rabbitmq ${{ matrix.rabbitmq }})
+
     # Started by the runner before the steps and torn down afterwards, with
     # their ports published on 127.0.0.1 - which is exactly where the tests
     # look, so no code needs to know it is running in CI. The health
@@ -46,7 +60,7 @@ jobs:
           --health-retries=30
 
       rabbitmq:
-        image: rabbitmq:3-alpine
+        image: rabbitmq:${{ matrix.rabbitmq }}
         env:
           RABBITMQ_DEFAULT_USER: statusengine
           RABBITMQ_DEFAULT_PASS: statusengine

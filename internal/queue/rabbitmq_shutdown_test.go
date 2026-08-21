@@ -95,9 +95,7 @@ func TestRabbitMQConsumerStopUnderLoadClosesOutputSafely(t *testing.T) {
 		t.Fatalf("open channel: %v", err)
 	}
 	defer ch.Close()
-	if _, err := ch.QueueDeclare(queueName, false, false, false, false, nil); err != nil {
-		t.Fatalf("declare queue: %v", err)
-	}
+	declareTestQueue(t, ch, queueName)
 
 	const messages = 200
 	for i := 0; i < messages; i++ {

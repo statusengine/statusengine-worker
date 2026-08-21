@@ -8,3 +8,16 @@ Gearman Job Server: 127.0.0.1:4730
 RabbitMQ Server: 127.0.0.1:5672
 Benutzername: statusengine
 Passwort: statusengine
+
+
+Statusengine Broker
+
+Code location: /home/nook24/git/broker/
+
+Build Commands
+export PKG_CONFIG_PATH=/opt/naemon/lib/pkgconfig
+meson setup --buildtype=release build
+ninja -C build
+
+The Broker Module is a shared library which lives inside the Naemon Core, you have to start Naemon itself to test it like so:
+/opt/naemon/bin/naemon /opt/naemon/etc/naemon/naemon.cfg

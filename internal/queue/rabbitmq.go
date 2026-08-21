@@ -42,13 +42,34 @@ const stopDrainTimeout = 5 * time.Second
 // each delivery's body is decoded and dispatched by the matching Handler,
 // then acked (or nacked-and-requeued on handler failure).
 //
-// Every queue in the Router is declared (not durable, not auto-deleted, not
-// exclusive - matching the real broker's own statusngin_* queues, see
-// .claude/specs/ressources.txt) before consuming, so this consumer works
-// whether it or a publisher (e.g. cmd/rabbitmq_publisher) connects first -
-// RabbitMQ queue declaration is idempotent as long as every declaration
-// agrees on the same arguments, which is why cmd/rabbitmq_publisher
-// declares with the exact same arguments.
+// Every queue in the Router is declared (durable, not auto-deleted, not
+// exclusive) before consuming, so this consumer works whether it or a
+// publisher connects first - RabbitMQ queue declaration is idempotent as
+// long as every declaration agrees on the same arguments.
+//
+// Durable is load-bearing rather than a preference. A queue that is
+// neither durable nor exclusive is RabbitMQ's deprecated
+// transient_nonexcl_queues feature: 3.13 logs a warning once per broker
+// start, and 4.x refuses the declare outright with a connection
+// exception, so the worker declares nothing and consumes nothing. Durable
+// has worked since AMQP 0-9-1, which makes it the only setting that works
+// on every broker version this worker might meet.
+//
+// It does not make the events survive a broker restart, and is not meant
+// to. Queue durability and message persistence are separate properties:
+// durable stores the queue *definition* on disk, while a message is only
+// written durably if its publisher marked it persistent. The Statusengine
+// NEB broker publishes with no delivery_mode at all
+// (amqp_basic_publish(..., properties=nullptr, ...) in
+// src/MessageHandler/RabbitmqClient.cpp), i.e. transient - so the queues
+// still buffer in RAM while no worker is connected, and a broker restart
+// still empties them. That is the intended behaviour and the change to
+// durable preserves it exactly.
+//
+// The NEB broker declares these same queues, with durable taken from its
+// DurableQueues setting. Both sides have to agree or whichever declares
+// second gets a 406 PRECONDITION_FAILED, which is why
+// cmd/rabbitmq_publisher and the tests declare with identical arguments.
 //
 // If the underlying connection drops unexpectedly, a background supervisor
 // goroutine redials, redeclares every queue and resumes consuming - see
@@ -159,16 +180,20 @@ func (c *RabbitMQConsumer) connect(ctx context.Context, out chan<- Message) erro
 			return fmt.Errorf("rabbitmq: open channel for %q: %w", queueName, err)
 		}
 
-		// Declare rather than assume the queue already exists (unlike the
-		// original implementation): whichever side connects first - this
-		// consumer or a publisher - creates it. Not durable, matching how
-		// the real broker's statusngin_* queues are already declared (see
-		// .claude/specs/ressources.txt); this must stay identical to
-		// cmd/rabbitmq_publisher's declaration, or RabbitMQ rejects the
-		// mismatched redeclare with a 406 PRECONDITION_FAILED channel error.
-		if _, err := ch.QueueDeclare(queueName, false, false, false, false, nil); err != nil {
+		// Declare rather than assume the queue already exists: whichever
+		// side connects first - this consumer, the NEB broker or a
+		// publisher - creates it. Durable for the reasons in the type
+		// comment above; every other flag stays false.
+		if _, err := ch.QueueDeclare(queueName, true, false, false, false, nil); err != nil {
 			conn.Close()
-			return fmt.Errorf("rabbitmq: declare queue %q: %w", queueName, err)
+			// A 406 PRECONDITION_FAILED here is by far the likeliest
+			// failure and says nothing useful on its own, so name the
+			// cause: someone else declared this queue with different
+			// arguments, and the argument that realistically differs is
+			// durability.
+			return fmt.Errorf("rabbitmq: declare queue %q (a 406 PRECONDITION_FAILED means another client "+
+				"already declared it with different arguments - check DurableQueues in the NEB broker's "+
+				"statusengine.toml, both sides must agree): %w", queueName, err)
 		}
 
 		// Bound the broker's push rate before consuming, not after: this

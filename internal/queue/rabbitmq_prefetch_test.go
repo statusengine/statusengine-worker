@@ -79,9 +79,7 @@ func TestRabbitMQConsumerPrefetchKeepsBacklogAtTheBroker(t *testing.T) {
 		}
 	})
 
-	if _, err := ch.QueueDeclare(queueName, false, false, false, false, nil); err != nil {
-		t.Fatalf("declare queue: %v", err)
-	}
+	declareTestQueue(t, ch, queueName)
 	for i := 0; i < published; i++ {
 		if err := ch.PublishWithContext(ctx, "", queueName, false, false,
 			amqp.Publishing{Body: []byte(`{"seq":1}`)}); err != nil {
@@ -109,10 +107,7 @@ func TestRabbitMQConsumerPrefetchKeepsBacklogAtTheBroker(t *testing.T) {
 		t.Fatalf("open info channel: %v", err)
 	}
 	defer infoCh.Close()
-	info, err := infoCh.QueueDeclare(queueName, false, false, false, false, nil)
-	if err != nil {
-		t.Fatalf("inspect queue: %v", err)
-	}
+	info := declareTestQueue(t, infoCh, queueName)
 
 	// Everything beyond the prefetch window must still be at the broker.
 	// Compared generously: the exact split between ready and unacked moves
