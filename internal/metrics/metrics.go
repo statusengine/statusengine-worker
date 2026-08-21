@@ -19,11 +19,12 @@ const (
 	ComponentWebSocket = "websocket"
 	ComponentGraphite  = "graphite"
 	ComponentQueue     = "queue"
+	ComponentCommand   = "command"
 )
 
 // Components lists every value that appears in PipelineErrorsTotal's
 // "component" label.
-var Components = []string{ComponentMySQL, ComponentWebSocket, ComponentGraphite, ComponentQueue}
+var Components = []string{ComponentMySQL, ComponentWebSocket, ComponentGraphite, ComponentQueue, ComponentCommand}
 
 // Why the Init* functions below exist:
 //
@@ -76,6 +77,34 @@ func InitStaleDiscards(queueName string) {
 func InitFlushes(table string) {
 	DBFlushesTotal.WithLabelValues(table)
 }
+
+// InitCommands pre-creates the labeled series on the command API's two
+// counters: one per accepted command name, one per rejection reason. Called
+// from cmd/app when the endpoint is registered.
+//
+// It matters more here than elsewhere. commands_rejected_total{reason="denied"}
+// is the series an operator alerts on - somebody with a valid key tried to
+// shut the monitoring core down - and an alert on a series that does not
+// exist until the first such attempt is an alert that cannot fire the first
+// time it should.
+func InitCommands() {
+	for _, name := range CommandNames {
+		CommandsReceivedTotal.WithLabelValues(name)
+	}
+	for _, reason := range CommandRejectReasons {
+		CommandsRejectedTotal.WithLabelValues(reason)
+	}
+}
+
+// CommandNames lists every command name the API accepts, and
+// CommandRejectReasons every value of the "reason" label. Both are
+// duplicated from internal/command rather than imported, because that
+// package imports this one - TestCommandMetricLabelsMatchTheCommandPackage
+// fails if the copies drift apart.
+var (
+	CommandNames         = []string{"check_result", "schedule_check", "delete_downtime", "raw"}
+	CommandRejectReasons = []string{"auth", "malformed", "unknown_command", "denied", "too_large"}
+)
 
 // InitTable pre-creates the per-table series on DBEventsWrittenTotal.
 // Called from db.NewBulkInserter, so every table this worker can write to
@@ -364,6 +393,56 @@ var (
 		Subsystem: "graphite",
 		Name:      "available",
 		Help:      "1 if writes are reaching Carbon, 0 while metrics are being dropped.",
+	})
+
+	// CommandsReceivedTotal counts external commands accepted by the
+	// command API and published onto statusngin_cmd, labeled by command
+	// name. It counts *commands*, not requests: one bulk request carrying
+	// 50 check results adds 50 here and 1 to CommandsPublishedTotal, the
+	// same events-vs-frames split the WebSocket counters use (rule 4).
+	CommandsReceivedTotal = promauto.NewCounterVec(prometheus.CounterOpts{
+		Namespace: "statusengine",
+		Subsystem: "commands",
+		Name:      "received_total",
+		Help:      "External commands accepted and published, by command name.",
+	}, []string{"command"})
+
+	// CommandsRejectedTotal counts requests refused before publishing,
+	// labeled by reason: auth, malformed, unknown_command, denied,
+	// too_large.
+	//
+	// reason="denied" is the one to alert on. It means a caller who
+	// authenticated successfully asked to shut down or restart the
+	// monitoring core, or to have Naemon read commands out of a file -
+	// either a badly broken client or someone probing what the key can do.
+	// reason="auth" is noisier and less conclusive on an exposed port.
+	CommandsRejectedTotal = promauto.NewCounterVec(prometheus.CounterOpts{
+		Namespace: "statusengine",
+		Subsystem: "commands",
+		Name:      "rejected_total",
+		Help:      "Command requests refused before publishing, by reason.",
+	}, []string{"reason"})
+
+	// CommandsPublishedTotal counts messages handed to the broker - one per
+	// request, whatever its bulk size. Together with CommandsReceivedTotal
+	// it gives commands per request from two plain counters:
+	// rate(commands_received_total[1m]) / rate(commands_published_total[1m]).
+	CommandsPublishedTotal = promauto.NewCounter(prometheus.CounterOpts{
+		Namespace: "statusengine",
+		Subsystem: "commands",
+		Name:      "published_total",
+		Help:      "Messages published onto the command queue (one per accepted request).",
+	})
+
+	// CommandPublishErrorsTotal counts requests that were valid but could
+	// not be handed to the broker, and were answered with a 503. Unlike a
+	// dropped Graphite batch this loses nothing: the caller was told, and
+	// can send it again.
+	CommandPublishErrorsTotal = promauto.NewCounter(prometheus.CounterOpts{
+		Namespace: "statusengine",
+		Subsystem: "commands",
+		Name:      "publish_errors_total",
+		Help:      "Valid command requests that could not be published (answered with 503).",
 	})
 
 	// WebsocketClientsActive tracks currently connected WebSocket clients.

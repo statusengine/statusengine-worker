@@ -135,6 +135,27 @@ api_keys: []
 #   - change-me-to-a-real-secret
 #   - a-second-key-for-another-client
 
+# API keys accepted by the /commands endpoint, which submits Naemon
+# external commands. Deliberately a separate list from api_keys above,
+# with no overlap in either direction: an api_keys entry grants *reading*
+# the event stream, an entry here grants *controlling the monitoring
+# core* - passive check results, forced checks, downtimes, acknowledgements
+# and, via "raw", most of Naemon's external command set.
+#
+# Unlike api_keys, leaving this empty really does disable the endpoint.
+# There is no generated fallback key: a random write-access key nobody
+# asked for is worse than no endpoint, so with nothing configured here the
+# worker does not serve /commands at all and says so at startup.
+command_api_keys: []
+# command_api_keys:
+#   - a-secret-only-openitcockpit-holds
+
+# Address the external-command HTTP server (/commands) listens on. Its own
+# port rather than sharing listen_addr, so the read stream and the write
+# endpoint can be exposed - or not - independently. Loopback-only by
+# default.
+command_listen_addr: 127.0.0.1:8081
+
 # On a core restart (Naemon/Nagios/Icinga reload), clear out stale
 # hoststatus/servicestatus rows how?
 #   false (default): TRUNCATE both tables outright.

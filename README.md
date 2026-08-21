@@ -305,6 +305,100 @@ Messages sitting in those queues are lost in step 2. That is acceptable for the 
 
 Both start orders were verified against a real Naemon with the real broker module — worker first, then Naemon, and the other way round — with no 406 in either.
 
+## Submitting External Commands
+
+The worker has one **writing** endpoint: `POST /commands` publishes Naemon
+external commands onto `statusngin_cmd`, where the [NEB broker
+module](https://github.com/statusengine/broker) picks them up and hands them to
+the monitoring core.
+
+The direction is the opposite of everything else here. `statusngin_cmd` is one
+of the module's three `WorkerQueue` values, which the module *consumes* — so
+what this adds is a publisher, not another consumer.
+
+### It has its own keys and its own port
+
+`-command-api-keys` is deliberately separate from `-api-keys`, with no overlap
+in either direction. An `/ws` key grants reading the event stream; a command key
+grants controlling the monitoring core. And unlike `/ws` — which generates a
+random key when none is configured, because an open event stream is worse than
+an awkward one — **configuring no command key leaves the endpoint unserved**. A
+generated write-access key nobody asked for is not a safety net.
+
+`-command-listen-addr` defaults to `127.0.0.1:8081`, a separate port so the read
+stream and the write endpoint can be exposed, or not, independently. The
+`?api_key=` query parameter is **not** accepted here; it exists on `/ws` only
+because browser JavaScript cannot set headers on a WebSocket handshake, and a
+secret in a URL ends up in proxy logs.
+
+### The body is the broker's envelope, unchanged
+
+The same JSON a client would publish to Gearman or AMQP directly — see the PHP
+examples in `.claude/specs/statusngin_cmd_*.php`. Either one command, or a bulk
+that may mix types freely:
+
+```bash
+curl -X POST http://127.0.0.1:8081/commands \
+  -H "X-Api-Key: $KEY" \
+  -d '{"messages":[
+        {"Command":"check_result","Data":{"host_name":"localhost","service_description":"PING","output":"OK","perf_data":"rta=0.5ms","return_code":0}},
+        {"Command":"raw","Data":"ENABLE_HOST_FLAP_DETECTION;localhost"}
+      ]}'
+{"accepted":2}
+```
+
+`Command` and `Data` are capitalised, `messages` is not — the broker matches
+exactly. A bulk carries `messages` only; a `Command`/`Data` pair beside it is
+silently ignored by the broker, so this API rejects that shape rather than
+returning a 202 for a command that will never run.
+
+| `Command` | `Data` |
+|---|---|
+| `check_result` | `host_name`\*, `service_description`, `output`\*, `long_output`, `perf_data`, `check_type`, `return_code`, `start_time`, `end_time`, `early_timeout`, `latency`, `exited_ok` |
+| `schedule_check` | `host_name`\*, `service_description`, `schedule_time`\* (never `0`) |
+| `delete_downtime` | `host_name`\*, `service_description`, `start_time`, `end_time`, `comment` |
+| `raw` | a Naemon external command string |
+
+### `raw` gets its timestamp filled in
+
+Naemon requires every external command to begin with `[<unix timestamp>] `.
+`command_parse()` reads the entry time first and refuses anything else with
+*"Commands must begin with a timestamp inside square brackets"* — which it logs
+into `naemon.log` and tells nobody else. So a command without the prefix simply
+never happens.
+
+This API adds the prefix when it is missing and leaves one you supplied exactly
+as it is. A client publishing to the queue directly has to add it itself.
+
+Control characters are rejected — not because a newline could inject a second
+command (it cannot; Naemon strips and parses exactly one), but because it would
+forge a line break in `naemon.log`, which is itself an ingested data source.
+
+### Five commands are refused outright
+
+| Denied | Why |
+|---|---|
+| `SHUTDOWN_PROGRAM`, `SHUTDOWN_PROCESS` | Two names for one thing — Naemon registers both against the same handler, so denying only the spelling everybody knows stops nothing |
+| `RESTART_PROGRAM`, `RESTART_PROCESS` | Same |
+| `PROCESS_FILE` | Has Naemon read commands out of a file, which walks straight around the rest of the list |
+
+This guards against accidents, not intent: a caller with a valid key can still
+`DISABLE_NOTIFICATIONS`. The real control is which key exists and who holds it.
+Worth knowing, and checked rather than assumed: the `CHANGE_*_CHECK_COMMAND` and
+`CHANGE_*_EVENT_HANDLER` commands — the obvious route to running arbitrary code
+— are disabled inside Naemon itself, so there is nothing to deny.
+
+`statusengine_commands_rejected_total{reason="denied"}` is the series to alert
+on. It means someone who authenticated successfully asked to shut the core down.
+
+### `202` is not `200`, on purpose
+
+A `202` says the command reached the broker. It does **not** say Naemon executed
+it: Gearman's background submit and AMQP's publish acknowledge queueing only, the
+broker module has no reply path, and it logs nothing at all for a command it does
+not recognise. That silence is why this endpoint validates command names itself —
+a typo caught here is a `400` instead of a command that quietly never happens.
+
 ## Discarding Superseded Status Events
 
 `statusngin_hoststatus` and `statusngin_servicestatus` carry a full snapshot of an object's current state, re-sent on every check and upserted into a table that holds exactly one row per object. A snapshot from ten minutes ago has no reader left: MySQL holds a newer one already, and a dashboard showing it would be showing something untrue.
@@ -379,6 +473,8 @@ Useful flags:
 - `-mysql-batch-size`: rows buffered per table before a bulk `INSERT` is flushed ahead of the 250ms ticker (default `100`, maximum `700`). See [Choosing a batch size](#choosing-a-batch-size)
 - `-gearman-max-concurrent-jobs-per-queue`: job handlers running at once **per queue** (default `8`). Per queue, not shared — see [One connection per queue](#one-connection-per-queue). Replaces `-gearman-max-concurrent-jobs`, whose value must not be carried over: the worker refuses to start if the old config key or environment variable is still set
 - `-rabbitmq-prefetch`: unacknowledged deliveries the broker may push, also per queue (default `100`). This bounds buffered messages, not concurrency — a RabbitMQ queue always processes one message at a time, see [One connection per queue](#one-connection-per-queue)
+- `-command-api-keys`: keys accepted by `POST /commands`, comma-separated. **Separate from `-api-keys`**, and empty means the endpoint is not served at all — see [Submitting External Commands](#submitting-external-commands)
+- `-command-listen-addr`: address the external-command server listens on (default `127.0.0.1:8081`), its own port so it can be exposed independently of `/ws`
 - `-listen-addr`: WebSocket server listen address (default `127.0.0.1:8080` — **loopback only**; exposing it on the network is an explicit opt-in, e.g. `-listen-addr :8080`)
 - `-api-keys`: comma-separated API keys accepted by `/ws`. Leaving this empty does **not** disable authentication — the worker generates a random key at startup and logs it as a warning instead, so an unconfigured worker is never an open event stream
 - `-metrics-listen-addr`: Prometheus server listen address (default `:9105`)

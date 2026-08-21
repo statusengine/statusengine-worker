@@ -122,6 +122,8 @@ servers:
     description: Prometheus metrics (default -metrics-listen-addr)
   - url: http://127.0.0.1:8080
     description: WebSocket handshake (default -listen-addr, loopback-only; use ws:// once upgraded)
+  - url: http://127.0.0.1:8081
+    description: External commands (default -command-listen-addr, loopback-only; separate keys from /ws)
 
 # The API's default is authenticated; /metrics opts out explicitly with
 # `security: []`, which is the one unauthenticated endpoint.
@@ -181,6 +183,59 @@ components:
         type: string
 
   schemas:
+    # ---------------------------------------------------------------------
+    # External command API (POST /commands)
+    # ---------------------------------------------------------------------
+    CommandEnvelope:
+      type: object
+      description: |
+        The NEB broker module's own message format, reproduced rather than
+        translated. Carries **either** a `Command`/`Data` pair **or** a
+        `messages` array, never both - see the endpoint description.
+
+        The field names are case-sensitive on the broker side: `Command` and
+        `Data` capitalised, `messages` not.
+      properties:
+        Command:
+          type: string
+          description: Which command `Data` describes. Anything else is rejected with 400, because the broker would drop it without logging.
+          enum: [check_result, schedule_check, delete_downtime, raw]
+          example: raw
+        Data:
+          description: |
+            An object of named fields for `check_result`, `schedule_check`
+            and `delete_downtime`; a plain command string for `raw`. The
+            field tables are in the endpoint description.
+          oneOf:
+            - type: object
+            - type: string
+          example: "SCHEDULE_FORCED_SVC_CHECK;localhost;PING;1700000000"
+        messages:
+          type: array
+          maxItems: 1000
+          description: |
+            A bulk. Command types may be mixed freely - the broker recurses
+            into this array from the same handler that dispatches a single
+            command, so it is not a `check_result` feature. One level only;
+            nesting is rejected.
+          items:
+            $ref: "#/components/schemas/CommandEnvelope"
+
+    CommandResponse:
+      type: object
+      description: The response shape for every status code, so a client parses one thing.
+      properties:
+        accepted:
+          type: integer
+          description: |
+            How many commands were handed to the broker - commands, not
+            requests, so a bulk of 50 reports 50. Absent on failure. Not a
+            count of commands Naemon executed; see the endpoint description.
+          example: 3
+        error:
+          type: string
+          description: What went wrong. Absent on success.
+
     # ---------------------------------------------------------------------
     # Protocol envelope / control messages
     # ---------------------------------------------------------------------
@@ -952,6 +1007,214 @@ paths:
                 type: string
               example: unauthorized
 
+  /commands:
+    post:
+      operationId: submitExternalCommands
+      summary: Submit Naemon external commands
+      description: |
+        Publishes one or more Naemon external commands onto the
+        `statusngin_cmd` queue, where the Statusengine NEB broker module
+        picks them up and hands them to the monitoring core.
+
+        This is the worker's only **writing** endpoint, and it is served on
+        its own port (default `127.0.0.1:8081`) with its own API keys
+        (`-command-api-keys`). A key for `/ws` does **not** work here and
+        vice versa: reading the event stream and controlling the monitoring
+        core are different privileges. Unlike `/ws`, configuring no key does
+        not fall back to a generated one - it leaves the endpoint unserved.
+
+        Unlike `/ws`, the `?api_key=` query parameter is **not** accepted;
+        that exists only because browser JavaScript cannot set headers on a
+        WebSocket handshake, and a secret in a URL ends up in proxy and
+        access logs.
+
+        **The body is the broker's own envelope**, unchanged - the same JSON
+        a client would publish to Gearman or AMQP directly. Either a single
+        command:
+
+        ```json
+        {"Command": "raw", "Data": "SCHEDULE_FORCED_SVC_CHECK;host;service;1700000000"}
+        ```
+
+        or a bulk, which may mix command types freely:
+
+        ```json
+        {"messages": [
+          {"Command": "check_result", "Data": {"host_name": "h", "output": "OK"}},
+          {"Command": "raw", "Data": "ENABLE_HOST_FLAP_DETECTION;h"}
+        ]}
+        ```
+
+        Note the capitalisation: `Command` and `Data` are capitalised,
+        `messages` is not. The broker matches these exactly. A bulk carries
+        `messages` **only** - a `Command`/`Data` pair beside it is ignored by
+        the broker, so this API rejects that shape rather than confirming a
+        command that will never run.
+
+        ### The four commands
+
+        | `Command` | `Data` | Notes |
+        |---|---|---|
+        | `check_result` | object | `host_name` (required), `service_description` (omit for a host check), `output` (required), `long_output`, `perf_data`, `check_type`, `return_code`, `start_time`, `end_time`, `early_timeout`, `latency`, `exited_ok`. Perfdata has its own field; the broker assembles Naemon's format from `output`/`long_output`/`perf_data`. |
+        | `schedule_check` | object | `host_name` (required), `service_description` (omit to schedule a host check), `schedule_time` (required, and must not be `0` - there is no way to express "now" other than the current timestamp). The host or service must exist, or the broker logs a warning and drops it. |
+        | `delete_downtime` | object | `host_name` (required), `service_description`, `start_time`, `end_time`, `comment`. |
+        | `raw` | string | A Naemon external command line. |
+
+        ### About `raw`
+
+        Naemon requires every external command to begin with
+        `[<unix timestamp>] `; `command_parse()` reads the entry time first
+        and refuses anything else with *"Commands must begin with a timestamp
+        inside square brackets"*, logging that into `naemon.log` and telling
+        nobody else. **This API adds the prefix when it is missing**, and
+        leaves one you supplied exactly as it is. A client publishing to the
+        queue directly has to add it itself.
+
+        Control characters are rejected. Not because a newline could inject a
+        second command - it cannot, Naemon strips and parses exactly one -
+        but because it would forge a line break in `naemon.log`, which is
+        itself an ingested data source.
+
+        These commands are refused with `403` even with a valid key:
+        `SHUTDOWN_PROGRAM`, `SHUTDOWN_PROCESS`, `RESTART_PROGRAM`,
+        `RESTART_PROCESS`, `PROCESS_FILE`. The first four are two names each
+        for one thing; `PROCESS_FILE` has Naemon read commands out of a file
+        and would walk around the rest of the list. This is a guard against
+        accidents, not a policy engine - a caller with a valid key can still
+        `DISABLE_NOTIFICATIONS`.
+
+        ### What 202 does and does not mean
+
+        A `202` says the command reached the broker. It does **not** say
+        Naemon executed it: Gearman's background submit and AMQP's publish
+        both acknowledge queueing only, the broker module has no reply path,
+        and it logs nothing for a command it does not recognise. That is why
+        this endpoint validates command names itself - a typo caught here is
+        a `400` instead of a command that silently never happens.
+      servers:
+        - url: http://127.0.0.1:8081
+          description: Separate port and separate keys from /ws.
+      security:
+        - BearerAuth: []
+        - ApiKeyHeader: []
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: "#/components/schemas/CommandEnvelope"
+            examples:
+              raw:
+                summary: A raw external command
+                value:
+                  Command: raw
+                  Data: "SCHEDULE_FORCED_SVC_CHECK;localhost;PING;1700000000"
+              checkResult:
+                summary: A passive check result
+                value:
+                  Command: check_result
+                  Data:
+                    host_name: localhost
+                    service_description: PING
+                    output: "OK - packet loss 0%"
+                    perf_data: "rta=0.5ms;;;0"
+                    return_code: 0
+                    check_type: 1
+                    start_time: 1700000000
+                    end_time: 1700000000
+                    exited_ok: 1
+              scheduleCheck:
+                summary: Force a service check
+                value:
+                  Command: schedule_check
+                  Data:
+                    host_name: localhost
+                    service_description: PING
+                    schedule_time: 1700000000
+              deleteDowntime:
+                summary: Delete a service downtime
+                value:
+                  Command: delete_downtime
+                  Data:
+                    host_name: localhost
+                    service_description: PING
+                    start_time: 1700000000
+                    end_time: 1700003600
+                    comment: maintenance
+              bulk:
+                summary: A bulk of mixed commands
+                value:
+                  messages:
+                    - Command: check_result
+                      Data:
+                        host_name: localhost
+                        service_description: PING
+                        output: "OK"
+                        return_code: 0
+                    - Command: raw
+                      Data: "ENABLE_HOST_FLAP_DETECTION;localhost"
+      responses:
+        "202":
+          description: |
+            Accepted - handed to the broker. See "What 202 does and does not
+            mean" above; this is not a report that Naemon ran anything.
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/CommandResponse"
+              example:
+                accepted: 3
+        "400":
+          description: |
+            Malformed JSON, a missing `Command`/`Data`, an unknown command
+            name, a `raw` command containing control characters, or a bulk
+            carrying a stray `Command`/`Data` pair beside `messages`.
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/CommandResponse"
+              example:
+                error: 'unknown command "check_results" - the broker accepts only check_result, schedule_check, delete_downtime, raw, and drops anything else without logging it'
+        "401":
+          description: Missing or invalid API key. Note that a `/ws` key is not valid here.
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/CommandResponse"
+              example:
+                error: missing or invalid API key
+        "403":
+          description: A denied external command - see the list above.
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/CommandResponse"
+              example:
+                error: the external command SHUTDOWN_PROGRAM is not permitted through this API
+        "405":
+          description: Only POST is supported.
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/CommandResponse"
+        "413":
+          description: The body exceeds 8 MiB, or the bulk carries more than 1000 commands.
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/CommandResponse"
+        "503":
+          description: |
+            The command was valid but the message broker could not be
+            reached. Nothing was lost and nothing was queued - the same
+            request will work once the broker is back.
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/CommandResponse"
+              example:
+                error: could not reach the message broker, retry later
+
   /metrics:
     get:
       operationId: getMetrics
@@ -985,6 +1248,10 @@ paths:
         | `statusengine_websocket_frames_sent_total` | counter | - | Frames handed to clients. Exists to be the denominator of `messages_broadcasted_total`: `rate(websocket_messages_broadcasted_total[1m]) / rate(websocket_frames_sent_total[1m])` is the average events per frame, from two plain counters and without histogram support - the same idiom as `db_events_written_total` / `db_flushes_total`. A ratio near 1.0 means jobs are arriving one event at a time; a rising one means the core is sending bulk, which is also when a client's send buffer is under pressure. |
         | `statusengine_websocket_messages_dropped_total` | counter | - | **Events** dropped because a client's send buffer was full - non-blocking broadcast. Counted in events, so it can be read against the broadcast counter, but note the shape: a full buffer costs a whole frame, so this moves in steps of a job's batch size rather than one at a time - while moving far less often, since the same 256-frame buffer now holds a job's worth of events per slot. Deliberately unlabeled: a client id is unique per connection, so labeling by it would mint a permanent new time series on every reconnect. Which client was too slow is logged when that client disconnects. |
         | `statusengine_websocket_publish_dropped_total` | counter | - | Events dropped because the Hub's *inbound* buffer was full, i.e. the broadcast goroutine could not keep up. Distinct from `messages_dropped_total` above and far more serious: that one means a single slow client missed a message, this one means the event reached no client at all. A non-zero rate here is what to alert on. The buffer holds 1024 *frames*, so a job's worth of events per slot - which is why this one became correspondingly hard to provoke. |
+        | `statusengine_commands_received_total` | counter | `command` | External commands accepted by `/commands` and published, by command name. Counts **commands, not requests**: a bulk of 50 check results adds 50 here and 1 to `commands_published_total`, the same events-vs-frames split the WebSocket counters use. |
+        | `statusengine_commands_rejected_total` | counter | `reason` | Command requests refused before publishing: `auth`, `malformed`, `unknown_command`, `denied`, `too_large`. **`reason="denied"` is the one to alert on** - a caller who authenticated successfully asked to shut down or restart the monitoring core, or to have Naemon read commands out of a file. `reason="auth"` is noisier and less conclusive. |
+        | `statusengine_commands_published_total` | counter | - | Messages published onto the command queue, one per accepted request whatever its bulk size. Denominator for the ratio above: `rate(commands_received_total[1m]) / rate(commands_published_total[1m])` is the average commands per request. |
+        | `statusengine_commands_publish_errors_total` | counter | - | Valid command requests that could not be handed to the broker and were answered with `503`. Unlike a dropped Graphite batch this loses nothing - the caller was told and can retry. |
         | `statusengine_build_info` | gauge | `version`, `revision`, `go_version` | Always 1; the labels carry the build identity of the running worker. Join on it to attribute behaviour to a build: `statusengine_db_events_written_total * on() group_left(version) statusengine_build_info`. The only metric here that labels with a free-form string, which is safe because there is exactly one build per process. |
         | `statusengine_pipeline_errors_total` | counter | `component` (`mysql`, `websocket`, `graphite`, `queue`) | Errors encountered anywhere in the pipeline. |
 

@@ -25,6 +25,7 @@ import (
 
 	_ "github.com/go-sql-driver/mysql"
 
+	"statusengine-worker/internal/command"
 	"statusengine-worker/internal/db"
 	"statusengine-worker/internal/graphite"
 	"statusengine-worker/internal/metrics"
@@ -57,6 +58,8 @@ type config struct {
 	perfdataRoute                    string // "mysql", "graphite" or "both"
 	nodeName                         string // written into hoststatus/servicestatus rows' node_name column
 	apiKeys                          string // comma-separated; empty disables /ws authentication entirely
+	commandAPIKeys                   string // comma-separated; empty leaves the command endpoint unregistered
+	commandListenAddr                string
 	enableOpenITCockpitTweaks        bool   // selects the core-restart hoststatus/servicestatus cleanup query
 	statusMaxAge                     string // max age of a hoststatus/servicestatus event before it is discarded; "0" disables
 	logLevel                         string // "debug", "info", "warn" or "error"
@@ -97,6 +100,8 @@ type fileConfig struct {
 	PerfdataRoute             string   `yaml:"perfdata_route"`
 	NodeName                  string   `yaml:"nodename"`
 	APIKeys                   []string `yaml:"api_keys"`
+	CommandAPIKeys            []string `yaml:"command_api_keys"`
+	CommandListenAddr         string   `yaml:"command_listen_addr"`
 	EnableOpenITCockpitTweaks *bool    `yaml:"enable_openitcockpit_tweaks"`
 	StatusMaxAge              string   `yaml:"status_max_age"`
 	LogLevel                  string   `yaml:"log_level"`
@@ -267,6 +272,13 @@ func loadConfig() config {
 	flag.StringVar(&cfg.apiKeys, "api-keys", "",
 		"comma-separated API keys accepted by the /ws endpoint (Authorization: Bearer <key> or X-Api-Key header; "+
 			"api_key query parameter also accepted, for browser clients that can't set headers); empty disables auth")
+	flag.StringVar(&cfg.commandAPIKeys, "command-api-keys", envOrDefault("STATUSENGINE_API_COMMAND_KEYS", ""),
+		"comma-separated API keys accepted by the "+command.Path+" endpoint. Deliberately separate from -api-keys: "+
+			"that one grants reading the event stream, this one grants submitting Naemon external commands, which "+
+			"controls the monitoring core. With no key set the endpoint is not served at all")
+	flag.StringVar(&cfg.commandListenAddr, "command-listen-addr", "127.0.0.1:8081",
+		"address the external-command HTTP server listens on; loopback-only by default, and on its own port so "+
+			"exposing the WebSocket stream does not also expose the write endpoint")
 	flag.BoolVar(&cfg.enableOpenITCockpitTweaks, "enable-openitcockpit-tweaks", false,
 		"on a core restart, delete only hoststatus/servicestatus rows for objects openITCockpit no longer "+
 			"knows about instead of truncating both tables outright")
@@ -316,6 +328,8 @@ func loadConfig() config {
 	cfg.perfdataRoute = resolveString(explicit, "perfdata-route", cfg.perfdataRoute, "STATUSENGINE_PERFDATA_ROUTE", fc.PerfdataRoute)
 	cfg.nodeName = resolveString(explicit, "nodename", cfg.nodeName, "STATUSENGINE_NODENAME", fc.NodeName)
 	cfg.apiKeys = resolveString(explicit, "api-keys", cfg.apiKeys, "STATUSENGINE_API_KEYS", strings.Join(fc.APIKeys, ","))
+	cfg.commandAPIKeys = resolveString(explicit, "command-api-keys", cfg.commandAPIKeys, "STATUSENGINE_API_COMMAND_KEYS", strings.Join(fc.CommandAPIKeys, ","))
+	cfg.commandListenAddr = resolveString(explicit, "command-listen-addr", cfg.commandListenAddr, "STATUSENGINE_COMMAND_LISTEN_ADDR", fc.CommandListenAddr)
 	cfg.enableOpenITCockpitTweaks = resolveBool(explicit, "enable-openitcockpit-tweaks", cfg.enableOpenITCockpitTweaks, "ENABLE_OPENITCOCKPIT_TWEAKS", fc.EnableOpenITCockpitTweaks)
 	cfg.statusMaxAge = resolveString(explicit, "status-max-age", cfg.statusMaxAge, "STATUSENGINE_STATUS_MAX_AGE", fc.StatusMaxAge)
 	cfg.logLevel = resolveString(explicit, "log-level", cfg.logLevel, "STATUSENGINE_LOG_LEVEL", fc.LogLevel)
@@ -501,6 +515,23 @@ func newWebsocketServer(addr string, h http.Handler) *http.Server {
 		Handler:           h,
 		ReadHeaderTimeout: wsReadHeaderTimeout,
 		IdleTimeout:       wsIdleTimeout,
+	}
+}
+
+// newCommandServer builds the external-command server. Like /metrics and
+// unlike /ws it serves ordinary short-lived requests, so it gets the full
+// set of timeouts - which is the reason this endpoint does not simply share
+// the WebSocket listener: newWebsocketServer omits ReadTimeout and
+// WriteTimeout on purpose, because they would apply to a connection meant
+// to last hours, and a POST endpoint inheriting that has no bound on how
+// slowly a body may be delivered.
+func newCommandServer(addr string, h http.Handler) *http.Server {
+	return &http.Server{
+		Addr:              addr,
+		Handler:           h,
+		ReadHeaderTimeout: metricsReadHeaderTimeout,
+		ReadTimeout:       metricsReadTimeout,
+		WriteTimeout:      metricsWriteTimeout,
 	}
 }
 
@@ -705,6 +736,39 @@ func main() {
 		}
 	}()
 
+	// External-command endpoint, on its own port again. It is registered
+	// only when a key is configured: unlike /ws, where an unconfigured
+	// worker gets a generated key because an open event stream is worse
+	// than an awkward one, there is no sensible fallback for a write
+	// endpoint. Generating a key here would create a way into the
+	// monitoring core that nobody asked for, so "not configured" means
+	// "not served".
+	var commandServer *http.Server
+	var commandPublisher command.Publisher
+	if commandKeys := parseAPIKeys(cfg.commandAPIKeys); len(commandKeys) > 0 {
+		commandPublisher, err = command.NewPublisher(cfg.consumerBackend, cfg.gearmanAddr, cfg.rabbitMQURL)
+		if err != nil {
+			fatal("command: could not build publisher", "backend", cfg.consumerBackend, "error", err)
+		}
+		metrics.InitCommands()
+
+		commandMux := http.NewServeMux()
+		commandMux.Handle(command.Path, command.NewHandler(commandPublisher, commandKeys))
+		commandServer = newCommandServer(cfg.commandListenAddr, commandMux)
+		go func() {
+			slog.Info("command: listening",
+				"addr", cfg.commandListenAddr, "path", command.Path,
+				"backend", cfg.consumerBackend, "queue", command.Queue,
+				"denied_commands", command.DeniedCommands())
+			if err := commandServer.ListenAndServe(); err != nil && err != http.ErrServerClosed {
+				slog.Error("command: http server error", "error", err)
+			}
+		}()
+	} else {
+		slog.Info("command: endpoint disabled, no API key configured",
+			"hint", "set -command-api-keys/STATUSENGINE_API_COMMAND_KEYS to enable "+command.Path)
+	}
+
 	// 3. MySQL connection and BulkInserters, each in its own goroutine.
 	sqlDB, err := sql.Open("mysql", cfg.mysqlDSN)
 	if err != nil {
@@ -793,6 +857,18 @@ func main() {
 	}
 	if err := metricsServer.Shutdown(shutdownCtx); err != nil {
 		slog.Error("metrics: error shutting down http server", "error", err)
+	}
+	// The command server goes down before its publisher, so a request still
+	// in flight can finish publishing rather than meet a closed connection.
+	if commandServer != nil {
+		if err := commandServer.Shutdown(shutdownCtx); err != nil {
+			slog.Error("command: error shutting down http server", "error", err)
+		}
+	}
+	if commandPublisher != nil {
+		if err := commandPublisher.Close(); err != nil {
+			slog.Error("command: error closing publisher", "error", err)
+		}
 	}
 	cancelShutdown()
 
