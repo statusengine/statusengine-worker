@@ -319,6 +319,20 @@ func (b *BulkInserter[T]) MaxBatchSize() int { return b.maxBatchSize }
 // guard that was wrong.
 func (b *BulkInserter[T]) ColumnCount() int { return len(b.columns) }
 
+// Table reports the table this inserter writes to, and IsUpsert whether it
+// does so with an ON DUPLICATE KEY UPDATE clause. Both exist for the same
+// reason as ColumnCount above: a caller that builds many inserters -
+// NewRouter - can then derive the set of tables written as upserts instead
+// of keeping a second list of them, which is the list that drifts.
+//
+// What that set is checked for is a secondary UNIQUE index, and the reason
+// is in queue.TestUpsertTablesHaveNoSecondaryUniqueIndex.
+func (b *BulkInserter[T]) Table() string { return b.table }
+
+// IsUpsert reports whether this inserter's flushes carry an
+// ON DUPLICATE KEY UPDATE clause. See Table.
+func (b *BulkInserter[T]) IsUpsert() bool { return len(b.updateColumns) > 0 }
+
 // Enqueue hands an item to the inserter's buffer, blocking only until
 // either it is accepted or ctx is cancelled.
 func (b *BulkInserter[T]) Enqueue(ctx context.Context, item T) error {
