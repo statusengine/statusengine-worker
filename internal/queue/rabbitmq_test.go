@@ -43,9 +43,52 @@ func declareTestQueue(t *testing.T, ch *amqp.Channel, name string) amqp.Queue {
 	return q
 }
 
+// cleanupTestQueue removes a test queue from the broker once the test is
+// over. Every test in this package that declares one must call it: a queue
+// left behind on the shared dev broker is not merely untidy, it keeps
+// receiving whatever a later run publishes into that name and its backlog
+// changes the timing of the test that owns it.
+//
+// Registered with t.Cleanup rather than deferred, and that ordering is the
+// point: defers run when the test function returns, cleanups only
+// afterwards. So the consumer's own `defer consumer.Stop()` has already
+// finished by the time this runs, and the delete cannot race a live
+// delivery loop. The connection is its own for the same reason - the
+// test's is closed by a defer before this point.
+//
+// Purge before delete, as in rabbitmq_fairness_test.go: an unacknowledged
+// delivery is requeued when the channel closes, so a queue can be
+// non-empty at exactly this moment even though the test published nothing
+// after Stop.
+func cleanupTestQueue(t *testing.T, name string) {
+	t.Helper()
+	t.Cleanup(func() {
+		conn, err := amqp.Dial(rabbitmqURL)
+		if err != nil {
+			t.Errorf("cleanup: dial: %v - queue %s was left on the broker", err, name)
+			return
+		}
+		defer conn.Close()
+		ch, err := conn.Channel()
+		if err != nil {
+			t.Errorf("cleanup: open channel: %v - queue %s was left on the broker", err, name)
+			return
+		}
+		defer ch.Close()
+		if _, err := ch.QueuePurge(name, false); err != nil {
+			t.Errorf("cleanup: purge %s: %v", name, err)
+			return
+		}
+		if _, err := ch.QueueDelete(name, false, false, false); err != nil {
+			t.Errorf("cleanup: delete %s: %v - queue was left on the broker", name, err)
+		}
+	})
+}
+
 func TestRabbitMQConsumerEndToEnd(t *testing.T) {
 	received := make(chan []byte, 1)
 	queueName := "queue_pkg_test_queue"
+	cleanupTestQueue(t, queueName)
 	router := Router{
 		queueName: func(_ context.Context, payload []byte) error {
 			received <- payload
@@ -126,6 +169,7 @@ func TestRabbitMQConsumerEndToEnd(t *testing.T) {
 func TestRabbitMQConsumerReconnectsAfterConnectionDrop(t *testing.T) {
 	received := make(chan []byte, 2)
 	queueName := "queue_pkg_test_reconnect_queue"
+	cleanupTestQueue(t, queueName)
 	router := Router{
 		queueName: func(_ context.Context, payload []byte) error {
 			received <- payload
