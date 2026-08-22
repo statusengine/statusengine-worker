@@ -1253,7 +1253,7 @@ paths:
         | `statusengine_commands_published_total` | counter | - | Messages published onto the command queue, one per accepted request whatever its bulk size. Denominator for the ratio above: `rate(commands_received_total[1m]) / rate(commands_published_total[1m])` is the average commands per request. |
         | `statusengine_commands_publish_errors_total` | counter | - | Valid command requests that could not be handed to the broker and were answered with `503`. Unlike a dropped Graphite batch this loses nothing - the caller was told and can retry. |
         | `statusengine_build_info` | gauge | `version`, `revision`, `go_version` | Always 1; the labels carry the build identity of the running worker. Join on it to attribute behaviour to a build: `statusengine_db_events_written_total * on() group_left(version) statusengine_build_info`. The only metric here that labels with a free-form string, which is safe because there is exactly one build per process. |
-        | `statusengine_pipeline_errors_total` | counter | `component` (`mysql`, `websocket`, `graphite`, `queue`) | Errors encountered anywhere in the pipeline. |
+        | `statusengine_pipeline_errors_total` | counter | `component` (`mysql`, `websocket`, `graphite`, `queue`, `command`) | Errors encountered anywhere in the pipeline. |
 
         Plus the standard Go runtime/process metrics `promhttp.Handler()`
         exposes automatically (`go_*`, `process_*`).

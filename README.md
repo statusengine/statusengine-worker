@@ -194,6 +194,8 @@ WebSocket delivery is deliberately not on that list: the hub drops rather than b
 | `statusengine_graphite_available` | `1` | `0` = metrics are being dropped right now, not merely delayed. |
 | `statusengine_websocket_publish_dropped_total` | `0` | The hub's own inbound buffer overflowed — every connected client went blind at once. Alert on this. |
 | `statusengine_websocket_messages_dropped_total` | non-zero is normal | One client could not keep up; everyone else got the frame. Counted in events, but lost a frame at a time. |
+| `statusengine_commands_rejected_total{reason="denied"}` | `0` | Someone holding a valid command key asked to shut down or restart the core, or to have Naemon read commands out of a file. Alert on this — the request was refused, but a client that sends it is either badly broken or probing. |
+| `statusengine_commands_publish_errors_total` | `0` | A valid command could not be handed to the broker and was answered with `503`. Nothing is lost — the caller was told and can retry — but the core is not receiving commands. |
 
 `statusengine_db_events_written_total` counts every buffered row as written, including duplicates an upsert skipped, so it briefly overstates after a restart under load. It is a throughput signal, not an audit.
 
