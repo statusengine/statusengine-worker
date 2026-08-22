@@ -264,7 +264,19 @@ One difference between the backends *is* real and worth knowing, because it is n
 | Gearman | `-gearman-max-concurrent-jobs-per-queue` (default 8) | concurrency |
 | RabbitMQ | **always 1** | `-rabbitmq-prefetch` bounds *buffered unacked messages*, not concurrency |
 
-`consumeLoop` calls its handler synchronously from a plain `for range` over the delivery channel, so a RabbitMQ queue processes one message at a time no matter how high the prefetch is (measured at prefetch 20: max 1 concurrent handler, 40 × 20 ms of work in 819 ms). Per-queue throughput on the RabbitMQ backend is therefore bounded by one handler's latency. Gearman is the production backend, so this is recorded rather than changed — adding concurrency there would give up in-order processing per queue, which is a design decision rather than a tuning knob.
+`consumeLoop` calls its handler synchronously from a plain `for range` over the delivery channel, so a RabbitMQ queue processes one message at a time no matter how high the prefetch is (measured at prefetch 20: max 1 concurrent handler, 40 × 20 ms of work in 819 ms).
+
+**It costs nothing, which is the reason it stays.** 200,000 events into one queue, against a throwaway MySQL 8 container, warm-up run discarded:
+
+| | `mysql_batch_size` 100 | 700 |
+|---|---|---|
+| RabbitMQ, 1 handler per queue | **11.55–11.81s** (~16,950 ev/s) | **5.14s** (~38,940 ev/s) |
+| Gearman, 8 handlers per queue | 12.31–12.57s (~16,250 ev/s) | 5.91s (~33,855 ev/s) |
+| RabbitMQ patched to 8 (throwaway) | 12.06–12.57s | 5.91s |
+
+The patched RabbitMQ landing exactly on Gearman's number is the cross-check that this measures the concurrency and not the backend. The mechanism is in `cmd/app`: there is **one `Run` goroutine per table**, so every handler on a queue ends up queued at the same `BulkInserter`'s channel and more of them only lengthens that queue — the average handler goes from 5.8 ms to 48.6 ms for the same throughput. The parallelism that does pay is *across* tables, and every queue already has its own inserter: four queues feeding four tables reach **40,900 ev/s** against 16,950 for a single queue.
+
+So adding per-queue concurrency would cost a few percent and give up in-order processing per queue in exchange. Don't, without a fresh measurement showing something has changed.
 
 Two consequences worth knowing:
 
