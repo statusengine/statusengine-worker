@@ -96,6 +96,8 @@ On SIGINT/SIGTERM, the worker performs an ordered shutdown:
 
 This guarantees buffered MySQL rows are written before process exit.
 
+Step 1 stops consumption without abandoning work already accepted: the Gearman consumer drains its in-flight jobs before dropping the connections, and the RabbitMQ consumer sends `basic.cancel` before closing anything, so the broker stops pushing while the acknowledgements a running Handler still owes can still be delivered. Without that, a Handler that was mid-message finished, wrote its rows, and then acked into a channel that no longer existed — and the broker redelivered a message that had in fact been processed.
+
 Flushing the buffers is only half of it, though. Queue delivery is at-least-once: a worker that is killed between finishing a job and its acknowledgement reaching the broker gets that job again on restart, with its rows already in MySQL. Every table that can collide on its PRIMARY KEY is therefore written as an upsert, so a redelivery is skipped instead of aborting the whole multi-row `INSERT` and taking the rest of the batch with it. See [MySQL Write Behavior](#mysql-write-behavior) for the full picture and [Verify No Events Are Lost](#verify-no-events-are-lost) for the tool that measures it end to end.
 
 ## Logging
@@ -525,6 +527,8 @@ On `SIGTERM` the worker stops consuming, drains jobs still in flight, and flushe
 | Final bulk-insert flush (`shutdownFlushTimeout`) | 10s |
 | HTTP server shutdown | 5s |
 | **Total** | **45s** |
+
+On the RabbitMQ backend the first row is smaller — 2s to cancel the consumers plus a 5s drain instead of the 30s Gearman drain, so 22s in total. The 45s figure is the one to size `TimeoutStopSec` against either way, since the backend is a configuration option and Gearman is the production one.
 
 systemd sends `SIGKILL` when `TimeoutStopSec` expires. Set below 45s it kills the worker *during* the flush and loses exactly the buffered rows the graceful shutdown exists to write — along with the job acknowledgements, so the broker redelivers and the idempotent writes become the only thing preventing duplicates. The unit sets `90s` explicitly rather than relying on systemd's default, so that raising `DrainTimeout` has an obvious place to be reflected.
 

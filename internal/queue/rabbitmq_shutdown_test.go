@@ -21,6 +21,12 @@ import (
 // race detector flags the unsynchronized access every time.
 func TestRabbitMQConsumerStopUnderLoadClosesOutputSafely(t *testing.T) {
 	queueName := "queue_pkg_test_stop_under_load"
+	// This test deliberately stops mid-backlog, so whatever the cancel's
+	// drain does not reach is requeued when the connection goes away.
+	// Without cleaning up, every run leaves messages behind on a shared
+	// dev broker, and after a few dozen runs the accumulated backlog
+	// changes the timing enough to make the test itself flaky.
+	cleanupTestQueue(t, queueName)
 
 	// A handler slow enough that Stop reliably lands while several delivery
 	// loops are still inside one. inFlight tracks how many are mid-handler
@@ -33,9 +39,10 @@ func TestRabbitMQConsumerStopUnderLoadClosesOutputSafely(t *testing.T) {
 			defer inFlight.Add(-1)
 			// Long enough that Stop reliably lands inside a handler rather
 			// than between two. Only one handler per queue is ever in
-			// flight (the loop is serial, and closing the connection stops
-			// it after the current one), so this doesn't scale with the
-			// message count.
+			// flight, the loop being serial - but Stop's basic.cancel lets
+			// it work through everything the broker already pushed, so the
+			// wait here does scale with the prefetch window (100 x 25ms),
+			// not with the message count.
 			time.Sleep(25 * time.Millisecond)
 			return nil
 		},
@@ -50,31 +57,6 @@ func TestRabbitMQConsumerStopUnderLoadClosesOutputSafely(t *testing.T) {
 		skipOrFailService(t, "no reachable dev RabbitMQ broker at %s: %v", rabbitmqURL, err)
 	}
 	defer consumer.Stop()
-
-	// This test deliberately stops mid-backlog, so most of the messages it
-	// publishes are still unacked when the connection goes away and the
-	// broker requeues them. Without cleaning up, every run leaves ~200
-	// messages behind on a shared dev broker; after a few dozen runs the
-	// accumulated backlog changes the timing enough to make the test
-	// itself flaky. Delete the queue on the way out, on a connection of
-	// its own since the test's is closed by then.
-	t.Cleanup(func() {
-		conn, err := amqp.Dial(rabbitmqURL)
-		if err != nil {
-			t.Logf("cleanup: dial: %v", err)
-			return
-		}
-		defer conn.Close()
-		ch, err := conn.Channel()
-		if err != nil {
-			t.Logf("cleanup: channel: %v", err)
-			return
-		}
-		defer ch.Close()
-		if _, err := ch.QueueDelete(queueName, false, false, false); err != nil {
-			t.Logf("cleanup: delete %s: %v", queueName, err)
-		}
-	})
 
 	// Drain out exactly the way cmd/app/main.go does, so the send side is
 	// genuinely live when the close happens.
@@ -123,5 +105,98 @@ func TestRabbitMQConsumerStopUnderLoadClosesOutputSafely(t *testing.T) {
 	case <-drained:
 	case <-time.After(10 * time.Second):
 		t.Fatal("raw-message channel was never closed after Stop")
+	}
+}
+
+// TestRabbitMQStopAcksTheMessageItWasHandling pins the one promise
+// basic.cancel buys: a message whose Handler was still running when Stop
+// arrived is acknowledged, not redelivered.
+//
+// Before the cancel, Stop closed the channels first, so the Handler
+// finished, wrote its rows, and then acked into a channel that no longer
+// existed - the broker logged
+//
+//	operation basic.ack caused a connection exception channel_error
+//
+// and requeued a message that had in fact been processed. The next start
+// did the work again; only rule 6's idempotent writes kept that harmless.
+//
+// The observable is the queue depth after Stop: 0 if the ack landed, 1 if
+// the broker took the message back. One message and one Handler, so
+// nothing here depends on timing beyond Stop landing inside the Handler,
+// which the entered channel guarantees.
+func TestRabbitMQStopAcksTheMessageItWasHandling(t *testing.T) {
+	queueName := "queue_pkg_test_stop_ack"
+	cleanupTestQueue(t, queueName)
+
+	entered := make(chan struct{}, 1)
+	router := Router{
+		queueName: func(_ context.Context, _ []byte) error {
+			entered <- struct{}{}
+			// Long enough that Stop is reliably inside this Handler, short
+			// enough to stay well under stopDrainTimeout so the drain
+			// really does wait for it.
+			time.Sleep(200 * time.Millisecond)
+			return nil
+		},
+	}
+
+	consumer := NewRabbitMQConsumer(rabbitmqURL, router, 100)
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+
+	out, err := consumer.Start(ctx)
+	if err != nil {
+		skipOrFailService(t, "no reachable dev RabbitMQ broker at %s: %v", rabbitmqURL, err)
+	}
+	defer consumer.Stop()
+	go func() {
+		for range out {
+		}
+	}()
+
+	conn, err := amqp.Dial(rabbitmqURL)
+	if err != nil {
+		t.Fatalf("amqp dial: %v", err)
+	}
+	defer conn.Close()
+	ch, err := conn.Channel()
+	if err != nil {
+		t.Fatalf("open channel: %v", err)
+	}
+	defer ch.Close()
+
+	if err := ch.PublishWithContext(ctx, "", queueName, false, false,
+		amqp.Publishing{Body: []byte(`{"seq":1}`)}); err != nil {
+		t.Fatalf("publish: %v", err)
+	}
+
+	select {
+	case <-entered:
+	case <-time.After(5 * time.Second):
+		t.Fatal("the handler was never invoked")
+	}
+
+	if err := consumer.Stop(); err != nil {
+		t.Fatalf("stop: %v", err)
+	}
+
+	// Stop has closed the consumer's connection, so a requeue has already
+	// happened at the broker by now if it was going to. Sampling for a
+	// while rather than once anyway: a single early read could catch the
+	// moment before the broker books the message back.
+	inspect, err := conn.Channel()
+	if err != nil {
+		t.Fatalf("open inspect channel: %v", err)
+	}
+	defer inspect.Close()
+	deadline := time.Now().Add(2 * time.Second)
+	for time.Now().Before(deadline) {
+		q := declareTestQueue(t, inspect, queueName)
+		if q.Messages != 0 {
+			t.Fatalf("queue holds %d message(s) after Stop; the handler finished, so this one "+
+				"was processed and then redelivered - its acknowledgement was lost", q.Messages)
+		}
+		time.Sleep(100 * time.Millisecond)
 	}
 }

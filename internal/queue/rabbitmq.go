@@ -37,6 +37,24 @@ const requeueDelay = 250 * time.Millisecond
 // graceful shutdown into a hang.
 const stopDrainTimeout = 5 * time.Second
 
+// cancelTimeout bounds the basic.cancel round trips Stop makes before it
+// waits for the delivery loops. Cancelling is a request-response exchange
+// with the broker, so an unresponsive-but-connected broker could otherwise
+// hold the shutdown here indefinitely - and unlike the drain below, there
+// is nothing to be gained by waiting: closing the channels achieves the
+// same teardown, only without the acknowledgements.
+const cancelTimeout = 2 * time.Second
+
+// consumerChannel is one queue's channel together with the consumer tag
+// registered on it. The tag exists solely so Stop can basic.cancel the
+// consumer before tearing anything down; without it the library invents a
+// tag and does not hand it back, leaving no way to cancel.
+type consumerChannel struct {
+	queue string
+	ch    *amqp.Channel
+	tag   string
+}
+
 // RabbitMQConsumer implements queue.Consumer against a RabbitMQ broker. It
 // opens one channel and consumer per queue name present in its Router;
 // each delivery's body is decoded and dispatched by the matching Handler,
@@ -84,7 +102,7 @@ type RabbitMQConsumer struct {
 
 	mu          sync.Mutex
 	conn        *amqp.Connection
-	channels    []*amqp.Channel
+	channels    []consumerChannel
 	closeNotify chan *amqp.Error
 
 	stopOnce   sync.Once
@@ -172,7 +190,7 @@ func (c *RabbitMQConsumer) connect(ctx context.Context, out chan<- Message) erro
 	}
 	closeNotify := conn.NotifyClose(make(chan *amqp.Error, 1))
 
-	channels := make([]*amqp.Channel, 0, len(c.router))
+	channels := make([]consumerChannel, 0, len(c.router))
 	for queueName, handle := range c.router {
 		ch, err := conn.Channel()
 		if err != nil {
@@ -204,13 +222,23 @@ func (c *RabbitMQConsumer) connect(ctx context.Context, out chan<- Message) erro
 			return fmt.Errorf("rabbitmq: set prefetch for %q: %w", queueName, err)
 		}
 
-		deliveries, err := ch.ConsumeWithContext(ctx, queueName, "", false, false, false, false, nil)
+		// An explicit consumer tag rather than the empty string. With ""
+		// the library generates one (ctag-<binary>-<n>) and never returns
+		// it, and a tag is what basic.cancel takes - so Stop would have no
+		// way to cancel this consumer and would be back to closing the
+		// channel out from under a running Handler. Tags are scoped to a
+		// channel and each channel carries exactly one consumer, so this
+		// cannot collide, not even between two worker processes. It also
+		// makes the RabbitMQ management console name the queue each
+		// consumer belongs to.
+		tag := consumerTag(queueName)
+		deliveries, err := ch.ConsumeWithContext(ctx, queueName, tag, false, false, false, false, nil)
 		if err != nil {
 			conn.Close()
 			return fmt.Errorf("rabbitmq: consume %q: %w", queueName, err)
 		}
 
-		channels = append(channels, ch)
+		channels = append(channels, consumerChannel{queue: queueName, ch: ch, tag: tag})
 
 		queueName, handle := queueName, handle // capture per-iteration values for the goroutine
 		c.consumerWG.Add(1)
@@ -318,9 +346,11 @@ func (c *RabbitMQConsumer) superviseReconnects(ctx context.Context, out chan<- M
 	// close is an unrecoverable "send on closed channel" panic (it happens
 	// in another goroutine, where a recover here can't reach it). Every
 	// return path below reaches this only after ctx was cancelled or Stop
-	// was called, both of which close the connection and so close every
-	// generation's deliveries channel, which is what makes the loops exit -
-	// so this Wait always terminates. This is the sole owner of the close;
+	// was called. Stop cancels the consumers first, which closes each
+	// generation's deliveries channel once its buffered deliveries are
+	// drained, and closes the connection afterwards regardless - so a
+	// cancel the broker never answered still ends the loops, and this Wait
+	// always terminates. See Stop for the three cases in full. This is the sole owner of the close;
 	// the WaitGroup is only ever Added to from connect, which runs either
 	// synchronously before this goroutine starts or from this goroutine
 	// itself, so no Add can ever race this Wait.
@@ -399,13 +429,36 @@ func (c *RabbitMQConsumer) logStatsPeriodically(ctx context.Context) {
 	}
 }
 
-// Stop closes the current connection (and, before that, every channel
-// opened on it), which causes every consumeLoop's deliveries channel to
-// close and its goroutine to exit, and signals superviseReconnects to stop
-// retrying rather than treat this as a drop to recover from. It then waits
-// for any Handler still in flight to return, so that once Stop has
-// returned, nothing is being enqueued into the pipeline any more. Safe to
-// call multiple times and safe to call without a prior Start.
+// Stop cancels every consumer, waits for the delivery loops to finish what
+// the broker has already handed them, and only then closes the channels and
+// the connection. It also signals superviseReconnects to stop retrying
+// rather than treat this as a drop to recover from. Once Stop has returned,
+// nothing is being enqueued into the pipeline any more. Safe to call
+// multiple times and safe to call without a prior Start.
+//
+// The cancel-first order is the whole point, and it used to be the other
+// way round. Closing a channel while a Handler is still running means that
+// Handler finishes, acks into a channel that is already gone, and the
+// broker answers with
+//
+//	operation basic.ack caused a connection exception channel_error:
+//	"expected 'channel.open'"
+//
+// The message was processed and written to MySQL, but never acknowledged,
+// so the broker redelivers it on the next start - work done twice, harmless
+// only because rule 6's writes are idempotent. basic.cancel stops the
+// broker sending more while leaving the channel usable for the
+// acknowledgements still owed. The Gearman consumer got exactly this fixed
+// in the fork (drain, then disconnect); this is the RabbitMQ half of the
+// same guarantee.
+//
+// Cancelling also changes what happens to deliveries the broker has already
+// pushed but the loop has not reached yet, and that is deliberate: closing a
+// channel makes amqp091-go drop them ("closed before drained, drop
+// in-flight", consumers.go), whereas cancelling hands them to the loop
+// first. So a Stop under load now processes up to prefetch more messages per
+// queue instead of leaving them to be redelivered. stopDrainTimeout is what
+// keeps that bounded.
 //
 // That wait is what makes cmd/app/main.go's shutdown order sound: step 6a
 // stops the consumer "so no new data comes in", then step 6b flushes every
@@ -426,19 +479,46 @@ func (c *RabbitMQConsumer) Stop() error {
 		conn, channels := c.conn, c.channels
 		c.mu.Unlock()
 
-		for _, ch := range channels {
-			_ = ch.Close()
+		cancelConsumers(channels)
+
+		// Wait before closing anything, not after. Every consumeLoop is
+		// on its way out by now - a successful cancel closes its
+		// deliveries channel once the buffered deliveries are drained -
+		// and it can still ack what it finishes, which is the point.
+		//
+		// The wait terminates in all three cases, and the close below is
+		// what makes the third one true:
+		//
+		//   - cancel-ok arrived: the deliveries channel closes, the loop
+		//     ends by itself.
+		//   - cancel failed because the connection is already gone: that
+		//     same connection teardown closed the deliveries channel.
+		//   - cancel timed out against a wedged broker: nothing closed the
+		//     deliveries channel, so the loop can still be parked in its
+		//     range. The timeout expires, and closing the channels and
+		//     connection below ends it - which is also what
+		//     superviseReconnects relies on before it closes out.
+		if !waitTimeout(&c.consumerWG, stopDrainTimeout) {
+			slog.Warn("rabbitmq: gave up waiting for in-flight handlers",
+				"timeout", stopDrainTimeout,
+				"note", "buffered rows enqueued after this point may not be flushed")
+		}
+
+		for _, cc := range channels {
+			_ = cc.ch.Close()
 		}
 		if conn != nil {
-			// A mid-flight shutdown routinely races the delivery loops:
-			// one of them acks on a channel whose connection is already on
-			// its way out, the broker answers with a connection-level
-			// error and closes it, and this Close then reports that the
-			// connection is not open. The connection being gone is the
-			// goal, so that is not a failure - only a Close that leaves it
-			// open is. Reporting the former had cmd/app log "error
-			// stopping consumer" on every shutdown that happened to catch
-			// a backlog.
+			// The connection can already be gone by now: a handler that
+			// outlived stopDrainTimeout, or one whose cancel never got its
+			// cancel-ok, still acks into a channel this is about to close,
+			// the broker answers with a connection-level error and closes
+			// it, and this Close then reports that the connection is not
+			// open. The connection being gone is the goal, so that is not
+			// a failure - only a Close that leaves it open is. Reporting
+			// the former had cmd/app log "error stopping consumer" on
+			// every shutdown that happened to catch a backlog, back when
+			// the channels were closed before the drain and this was the
+			// normal case rather than the timed-out one.
 			if closeErr := conn.Close(); closeErr != nil {
 				if conn.IsClosed() {
 					slog.Debug("rabbitmq: connection was already closed on shutdown", "error", closeErr)
@@ -448,25 +528,48 @@ func (c *RabbitMQConsumer) Stop() error {
 			}
 		}
 
-		// Closing the connection above closed every consumeLoop's
-		// deliveries channel, so the loops are already on their way out.
-		// The only things one can still be blocked on are its Handler's
-		// Enqueue (which selects on ctx, and whose BulkInserter is still
-		// draining - cmd/app/main.go doesn't cancel the pipeline until
-		// step 6c) and pauseBeforeRequeue (which selects on c.stopping,
-		// closed just above). Sends to out are non-blocking. So this
-		// terminates on its own; the timeout is a backstop, not the plan.
-		if !waitTimeout(&c.consumerWG, stopDrainTimeout) {
-			slog.Warn("rabbitmq: gave up waiting for in-flight handlers",
-				"timeout", stopDrainTimeout,
-				"note", "buffered rows enqueued after this point may not be flushed")
-		}
-
 		slog.Info("rabbitmq: consumer stopped",
 			"processed", c.processed.Load(), "errors", c.errors.Load(),
 			"dropped", c.dropped.Load(), "reconnects", c.reconnects.Load())
 	})
 	return err
+}
+
+// consumerTag names this process's consumer on one queue. It is only ever
+// read by a human in the RabbitMQ management console; what the code needs
+// is merely that Stop knows the string it registered.
+func consumerTag(queueName string) string {
+	return "statusengine-worker." + queueName
+}
+
+// cancelConsumers sends basic.cancel for every consumer and waits for the
+// broker's cancel-ok, so no further deliveries arrive while the loops
+// finish and acknowledge what they already have.
+//
+// In parallel and bounded, for the same reason closeWorkers in gearman.go
+// is: each cancel is a round trip, and twelve of them one after another
+// against a slow broker is a shutdown delay that a service manager
+// eventually answers with SIGKILL. A failed or timed-out cancel is not an
+// error worth reporting - the channel close that follows tears the
+// consumer down anyway, just without the acknowledgements. That is exactly
+// the old behaviour, so the worst case here is no worse than before.
+func cancelConsumers(channels []consumerChannel) {
+	var cancelling sync.WaitGroup
+	for _, cc := range channels {
+		cancelling.Add(1)
+		go func(cc consumerChannel) {
+			defer cancelling.Done()
+			if err := cc.ch.Cancel(cc.tag, false); err != nil {
+				slog.Debug("rabbitmq: cancelling consumer failed, closing its channel instead",
+					"queue", cc.queue, "error", err)
+			}
+		}(cc)
+	}
+
+	if !waitTimeout(&cancelling, cancelTimeout) {
+		slog.Warn("rabbitmq: broker did not answer basic.cancel in time; "+
+			"unacknowledged messages will be redelivered", "timeout", cancelTimeout)
+	}
 }
 
 // waitTimeout waits for wg, reporting false if d elapsed first. The
