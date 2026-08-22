@@ -148,7 +148,7 @@ api_keys: []
 # worker does not serve /commands at all and says so at startup.
 command_api_keys: []
 # command_api_keys:
-#   - a-secret-only-openitcockpit-holds
+#   - a-secret-only-you-knows
 
 # Address the external-command HTTP server (/commands) listens on. Its own
 # port rather than sharing listen_addr, so the read stream and the write
