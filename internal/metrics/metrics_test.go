@@ -99,6 +99,7 @@ var queueMetricNames = []string{
 	"statusengine_queue_payloads_repaired_total",
 	"statusengine_queue_handler_duration_seconds",
 	"statusengine_queue_jobs_in_flight",
+	"statusengine_queue_reconnects_total",
 }
 
 // TestComponentSeriesExistAtZero pins the package's init: all four
@@ -125,6 +126,29 @@ func TestInitQueueCreatesEverySeries(t *testing.T) {
 
 	for _, name := range queueMetricNames {
 		mustFindZero(t, name, "queue_name", queueName)
+	}
+}
+
+// TestInitQueueLeavesQueueConnectedAlone is the deliberate exception to
+// every other pre-creation rule in this package, and it needs a guard
+// precisely because it contradicts them: adding QueueConnected to InitQueue
+// would look like fixing an oversight.
+//
+// A pre-created gauge sits at 0, and 0 on this one is not "nothing has
+// happened yet" - it is the assertion "this queue has no connection", the
+// exact state the alert fires on. Since NewRouter runs before any consumer
+// dials, pre-creating it would make every worker report an outage for all
+// twelve queues during startup, and a worker that failed to start at all
+// would be indistinguishable from one that was running fine. The consumers
+// set it themselves once a connection is genuinely up.
+func TestInitQueueLeavesQueueConnectedAlone(t *testing.T) {
+	const queueName = "metrics_test_connected_queue"
+
+	InitQueue(queueName)
+
+	if _, ok := gatherFamily(t, "statusengine_queue_connected").find("queue_name", queueName); ok {
+		t.Errorf("InitQueue created a statusengine_queue_connected series for %q; "+
+			"a pre-created 0 there claims the queue is disconnected, which is what the alert watches for", queueName)
 	}
 }
 

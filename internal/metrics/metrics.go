@@ -48,15 +48,20 @@ var Components = []string{ComponentMySQL, ComponentWebSocket, ComponentGraphite,
 // id, a hostname), where pre-creating would be indistinguishable from a
 // cardinality leak.
 
-// InitQueue pre-creates the three per-queue series for queueName, so a
-// worker that has not yet received a message on that queue still reports
-// zeros for it rather than nothing at all. Called from queue.NewRouter
-// for every queue it wires up.
+// InitQueue pre-creates the per-queue series for queueName, so a worker
+// that has not yet received a message on that queue still reports zeros
+// for it rather than nothing at all. Called from queue.NewRouter for every
+// queue it wires up.
+//
+// QueueConnected is deliberately absent: it is the one series here whose
+// zero value is a claim rather than an absence of data, so the consumers
+// set it when a connection actually comes up. See its own comment.
 func InitQueue(queueName string) {
 	QueueMessagesReceivedTotal.WithLabelValues(queueName)
 	QueuePayloadsRepairedTotal.WithLabelValues(queueName)
 	QueueHandlerDurationSeconds.WithLabelValues(queueName)
 	QueueJobsInFlight.WithLabelValues(queueName)
+	QueueReconnectsTotal.WithLabelValues(queueName)
 }
 
 // InitStaleDiscards pre-creates the per-queue series on
@@ -172,6 +177,49 @@ var (
 		Subsystem: "queue",
 		Name:      "jobs_in_flight",
 		Help:      "Number of queue messages currently being handled, per queue.",
+	}, []string{"queue_name"})
+
+	// QueueConnected is 1 while the consumer holds a working connection
+	// for that queue and 0 from the moment it is lost until one is
+	// re-established. This is the metric to alert on, and it exists
+	// because nothing else could answer the question: a queue that has
+	// stopped consuming and a queue that is merely idle produce exactly
+	// the same flat messages_received_total and the same
+	// jobs_in_flight of 0. When the Gearman consumer lost its connections
+	// and never reconnected, the only evidence was twelve WARN lines in
+	// the log and a processed count that stopped climbing.
+	//
+	// Deliberately NOT pre-created by InitQueue, unlike every other series
+	// in this subsystem. Each consumer sets it to 1 itself after a
+	// connection is actually up (Ready for Gearman, connect for
+	// RabbitMQ), so a 1 means "connected" rather than "NewRouter ran".
+	// That is the opposite choice from DBAvailable, which is pre-set to 1
+	// precisely because there is nothing to observe before the first flush
+	// - here there is, and it is the whole point of the metric.
+	//
+	// One series per queue on both backends, even though a RabbitMQ
+	// connection is shared by every queue and so moves all twelve at once:
+	// an alert written against one backend has to keep working on the
+	// other.
+	QueueConnected = promauto.NewGaugeVec(prometheus.GaugeOpts{
+		Namespace: "statusengine",
+		Subsystem: "queue",
+		Name:      "connected",
+		Help:      "1 while the consumer holds a working connection for this queue, 0 while it does not.",
+	}, []string{"queue_name"})
+
+	// QueueReconnectsTotal counts how often the consumer had to rebuild a
+	// lost connection for that queue. QueueConnected says whether data is
+	// flowing right now; this says how unstable the link has been, which is
+	// the difference between "the broker restarted once at 03:00" and "the
+	// link flaps every few minutes". Pre-created at zero by InitQueue,
+	// because a counter that only appears once something has gone wrong
+	// cannot be graphed before it does.
+	QueueReconnectsTotal = promauto.NewCounterVec(prometheus.CounterOpts{
+		Namespace: "statusengine",
+		Subsystem: "queue",
+		Name:      "reconnects_total",
+		Help:      "Total number of times the consumer re-established a lost connection, per queue.",
 	}, []string{"queue_name"})
 
 	// QueuePayloadsRepairedTotal counts payloads that were not valid

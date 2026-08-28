@@ -90,11 +90,17 @@ func TestNewRouterPreCreatesMetricSeries(t *testing.T) {
 	router, _ := NewRouter(sqlDB, hub, graphite.NewClient("127.0.0.1:2003"),
 		PerfdataRouteMySQL, "statusengine-test", "statusengine-test", false, noAgeFilter, testBatchSize)
 
-	// Every queue in the router, on all three per-queue metrics.
+	// Every queue in the router, on all four per-queue metrics.
+	//
+	// statusengine_queue_connected is deliberately not among them: it is
+	// set by the consumer once a connection is actually up, so that a 1
+	// means "connected" rather than "the Router was wired up". See
+	// TestInitQueueLeavesQueueConnectedAlone (internal/metrics).
 	for _, name := range []string{
 		"statusengine_queue_messages_received_total",
 		"statusengine_queue_payloads_repaired_total",
 		"statusengine_queue_handler_duration_seconds",
+		"statusengine_queue_reconnects_total",
 	} {
 		exported := gatheredLabelValues(t, name, "queue_name")
 		for queueName := range router {

@@ -15,13 +15,19 @@ import (
 	"statusengine-worker/internal/metrics"
 )
 
-// reconnectDelay is how long the consumer waits between reconnect attempts
-// after an unexpected disconnect. Unlike the Gearman client library (see
-// gearman.go's KNOWN ISSUE comment for the one thing it doesn't handle),
-// amqp091-go never reconnects on its own - a dropped TCP connection just
-// closes every delivery channel and stops there - so this consumer has to
-// redial itself to satisfy CLAUDE.md rule 6 ("reconnect automatically to
-// MySQL/Queues on connection drops").
+// reconnectDelay is how long either consumer waits between reconnect
+// attempts after an unexpected disconnect. Neither backend's client library
+// recovers on its own: amqp091-go closes every delivery channel and stops
+// there, and gearman-go's agent goroutine reports the disconnect to the
+// ErrorHandler and returns, leaving its Work loop parked on a channel
+// nothing will ever send on again. So both consumers redial themselves, to
+// satisfy CLAUDE.md rule 6 ("reconnect automatically to MySQL/Queues on
+// connection drops").
+//
+// This comment used to claim the opposite about Gearman - that the library
+// handled it and only shutdown was a problem. That assumption is why a lost
+// job server silently stopped the worker consuming until it was restarted
+// by hand; see superviseReconnects in gearman.go.
 const reconnectDelay = 2 * time.Second
 
 // requeueDelay is how long a delivery loop pauses before requeueing a
@@ -251,6 +257,15 @@ func (c *RabbitMQConsumer) connect(ctx context.Context, out chan<- Message) erro
 	c.closeNotify = closeNotify
 	c.mu.Unlock()
 
+	// One series per queue even though a single connection carries all of
+	// them, so the same alert works against either backend - see
+	// metrics.QueueConnected. Set only now, with every queue declared and
+	// consuming, because a partial connect returned above without ever
+	// getting here.
+	for queueName := range c.router {
+		metrics.QueueConnected.WithLabelValues(queueName).Set(1)
+	}
+
 	return nil
 }
 
@@ -378,6 +393,12 @@ func (c *RabbitMQConsumer) superviseReconnects(ctx context.Context, out chan<- M
 			default:
 			}
 			c.reconnects.Add(1)
+			// Every queue at once: they share the connection that just
+			// went away, so every one of them has stopped consuming.
+			for queueName := range c.router {
+				metrics.QueueConnected.WithLabelValues(queueName).Set(0)
+				metrics.QueueReconnectsTotal.WithLabelValues(queueName).Inc()
+			}
 			slog.Warn("rabbitmq: connection lost, reconnecting", "error", amqpErr, "retry_interval", reconnectDelay)
 		}
 
@@ -526,6 +547,10 @@ func (c *RabbitMQConsumer) Stop() error {
 					err = closeErr
 				}
 			}
+		}
+
+		for queueName := range c.router {
+			metrics.QueueConnected.WithLabelValues(queueName).Set(0)
 		}
 
 		slog.Info("rabbitmq: consumer stopped",

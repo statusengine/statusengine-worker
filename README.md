@@ -285,6 +285,27 @@ Two consequences worth knowing:
 
 gearmand's `--round-robin` is a related but separate thing: it changes which queue the *server* offers next, and would have spread the shared budget around without removing the coupling, which lived in this process. It is also off by default on gearmand 1.x. Correctness here no longer depends on it.
 
+## Reconnecting to the broker
+
+Neither client library recovers from a dropped connection on its own, so both consumers rebuild it themselves, retrying every 2 s until the broker is back.
+
+For Gearman that was not always true, and the failure was a quiet one. On EOF the library's agent goroutine reports a `WorkerDisconnectError` to the `ErrorHandler` and returns; nothing sends on the worker's internal job channel afterwards, and `Work()` is a plain `range` over that channel, which only `Close()` ever ends. So the worker stayed up, kept logging its stats line, and consumed nothing — one WARN line per queue and then silence until someone restarted the process:
+
+```
+level=WARN msg="gearman: worker error" queue=statusngin_hoststatus error=EOF
+...
+level=INFO msg="gearman: consumer stats" addr=127.0.0.1:4730 processed=12836 errors=0
+level=INFO msg="gearman: consumer stats" addr=127.0.0.1:4730 processed=12836 errors=0
+```
+
+The consumer now treats that error as what it is. Per queue, it closes the dead connection, then rebuilds the worker from scratch — `New`/`AddServer`/`AddFunc`/`Ready`/`Work`, the same path every startup takes — rather than calling the library's `WorkerDisconnectError.Reconnect()`, which cannot be called from the `ErrorHandler` that hands you the error: `agent.disconnect_error` holds the agent's mutex while calling the handler, and `reconnect()` takes that same mutex. The twelve queues reconnect in parallel, so a job server restart costs seconds rather than twelve backoffs in a row.
+
+Jobs that were in flight when the connection dropped lose their acknowledgement and are handed out again afterwards. That is expected and harmless — it is the same at-least-once redelivery the upserts under [MySQL Write Behavior](#mysql-write-behavior) exist to absorb.
+
+**Watch `statusengine_queue_connected`.** It is the only series that distinguishes a queue that has stopped consuming from one that is merely idle — both leave `messages_received_total` flat and `jobs_in_flight` at 0. It is deliberately *not* pre-created at startup, unlike every other per-queue series: a pre-created gauge sits at 0, and 0 here would claim an outage for all twelve queues in the window between wiring the Router and dialling. `statusengine_queue_reconnects_total` counts how often the link had to be rebuilt — a short dip is a broker restart, a climbing counter is a flapping link.
+
+One case is knowingly not covered: a half-open TCP connection (a network partition with no FIN or RST) never produces an EOF, so the agent stays blocked in `read()` and nothing notices. In production gearmand is on `127.0.0.1:4730`, where that does not realistically happen; closing it would need an application-level heartbeat.
+
 ## RabbitMQ Queue Durability
 
 Every queue is declared **durable**, and the events inside it stay **transient**. Those are two different AMQP properties, and keeping them apart is the whole point of this section.
