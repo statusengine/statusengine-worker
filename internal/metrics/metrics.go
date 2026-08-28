@@ -111,6 +111,19 @@ var (
 	CommandRejectReasons = []string{"auth", "malformed", "unknown_command", "denied", "too_large"}
 )
 
+// InitDowntimeUpdates pre-creates the per-table series on
+// DowntimeUpdatesUnmatchedTotal. Called from queue.NewRouter for the two
+// downtimehistory tables, which are the only ones a downtime UPDATE ever
+// targets - the scheduleddowntimes pair is only ever upserted or deleted.
+//
+// Pre-created for the usual reason, which bites harder here than anywhere
+// else: this counter is supposed to sit at 0 forever, so without this it
+// would not exist at all on a healthy worker and an alert on it would never
+// evaluate.
+func InitDowntimeUpdates(table string) {
+	DowntimeUpdatesUnmatchedTotal.WithLabelValues(table)
+}
+
 // InitTable pre-creates the per-table series on DBEventsWrittenTotal.
 // Called from db.NewBulkInserter, so every table this worker can write to
 // is covered automatically - including one added later, which is the
@@ -221,6 +234,36 @@ var (
 		Name:      "reconnects_total",
 		Help:      "Total number of times the consumer re-established a lost connection, per queue.",
 	}, []string{"queue_name"})
+
+	// DowntimeUpdatesUnmatchedTotal counts downtime UPDATEs that matched no
+	// row, per destination table. A downtime's START and STOP arrive as
+	// separate messages and are written as bare UPDATE ... WHERE <PK>
+	// against the row its ADD created, so an UPDATE that matches nothing
+	// means that row was not there - the event is simply gone, with no
+	// error and nothing in the log to say so.
+	//
+	// That is not hypothetical: handling the downtime queue concurrently
+	// let a backlog execute START before ADD, which left was_started=0 and
+	// actual_start_time=0 on downtimes that had demonstrably run. The
+	// consumer now serializes that queue (queue.RequiresInOrderProcessing),
+	// so this should stay at 0; it exists because the failure it reports is
+	// otherwise invisible until someone diffs the database against another
+	// worker.
+	//
+	// Deliberately not counted for DELETE, which legitimately matches
+	// nothing on every ordinary downtime: STOP already removed the
+	// scheduleddowntimes row by the time DELETE arrives.
+	//
+	// One legitimate source remains: a downtime whose ADD predates this
+	// database entirely (LOAD is a no-op by design, mirroring the legacy
+	// worker), so its START finds no history row. Expect a few of these
+	// right after a fresh installation, and none afterwards.
+	DowntimeUpdatesUnmatchedTotal = promauto.NewCounterVec(prometheus.CounterOpts{
+		Namespace: "statusengine",
+		Subsystem: "queue",
+		Name:      "downtime_updates_unmatched_total",
+		Help:      "Total number of downtime UPDATE statements that matched no row, per table.",
+	}, []string{"table"})
 
 	// QueuePayloadsRepairedTotal counts payloads that were not valid
 	// UTF-8 and had their invalid bytes reinterpreted as Windows-1252

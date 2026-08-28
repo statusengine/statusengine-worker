@@ -223,9 +223,16 @@ func (c *GearmanConsumer) Start(ctx context.Context) (<-chan Message, error) {
 		c.Stop()
 	}()
 
+	inOrder := 0
+	for queueName := range c.router {
+		if RequiresInOrderProcessing(queueName) {
+			inOrder++
+		}
+	}
 	slog.Info("gearman: consumer started",
 		"addr", c.addr, "queues", len(c.router),
-		"max_concurrent_jobs_per_queue", c.maxConcurrentJobsPerQueue)
+		"max_concurrent_jobs_per_queue", c.maxConcurrentJobsPerQueue,
+		"serialized_queues", inOrder)
 
 	return out, nil
 }
@@ -245,7 +252,17 @@ func (c *GearmanConsumer) newWorker(ctx context.Context, qw *queueWorker, out ch
 	// spawning the job's goroutine, so New(n) permits exactly n concurrent
 	// handlers and New(1) serializes them. That is correct as written; it
 	// only looks like an off-by-one.
-	w := gearman.New(c.maxConcurrentJobsPerQueue)
+	//
+	// A queue whose messages build on one another gets 1 regardless of the
+	// configured cap, which is what makes New(1)'s serialization
+	// load-bearing rather than a curiosity. See RequiresInOrderProcessing:
+	// statusngin_downtimes delivers a downtime's ADD/START/STOP/DELETE as
+	// separate jobs, and handling them concurrently silently corrupts the
+	// two downtime table pairs whenever a backlog makes them overlap.
+	// Costs nothing: that queue sees a handful of messages an hour, and
+	// per-queue concurrency buys no throughput anyway (CLAUDE.md rule 2 -
+	// the bottleneck is the single Run goroutine per table).
+	w := gearman.New(c.jobLimitFor(qw.queue))
 	if err := w.AddServer(gearman.Network, c.addr); err != nil {
 		return nil, fmt.Errorf("gearman: connect to %s for %q: %w", c.addr, qw.queue, err)
 	}
@@ -267,6 +284,17 @@ func (c *GearmanConsumer) newWorker(ctx context.Context, qw *queueWorker, out ch
 	metrics.QueueConnected.WithLabelValues(qw.queue).Set(1)
 
 	return w, nil
+}
+
+// jobLimitFor is the concurrency cap to open one queue's connection with:
+// the configured per-queue cap, or 1 for a queue that must be processed in
+// order. Split out so Start can report how many queues are serialized
+// without repeating the rule.
+func (c *GearmanConsumer) jobLimitFor(queueName string) int {
+	if RequiresInOrderProcessing(queueName) {
+		return 1
+	}
+	return c.maxConcurrentJobsPerQueue
 }
 
 // errorHandler builds the gearman.ErrorHandler for one queue. Its real job
