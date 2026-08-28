@@ -1,3 +1,5 @@
+.claude/settings.json
+.ressouces
 /simulator
 /gearman_publisher
 /rabbitmq_publisher
