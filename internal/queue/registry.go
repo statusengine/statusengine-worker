@@ -3,6 +3,7 @@ package queue
 import (
 	"context"
 	"database/sql"
+	"errors"
 	"fmt"
 	"log/slog"
 	"time"
@@ -32,6 +33,49 @@ const (
 	QueueDowntimes                 = "statusngin_downtimes"
 	QueueCoreRestart               = "statusngin_core_restart"
 )
+
+// inOrderQueues names the queues whose messages build on one another, so a
+// later message must never be handled before an earlier one. A consumer is
+// required to process these strictly one at a time.
+//
+// statusngin_downtimes is the only one, and it is not a preference. A
+// single downtime arrives as up to four separate messages over its
+// lifetime - ADD, START, STOP, DELETE (see
+// .claude/specs/downtime_ablauf.txt) - and only ADD is an UPSERT. START and
+// STOP are bare UPDATE ... WHERE <PK> against the row ADD created, and
+// STOP/DELETE are DELETE FROM scheduleddowntimes. Every one of those is a
+// silent no-op if it runs before the message it depends on.
+//
+// This is not theoretical. Measured against a shadow-tested database after
+// the worker had been disconnected from the job server for two hours and
+// was restarted with the whole backlog waiting: of ~14 downtimes, 6 were
+// corrupted, each one explainable by the order its messages happened to be
+// executed in. START before ADD left was_started=0 and actual_start_time=0
+// on a row whose actual_end_time was correct, because STOP got there after
+// ADD. STOP before START left a scheduleddowntimes row behind for good,
+// because STOP deleted it and START's UPSERT put it back. Nothing was
+// logged, nothing failed, and the only reason it was found at all is that
+// cmd/db_verifier diffs against the legacy PHP worker.
+//
+// Live traffic hides this completely - a downtime's events are minutes
+// apart, so they never overlap. It takes a backlog, which is exactly what
+// an outage produces.
+//
+// The legacy PHP worker forks one process per queue and is sequential, and
+// the RabbitMQ consumer here calls its Handler synchronously from a plain
+// for range (TestRabbitMQPrefetchDoesNotAddConcurrency pins that), so both
+// of those are already in order. Only the Gearman consumer dispatches
+// concurrently, and it never meant to make this queue an exception.
+var inOrderQueues = map[string]bool{
+	QueueDowntimes: true,
+}
+
+// RequiresInOrderProcessing reports whether queueName's messages must be
+// handled strictly one at a time. Consumers that dispatch concurrently have
+// to honour it; see inOrderQueues for why.
+func RequiresInOrderProcessing(queueName string) bool {
+	return inOrderQueues[queueName]
+}
 
 // isHardState maps the standard Nagios/Icinga/Naemon state_type convention
 // (0 = SOFT, 1 = HARD) to the tinyint(1) is_hardstate column.
@@ -453,19 +497,12 @@ func downtimeMetricsTables() []string {
 	return tables
 }
 
-// execDowntimeAction turns one DowntimeAction into its concrete (query,
-// args) pair via the matching internal/db builder (Schritt 3), executes it,
-// and reports the outcome through the same db-write instrumentation
-// BulkInserter.flushBuffer uses for every other table - done by hand here
-// since downtime writes deliberately bypass BulkInserter entirely (see
-// .claude/specs/downtime_ablauf.txt section 6: a single downtime message
-// can require an UPSERT, UPDATE or DELETE, not just an INSERT). Unlike
-// BulkInserter's batch histograms (which track 100-item/250ms batching
-// behaviour that plainly doesn't apply here, per downtime_ablauf.txt
-// section 6), only DBEventsWrittenTotal/PipelineErrorsTotal apply to a
-// single-row ExecContext like this one.
-func execDowntimeAction(ctx context.Context, sqlDB *sql.DB, action DowntimeAction) error {
-	row := db.DowntimeRow{
+// downtimeRowFor projects a DowntimeAction's payload onto the db-layer row
+// every downtime query builder takes. Shared by the statement itself and by
+// the follow-up existence check, so both can never disagree about which row
+// they mean.
+func downtimeRowFor(action DowntimeAction) db.DowntimeRow {
+	return db.DowntimeRow{
 		IsHostDowntime:     action.Data.IsHostDowntime,
 		HostName:           action.Data.HostName,
 		ServiceDescription: action.Data.ServiceDescription,
@@ -485,6 +522,113 @@ func execDowntimeAction(ctx context.Context, sqlDB *sql.DB, action DowntimeActio
 		ActualEndTime:      action.Data.ActualEndTime,
 		WasCancelled:       action.Data.WasCancelled,
 	}
+}
+
+// reportUnmatchedDowntimeUpdate says so when a downtime UPDATE matched no
+// row, which MySQL reports as success and which nothing else would ever
+// surface.
+//
+// START and STOP are written as bare UPDATE ... WHERE <PK> against the row
+// the downtime's ADD created (see .claude/specs/downtime_ablauf.txt). If
+// that row is not there the statement affects nothing, returns no error,
+// and the event is lost - was_started stays 0 on a downtime that ran, or
+// actual_end_time stays 0 on one that ended. That is precisely how
+// concurrent handling of the downtime queue corrupted six downtimes across
+// one job-server outage without producing a single log line; the queue is
+// serialized now (see inOrderQueues), and this is what makes a recurrence
+// visible rather than something cmd/db_verifier finds weeks later.
+//
+// Only the two UPDATE actions are checked. A DELETE matching nothing is
+// normal and happens on every ordinary downtime - STOP removes the
+// scheduleddowntimes row, and the DELETE that follows finds it already
+// gone - so counting that would bury the real signal in noise. An UPSERT
+// always matches by definition.
+//
+// Zero affected rows is not on its own enough to report, which is why this
+// costs a second query. MySQL counts rows *changed*, not matched
+// (CLIENT_FOUND_ROWS is off in go-sql-driver by default), so a redelivered
+// START rewriting the values it already wrote also reports zero - and
+// redelivery is normal here, not exceptional (CLAUDE.md rule 6). Asking
+// whether the row exists separates the two, and it only ever runs on a path
+// that is supposed to be dead, so its cost is irrelevant.
+//
+// The answer is only as good as the serialization it rests on, and that is
+// worth knowing rather than assuming. If something else writes that row
+// between the UPDATE and this lookup, a genuinely lost event reads as a
+// redelivery and goes uncounted - measured, by running this check against a
+// deliberately unserialized downtime queue: the ADD racing behind its own
+// START landed in exactly that window, the corruption appeared in MySQL and
+// this counter stayed at 0. Not a gap in practice, because the queue that
+// produces these is serialized (see inOrderQueues) and the only other
+// writer would be a second worker process, which CLAUDE.md rule 2 already
+// advises against for unrelated reasons. It does mean this counter
+// backstops a missing ADD rather than a broken ordering guarantee -
+// TestDowntimeQueueIsHandledOneAtATime is what covers the latter.
+//
+// A driver that cannot report RowsAffected is not treated as a finding: the
+// point is to detect a missing row, not to complain about the driver.
+func reportUnmatchedDowntimeUpdate(ctx context.Context, sqlDB *sql.DB, result sql.Result, action DowntimeAction, table string) {
+	if action.Action != DowntimeActionUpdateStarted && action.Action != DowntimeActionUpdateStopped {
+		return
+	}
+
+	affected, err := result.RowsAffected()
+	if err != nil || affected != 0 {
+		return
+	}
+
+	query, args := db.DowntimeHistoryExistsQuery(downtimeRowFor(action))
+	var exists int
+	switch err := sqlDB.QueryRowContext(ctx, query, args...).Scan(&exists); {
+	case err == nil:
+		// The row is there and already held these values - a redelivery
+		// doing its job, which is the whole reason for this second look.
+		return
+	case !errors.Is(err, sql.ErrNoRows):
+		// Could not find out. Reporting a lost event on a failed lookup
+		// would be worse than staying quiet, since this counter is only
+		// useful if a non-zero value is trustworthy.
+		slog.Debug("queue: could not check whether the downtime row exists",
+			"table", table, "action", action.Action, "error", err)
+		return
+	}
+
+	metrics.DowntimeUpdatesUnmatchedTotal.WithLabelValues(table).Inc()
+	slog.Warn("queue: downtime update matched no row, the event is lost",
+		"table", table, "action", action.Action,
+		"host", action.Data.HostName, "service", action.Data.ServiceDescription,
+		"internal_downtime_id", action.Data.InternalDowntimeID,
+		"scheduled_start_time", action.Data.ScheduledStartTime,
+		"note", "no row for this downtime existed to update - its ADD is missing or arrived later")
+}
+
+// downtimeHistoryTables enumerates the two tables a downtime UPDATE can
+// target. A strict subset of downtimeMetricsTables: the scheduleddowntimes
+// pair is only ever upserted or deleted, never updated, so pre-creating an
+// unmatched-update series for those two would advertise a failure mode they
+// do not have. Built from the same helper as everything else here so the
+// four names cannot drift apart; a test pins the subset relationship.
+func downtimeHistoryTables() []string {
+	tables := make([]string, 0, 2)
+	for _, scope := range []string{"host", "service"} {
+		tables = append(tables, downtimeTableName(scope, DowntimeHistoryTable.String()))
+	}
+	return tables
+}
+
+// execDowntimeAction turns one DowntimeAction into its concrete (query,
+// args) pair via the matching internal/db builder (Schritt 3), executes it,
+// and reports the outcome through the same db-write instrumentation
+// BulkInserter.flushBuffer uses for every other table - done by hand here
+// since downtime writes deliberately bypass BulkInserter entirely (see
+// .claude/specs/downtime_ablauf.txt section 6: a single downtime message
+// can require an UPSERT, UPDATE or DELETE, not just an INSERT). Unlike
+// BulkInserter's batch histograms (which track 100-item/250ms batching
+// behaviour that plainly doesn't apply here, per downtime_ablauf.txt
+// section 6), only DBEventsWrittenTotal/PipelineErrorsTotal apply to a
+// single-row ExecContext like this one.
+func execDowntimeAction(ctx context.Context, sqlDB *sql.DB, action DowntimeAction) error {
+	row := downtimeRowFor(action)
 
 	var query string
 	var args []any
@@ -510,7 +654,7 @@ func execDowntimeAction(ctx context.Context, sqlDB *sql.DB, action DowntimeActio
 
 	table := downtimeMetricsTable(action)
 	start := time.Now()
-	_, err := sqlDB.ExecContext(ctx, query, args...)
+	result, err := sqlDB.ExecContext(ctx, query, args...)
 	duration := time.Since(start)
 
 	if err != nil {
@@ -518,6 +662,8 @@ func execDowntimeAction(ctx context.Context, sqlDB *sql.DB, action DowntimeActio
 		slog.Error("queue: downtime write failed", "table", table, "action", action.Action, "duration", duration, "error", err)
 		return fmt.Errorf("%s %s: %w", action.Action, table, err)
 	}
+
+	reportUnmatchedDowntimeUpdate(ctx, sqlDB, result, action, table)
 
 	metrics.DBEventsWrittenTotal.WithLabelValues(table).Add(1)
 	// Debug, for the same reason as the bulk-insert flush line: one entry
@@ -858,6 +1004,9 @@ func NewRouter(sqlDB *sql.DB, hub *websocket.Hub, gc *graphite.Client, perfdataR
 	}
 	for _, table := range downtimeMetricsTables() {
 		metrics.InitTable(table)
+	}
+	for _, table := range downtimeHistoryTables() {
+		metrics.InitDowntimeUpdates(table)
 	}
 
 	runners := []Runner{

@@ -190,6 +190,25 @@ func UpdateDowntimeHistoryStoppedQuery(row DowntimeRow) (string, []any) {
 	return query, args
 }
 
+// DowntimeHistoryExistsQuery builds the SELECT that answers whether the
+// downtimehistory row an UPDATE was aimed at exists at all.
+//
+// It is only ever run to disambiguate an UPDATE that reported zero affected
+// rows, which MySQL says for two very different situations: the row is not
+// there (the downtime's ADD is missing - a lost event), or the row is there
+// and already held exactly these values (a redelivered message rewriting
+// what it wrote before, which CLAUDE.md rule 6 makes a normal occurrence).
+// go-sql-driver reports rows *changed* rather than rows matched, since
+// CLIENT_FOUND_ROWS is off by default - and turning it on to tell these
+// apart would change what every other statement in the worker reports, to
+// answer a question that arises on a path that should never be taken.
+func DowntimeHistoryExistsQuery(row DowntimeRow) (string, []any) {
+	table := downtimeTable("downtimehistory", row.IsHostDowntime)
+	where, whereArgs := downtimePrimaryKeyWhere(row)
+
+	return "SELECT 1 FROM " + table + " WHERE " + where + " LIMIT 1", whereArgs
+}
+
 // DeleteDowntimeHistoryQuery builds the DELETE used only for the DELETE
 // Envelope.Type action's "wasNeverStarted" case (downtime_ablauf.txt
 // section 5): a downtime removed before its scheduled start_time was ever

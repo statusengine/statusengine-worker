@@ -285,6 +285,47 @@ Two consequences worth knowing:
 
 gearmand's `--round-robin` is a related but separate thing: it changes which queue the *server* offers next, and would have spread the shared budget around without removing the coupling, which lived in this process. It is also off by default on gearmand 1.x. Correctness here no longer depends on it.
 
+## Reconnecting to the broker
+
+Neither client library recovers from a dropped connection on its own, so both consumers rebuild it themselves, retrying every 2 s until the broker is back.
+
+For Gearman that was not always true, and the failure was a quiet one. On EOF the library's agent goroutine reports a `WorkerDisconnectError` to the `ErrorHandler` and returns; nothing sends on the worker's internal job channel afterwards, and `Work()` is a plain `range` over that channel, which only `Close()` ever ends. So the worker stayed up, kept logging its stats line, and consumed nothing — one WARN line per queue and then silence until someone restarted the process:
+
+```
+level=WARN msg="gearman: worker error" queue=statusngin_hoststatus error=EOF
+...
+level=INFO msg="gearman: consumer stats" addr=127.0.0.1:4730 processed=12836 errors=0
+level=INFO msg="gearman: consumer stats" addr=127.0.0.1:4730 processed=12836 errors=0
+```
+
+The consumer now treats that error as what it is. Per queue, it closes the dead connection, then rebuilds the worker from scratch — `New`/`AddServer`/`AddFunc`/`Ready`/`Work`, the same path every startup takes — rather than calling the library's `WorkerDisconnectError.Reconnect()`, which cannot be called from the `ErrorHandler` that hands you the error: `agent.disconnect_error` holds the agent's mutex while calling the handler, and `reconnect()` takes that same mutex. The twelve queues reconnect in parallel, so a job server restart costs seconds rather than twelve backoffs in a row.
+
+Jobs that were in flight when the connection dropped lose their acknowledgement and are handed out again afterwards. That is expected and harmless — it is the same at-least-once redelivery the upserts under [MySQL Write Behavior](#mysql-write-behavior) exist to absorb.
+
+**Watch `statusengine_queue_connected`.** It is the only series that distinguishes a queue that has stopped consuming from one that is merely idle — both leave `messages_received_total` flat and `jobs_in_flight` at 0. It is deliberately *not* pre-created at startup, unlike every other per-queue series: a pre-created gauge sits at 0, and 0 here would claim an outage for all twelve queues in the window between wiring the Router and dialling. `statusengine_queue_reconnects_total` counts how often the link had to be rebuilt — a short dip is a broker restart, a climbing counter is a flapping link.
+
+One case is knowingly not covered: a half-open TCP connection (a network partition with no FIN or RST) never produces an EOF, so the agent stays blocked in `read()` and nothing notices. In production gearmand is on `127.0.0.1:4730`, where that does not realistically happen; closing it would need an application-level heartbeat.
+
+## Downtimes are processed in order
+
+`statusngin_downtimes` is the one queue whose messages build on one another, and the only one the consumer handles strictly one at a time.
+
+A single downtime arrives as up to four separate jobs — ADD, START, STOP, DELETE — and only ADD is an UPSERT. START and STOP are bare `UPDATE ... WHERE <PK>` against the row ADD created; STOP and DELETE are `DELETE FROM …_scheduleddowntimes`. Every one of those does nothing at all, successfully and silently, if it runs before the message it depends on.
+
+With eight handlers per queue that ordering held only by luck, and live traffic supplied the luck — a downtime's events are minutes apart, so they never overlap. A backlog does not. After the job-server outage described above was drained in one burst, 6 of ~14 downtimes came out wrong:
+
+| Symptom in the Go database | What happened |
+|---|---|
+| `was_started=0`, `actual_start_time=0`, but `actual_end_time` correct | START ran before ADD — its UPDATE matched nothing. STOP ran after ADD and landed. |
+| history correct, but a `scheduleddowntimes` row left behind forever | STOP ran before START — STOP deleted the scheduled row, START's UPSERT recreated it. |
+| everything 0 *and* a leftover scheduled row | START and STOP both ran before ADD. |
+
+Nothing failed and nothing was logged; it was found by `cmd/db_verifier` diffing against the legacy PHP worker. The legacy worker forks one process per queue and the RabbitMQ consumer here calls its Handler synchronously from a plain `for range`, so both were already in order — only the Gearman path was not, and never on purpose.
+
+The consumer now caps that queue at one handler regardless of `-gearman-max-concurrent-jobs-per-queue`. It costs nothing: the queue sees a handful of messages an hour, and per-queue concurrency buys no throughput anyway (see [One connection per queue](#one-connection-per-queue) — the bottleneck is the single `Run` goroutine per table).
+
+**Watch `statusengine_queue_downtime_updates_unmatched_total`.** It counts downtime UPDATEs that found no row, which is what a lost ADD looks like, and it should stay at 0. It costs one extra `SELECT` when that happens rather than trusting `RowsAffected`, because MySQL counts rows *changed* rather than matched — so a redelivered START rewriting identical values reports zero too, and redelivery is normal here. A DELETE matching nothing is deliberately not counted: STOP already removed the scheduled row, so that happens on every ordinary downtime.
+
 ## RabbitMQ Queue Durability
 
 Every queue is declared **durable**, and the events inside it stay **transient**. Those are two different AMQP properties, and keeping them apart is the whole point of this section.

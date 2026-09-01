@@ -48,15 +48,20 @@ var Components = []string{ComponentMySQL, ComponentWebSocket, ComponentGraphite,
 // id, a hostname), where pre-creating would be indistinguishable from a
 // cardinality leak.
 
-// InitQueue pre-creates the three per-queue series for queueName, so a
-// worker that has not yet received a message on that queue still reports
-// zeros for it rather than nothing at all. Called from queue.NewRouter
-// for every queue it wires up.
+// InitQueue pre-creates the per-queue series for queueName, so a worker
+// that has not yet received a message on that queue still reports zeros
+// for it rather than nothing at all. Called from queue.NewRouter for every
+// queue it wires up.
+//
+// QueueConnected is deliberately absent: it is the one series here whose
+// zero value is a claim rather than an absence of data, so the consumers
+// set it when a connection actually comes up. See its own comment.
 func InitQueue(queueName string) {
 	QueueMessagesReceivedTotal.WithLabelValues(queueName)
 	QueuePayloadsRepairedTotal.WithLabelValues(queueName)
 	QueueHandlerDurationSeconds.WithLabelValues(queueName)
 	QueueJobsInFlight.WithLabelValues(queueName)
+	QueueReconnectsTotal.WithLabelValues(queueName)
 }
 
 // InitStaleDiscards pre-creates the per-queue series on
@@ -105,6 +110,19 @@ var (
 	CommandNames         = []string{"check_result", "schedule_check", "delete_downtime", "raw"}
 	CommandRejectReasons = []string{"auth", "malformed", "unknown_command", "denied", "too_large"}
 )
+
+// InitDowntimeUpdates pre-creates the per-table series on
+// DowntimeUpdatesUnmatchedTotal. Called from queue.NewRouter for the two
+// downtimehistory tables, which are the only ones a downtime UPDATE ever
+// targets - the scheduleddowntimes pair is only ever upserted or deleted.
+//
+// Pre-created for the usual reason, which bites harder here than anywhere
+// else: this counter is supposed to sit at 0 forever, so without this it
+// would not exist at all on a healthy worker and an alert on it would never
+// evaluate.
+func InitDowntimeUpdates(table string) {
+	DowntimeUpdatesUnmatchedTotal.WithLabelValues(table)
+}
 
 // InitTable pre-creates the per-table series on DBEventsWrittenTotal.
 // Called from db.NewBulkInserter, so every table this worker can write to
@@ -173,6 +191,79 @@ var (
 		Name:      "jobs_in_flight",
 		Help:      "Number of queue messages currently being handled, per queue.",
 	}, []string{"queue_name"})
+
+	// QueueConnected is 1 while the consumer holds a working connection
+	// for that queue and 0 from the moment it is lost until one is
+	// re-established. This is the metric to alert on, and it exists
+	// because nothing else could answer the question: a queue that has
+	// stopped consuming and a queue that is merely idle produce exactly
+	// the same flat messages_received_total and the same
+	// jobs_in_flight of 0. When the Gearman consumer lost its connections
+	// and never reconnected, the only evidence was twelve WARN lines in
+	// the log and a processed count that stopped climbing.
+	//
+	// Deliberately NOT pre-created by InitQueue, unlike every other series
+	// in this subsystem. Each consumer sets it to 1 itself after a
+	// connection is actually up (Ready for Gearman, connect for
+	// RabbitMQ), so a 1 means "connected" rather than "NewRouter ran".
+	// That is the opposite choice from DBAvailable, which is pre-set to 1
+	// precisely because there is nothing to observe before the first flush
+	// - here there is, and it is the whole point of the metric.
+	//
+	// One series per queue on both backends, even though a RabbitMQ
+	// connection is shared by every queue and so moves all twelve at once:
+	// an alert written against one backend has to keep working on the
+	// other.
+	QueueConnected = promauto.NewGaugeVec(prometheus.GaugeOpts{
+		Namespace: "statusengine",
+		Subsystem: "queue",
+		Name:      "connected",
+		Help:      "1 while the consumer holds a working connection for this queue, 0 while it does not.",
+	}, []string{"queue_name"})
+
+	// QueueReconnectsTotal counts how often the consumer had to rebuild a
+	// lost connection for that queue. QueueConnected says whether data is
+	// flowing right now; this says how unstable the link has been, which is
+	// the difference between "the broker restarted once at 03:00" and "the
+	// link flaps every few minutes". Pre-created at zero by InitQueue,
+	// because a counter that only appears once something has gone wrong
+	// cannot be graphed before it does.
+	QueueReconnectsTotal = promauto.NewCounterVec(prometheus.CounterOpts{
+		Namespace: "statusengine",
+		Subsystem: "queue",
+		Name:      "reconnects_total",
+		Help:      "Total number of times the consumer re-established a lost connection, per queue.",
+	}, []string{"queue_name"})
+
+	// DowntimeUpdatesUnmatchedTotal counts downtime UPDATEs that matched no
+	// row, per destination table. A downtime's START and STOP arrive as
+	// separate messages and are written as bare UPDATE ... WHERE <PK>
+	// against the row its ADD created, so an UPDATE that matches nothing
+	// means that row was not there - the event is simply gone, with no
+	// error and nothing in the log to say so.
+	//
+	// That is not hypothetical: handling the downtime queue concurrently
+	// let a backlog execute START before ADD, which left was_started=0 and
+	// actual_start_time=0 on downtimes that had demonstrably run. The
+	// consumer now serializes that queue (queue.RequiresInOrderProcessing),
+	// so this should stay at 0; it exists because the failure it reports is
+	// otherwise invisible until someone diffs the database against another
+	// worker.
+	//
+	// Deliberately not counted for DELETE, which legitimately matches
+	// nothing on every ordinary downtime: STOP already removed the
+	// scheduleddowntimes row by the time DELETE arrives.
+	//
+	// One legitimate source remains: a downtime whose ADD predates this
+	// database entirely (LOAD is a no-op by design, mirroring the legacy
+	// worker), so its START finds no history row. Expect a few of these
+	// right after a fresh installation, and none afterwards.
+	DowntimeUpdatesUnmatchedTotal = promauto.NewCounterVec(prometheus.CounterOpts{
+		Namespace: "statusengine",
+		Subsystem: "queue",
+		Name:      "downtime_updates_unmatched_total",
+		Help:      "Total number of downtime UPDATE statements that matched no row, per table.",
+	}, []string{"table"})
 
 	// QueuePayloadsRepairedTotal counts payloads that were not valid
 	// UTF-8 and had their invalid bytes reinterpreted as Windows-1252
