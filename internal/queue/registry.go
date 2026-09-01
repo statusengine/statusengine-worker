@@ -185,6 +185,7 @@ func serviceStateHistoryRow(ev stateChangeEvent, dst []any) []any {
 }
 
 func hostAcknowledgementRow(ev acknowledgementEvent, dst []any) []any {
+	// ev.EntryTime = msg.Timestamp, see decodeAcknowledgement in decode.go
 	return append(dst,
 		ev.HostName, ev.EntryTime, ev.EntryTimeUsec, ev.State, ev.AuthorName, ev.CommentData,
 		ev.AcknowledgementType, ev.IsSticky, ev.PersistentComment, ev.NotifyContacts,
@@ -192,6 +193,7 @@ func hostAcknowledgementRow(ev acknowledgementEvent, dst []any) []any {
 }
 
 func serviceAcknowledgementRow(ev acknowledgementEvent, dst []any) []any {
+	// ev.EntryTime = msg.Timestamp, see decodeAcknowledgement in decode.go
 	return append(dst,
 		ev.ServiceDescription, ev.EntryTime, ev.EntryTimeUsec, ev.HostName, ev.State, ev.AuthorName, ev.CommentData,
 		ev.AcknowledgementType, ev.IsSticky, ev.PersistentComment, ev.NotifyContacts,
@@ -208,14 +210,14 @@ const notificationTypeContactNotificationMethodEnd = 605
 
 func hostNotificationRow(ev notificationMethodEvent, dst []any) []any {
 	return append(dst,
-		ev.HostName, ev.Timestamp, ev.TimestampUsec, ev.ContactName, ev.CommandName, ev.CommandArgs,
+		ev.HostName, ev.StartTime, ev.TimestampUsec, ev.ContactName, ev.CommandName, ev.CommandArgs,
 		ev.State, ev.EndTime, ev.ReasonType, ev.Output, ev.AckAuthor, ev.AckData,
 	)
 }
 
 func serviceNotificationRow(ev notificationMethodEvent, dst []any) []any {
 	return append(dst,
-		ev.ServiceDescription, ev.Timestamp, ev.TimestampUsec, ev.HostName, ev.ContactName, ev.CommandName,
+		ev.ServiceDescription, ev.StartTime, ev.TimestampUsec, ev.HostName, ev.ContactName, ev.CommandName,
 		ev.CommandArgs, ev.State, ev.EndTime, ev.ReasonType, ev.Output, ev.AckAuthor, ev.AckData,
 	)
 }
