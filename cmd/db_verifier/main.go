@@ -30,11 +30,25 @@ const (
 )
 
 // tableSpec describes how to page through a table's most recent rows and
-// which columns uniquely identify a row across both databases: pkColumns
-// must match the table's actual PRIMARY KEY (see .claude/specs/mysql_schema.sql)
-// so that a row found in one database can be matched against its counterpart
-// in the other, and orderBy picks the columns that make "most recent" mean
-// something for that table (usually the PK's own time columns).
+// which columns uniquely identify a row across both databases: pkColumns has
+// to identify a row uniquely so that one found in one database can be matched
+// against its counterpart in the other, and orderBy picks the columns that
+// make "most recent" mean something for that table (usually the PK's own time
+// columns).
+//
+// pkColumns is a unique key rather than the PRIMARY KEY, because there are two
+// schemas and they disagree. .claude/specs/mysql_schema.sql is openITCOCKPIT's
+// variant, where service_description holds a UUID and is therefore unique on
+// its own, so four service tables key on it without hostname. Standard
+// Statusengine (lib/mysql.php in statusengine/worker, the setPrimaryKey calls)
+// keeps the plain service description there and leads those PRIMARY KEYs with
+// hostname. Keying on service_description alone would then collapse "PING on
+// host A" and "PING on host B" onto one map entry: one row silently replaces
+// the other and the comparison reports a mismatch against a row from a
+// different service. Naming hostname *and* service_description is a superset
+// of openITCOCKPIT's key and exactly Statusengine's, so it is unique under
+// both and needs no switch - the column exists in every one of these tables in
+// either schema.
 type tableSpec struct {
 	pkColumns []string
 	orderBy   []string
@@ -62,7 +76,7 @@ var tableSpecs = map[string]tableSpec{
 		orderBy:   []string{"start_time", "start_time_usec"},
 	},
 	"statusengine_servicechecks": {
-		pkColumns: []string{"service_description", "start_time", "start_time_usec"},
+		pkColumns: []string{"hostname", "service_description", "start_time", "start_time_usec"},
 		orderBy:   []string{"start_time", "start_time_usec"},
 	},
 	"statusengine_host_statehistory": {
@@ -70,7 +84,7 @@ var tableSpecs = map[string]tableSpec{
 		orderBy:   []string{"state_time", "state_time_usec"},
 	},
 	"statusengine_service_statehistory": {
-		pkColumns: []string{"service_description", "state_time", "state_time_usec"},
+		pkColumns: []string{"hostname", "service_description", "state_time", "state_time_usec"},
 		orderBy:   []string{"state_time", "state_time_usec"},
 	},
 	"statusengine_host_downtimehistory": {
@@ -90,7 +104,7 @@ var tableSpecs = map[string]tableSpec{
 		orderBy:   []string{"start_time", "start_time_usec"},
 	},
 	"statusengine_service_notifications": {
-		pkColumns: []string{"service_description", "start_time", "start_time_usec"},
+		pkColumns: []string{"hostname", "service_description", "start_time", "start_time_usec"},
 		orderBy:   []string{"start_time", "start_time_usec"},
 	},
 	"statusengine_service_notifications_log": {
@@ -102,7 +116,7 @@ var tableSpecs = map[string]tableSpec{
 		orderBy:   []string{"entry_time", "entry_time_usec"},
 	},
 	"statusengine_service_acknowledgements": {
-		pkColumns: []string{"service_description", "entry_time", "entry_time_usec"},
+		pkColumns: []string{"hostname", "service_description", "entry_time", "entry_time_usec"},
 		orderBy:   []string{"entry_time", "entry_time_usec"},
 	},
 	"statusengine_host_scheduleddowntimes": {

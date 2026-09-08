@@ -868,10 +868,21 @@ func newRedeliverySafeInserter[T any](sqlDB *sql.DB, table string, columns []str
 }
 
 // redeliverySafePKColumn maps every table written through
-// newRedeliverySafeInserter to the first column of its PRIMARY KEY. Kept as
-// one table rather than spelled out at each call site so the value cannot
-// drift from the schema unnoticed - TestRedeliverySafePKColumnsMatchSchema
-// checks every entry against .claude/specs/mysql_schema.sql.
+// newRedeliverySafeInserter to one column of its PRIMARY KEY, which is what
+// makes the ON DUPLICATE KEY UPDATE clause a no-op: the row only matched
+// because every key column already holds the incoming value, so writing one
+// of them back changes nothing. Membership is the requirement, not position.
+//
+// Each column here is in the key under *both* schemas, and that is the reason
+// the service tables name service_description rather than the hostname their
+// standard-Statusengine keys start with: openITCOCKPIT stores a UUID in
+// service_description and leaves hostname out of those keys entirely, so
+// hostname would be a column outside the key there - a redelivery would write
+// instead of skipping. Kept as one table rather than spelled out at each call
+// site so the value cannot drift from the schema unnoticed;
+// TestRedeliverySafePKColumnsMatchSchema checks every entry against
+// .claude/specs/mysql_schema.sql (openITCOCKPIT) and against the standard
+// Statusengine keys transcribed beside it.
 //
 // statusengine_logentries and statusengine_perfdata are absent on purpose:
 // neither has a PRIMARY KEY a redelivery could collide on. See the comment
