@@ -5,6 +5,7 @@ import (
 	"database/sql"
 	"os"
 	"regexp"
+	"slices"
 	"sort"
 	"testing"
 	"time"
@@ -36,10 +37,10 @@ func tableBlock(t *testing.T, schema, table string) string {
 	return m[1]
 }
 
-// firstPrimaryKeyColumn returns the first column of table's PRIMARY KEY as
-// declared in the schema dump, so the tests below compare against the real
-// database rather than against a second copy of the same assumption.
-func firstPrimaryKeyColumn(t *testing.T, schema, table string) string {
+// primaryKeyColumns returns every column of table's PRIMARY KEY as declared in
+// the schema dump, so the tests below compare against the real database rather
+// than against a second copy of the same assumption.
+func primaryKeyColumns(t *testing.T, schema, table string) []string {
 	t.Helper()
 
 	pk := regexp.MustCompile("PRIMARY KEY \\(([^)]*)\\)").FindStringSubmatch(tableBlock(t, schema, table))
@@ -47,11 +48,39 @@ func firstPrimaryKeyColumn(t *testing.T, schema, table string) string {
 		t.Fatalf("table %s has no PRIMARY KEY in %s", table, schemaPath)
 	}
 
-	columns := regexp.MustCompile("`([^`]+)`").FindAllStringSubmatch(pk[1], -1)
-	if len(columns) == 0 {
+	matches := regexp.MustCompile("`([^`]+)`").FindAllStringSubmatch(pk[1], -1)
+	if len(matches) == 0 {
 		t.Fatalf("could not parse PRIMARY KEY of %s: %q", table, pk[1])
 	}
-	return columns[0][1]
+	columns := make([]string, len(matches))
+	for i, m := range matches {
+		columns[i] = m[1]
+	}
+	return columns
+}
+
+// standardStatusenginePK is the PRIMARY KEY of each upserted table in *standard*
+// Statusengine, transcribed from the setPrimaryKey calls in lib/mysql.php of
+// statusengine/worker. .claude/specs/mysql_schema.sql is openITCOCKPIT's schema,
+// which is not the same database: openITCOCKPIT puts a UUID in
+// service_description, so it is unique on its own and the four service tables
+// below drop hostname from their key, while standard Statusengine keeps the
+// plain description and leads those keys with hostname.
+//
+// Both are checked because the fix has to hold on either. Kept as a literal
+// rather than fetched, since a test that reaches for GitHub fails offline for
+// reasons that have nothing to do with the code under test.
+var standardStatusenginePK = map[string][]string{
+	"statusengine_hostchecks":                {"hostname", "start_time", "start_time_usec"},
+	"statusengine_servicechecks":             {"hostname", "service_description", "start_time", "start_time_usec"},
+	"statusengine_host_statehistory":         {"hostname", "state_time", "state_time_usec"},
+	"statusengine_service_statehistory":      {"hostname", "service_description", "state_time", "state_time_usec"},
+	"statusengine_host_acknowledgements":     {"hostname", "entry_time", "entry_time_usec"},
+	"statusengine_service_acknowledgements":  {"hostname", "service_description", "entry_time", "entry_time_usec"},
+	"statusengine_host_notifications":        {"hostname", "start_time", "start_time_usec"},
+	"statusengine_service_notifications":     {"hostname", "service_description", "start_time", "start_time_usec"},
+	"statusengine_host_notifications_log":    {"hostname", "start_time", "start_time_usec"},
+	"statusengine_service_notifications_log": {"hostname", "service_description", "start_time", "start_time_usec"},
 }
 
 func readSchema(t *testing.T) string {
@@ -64,18 +93,52 @@ func readSchema(t *testing.T) string {
 }
 
 // TestRedeliverySafePKColumnsMatchSchema is the test that actually protects
-// the fix. The ON DUPLICATE KEY UPDATE clause is only a no-op while the named
-// column is the first column of the PRIMARY KEY - name any other column and
-// every redelivered row turns into a real write instead of being skipped.
+// the fix. The ON DUPLICATE KEY UPDATE clause is a no-op precisely while the
+// named column is *part of* the PRIMARY KEY: the row only matched because
+// every key column already equals the incoming value, so assigning one of them
+// writes back what is there. Name a column outside the key - state, output,
+// end_time - and every redelivered row turns into a real write instead of
+// being skipped.
+//
+// Membership, not position: the column need not come first. That distinction
+// is load-bearing rather than pedantic, because the two schemas order these
+// keys differently (see standardStatusenginePK), so a test demanding the first
+// column would pin the fix to openITCOCKPIT's schema and pass while the worker
+// is wrong on the other one - or vice versa. Both are checked here.
 func TestRedeliverySafePKColumnsMatchSchema(t *testing.T) {
 	schema := readSchema(t)
 
 	for table, column := range redeliverySafePKColumn {
-		want := firstPrimaryKeyColumn(t, schema, table)
-		if column != want {
-			t.Errorf("%s: declared %q, but the PRIMARY KEY starts with %q",
-				table, column, want)
+		openITCockpitPK := primaryKeyColumns(t, schema, table)
+		if !slices.Contains(openITCockpitPK, column) {
+			t.Errorf("%s: declared %q, which is not part of the openITCOCKPIT PRIMARY KEY %v (from %s)",
+				table, column, openITCockpitPK, schemaPath)
 		}
+
+		standardPK, ok := standardStatusenginePK[table]
+		if !ok {
+			t.Errorf("%s: no standard Statusengine PRIMARY KEY recorded - add it from lib/mysql.php", table)
+			continue
+		}
+		if !slices.Contains(standardPK, column) {
+			t.Errorf("%s: declared %q, which is not part of the standard Statusengine PRIMARY KEY %v",
+				table, column, standardPK)
+		}
+	}
+}
+
+// TestStandardStatusenginePKCoversEveryUpsertedTable keeps the two maps in
+// step: a table added to redeliverySafePKColumn without its standard-schema
+// key would only ever be checked against openITCOCKPIT's.
+func TestStandardStatusenginePKCoversEveryUpsertedTable(t *testing.T) {
+	for table := range standardStatusenginePK {
+		if _, ok := redeliverySafePKColumn[table]; !ok {
+			t.Errorf("%s: has a standard Statusengine PRIMARY KEY recorded but is no longer upserted - drop it", table)
+		}
+	}
+	if len(standardStatusenginePK) != len(redeliverySafePKColumn) {
+		t.Errorf("standardStatusenginePK has %d tables, redeliverySafePKColumn has %d",
+			len(standardStatusenginePK), len(redeliverySafePKColumn))
 	}
 }
 
