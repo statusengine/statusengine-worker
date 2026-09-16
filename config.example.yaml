@@ -39,7 +39,7 @@ gearman_addr: 127.0.0.1:4730
 # which was a single budget shared by all queues. The worker refuses to
 # start if that key is still present rather than reinterpreting its value,
 # because carrying a 64 over would mean 768 concurrent handlers here.
-gearman_max_concurrent_jobs_per_queue: 8
+gearman_max_concurrent_jobs_per_queue: 1
 
 # RabbitMQ broker URL (amqp://user:pass@host:port/vhost). Only used when
 # consumer: rabbitmq.
