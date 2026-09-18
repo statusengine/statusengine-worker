@@ -15,7 +15,7 @@ func TestContactNotificationMethodHandlerDiscardsNonEndType(t *testing.T) {
 
 	hostIns := &fakeEnqueuer[notificationMethodEvent]{}
 	serviceIns := &fakeEnqueuer[notificationMethodEvent]{}
-	handler := newContactNotificationMethodHandler(hub, QueueContactNotificationMethod, hostIns, serviceIns)
+	handler := newContactNotificationMethodHandler(hub, QueueContactNotificationMethod, hostIns, serviceIns, false)
 
 	// The real fixture carries type 605 (NEBTYPE_CONTACTNOTIFICATIONMETHOD_END)
 	// and a service_description, so it must land in serviceIns.
@@ -60,7 +60,7 @@ func TestContactNotificationMethodHandlerRoutesHostVsService(t *testing.T) {
 
 	hostIns := &fakeEnqueuer[notificationMethodEvent]{}
 	serviceIns := &fakeEnqueuer[notificationMethodEvent]{}
-	handler := newContactNotificationMethodHandler(hub, QueueContactNotificationMethod, hostIns, serviceIns)
+	handler := newContactNotificationMethodHandler(hub, QueueContactNotificationMethod, hostIns, serviceIns, false)
 
 	hostEvent := []byte(`{
 		"type": 605,
@@ -112,5 +112,68 @@ func TestHostNotificationRowAndServiceNotificationRowColumns(t *testing.T) {
 	}
 	if serviceRow[3] != ev.HostName {
 		t.Fatalf("serviceNotificationRow[3] (hostname) = %v, want %v", serviceRow[3], ev.HostName)
+	}
+}
+
+func TestContactNotificationMethodHandlerStoresStartEventWhenAsked(t *testing.T) {
+	hub := websocket.NewHub()
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	go hub.Run(ctx)
+
+	hostIns := &fakeEnqueuer[notificationMethodEvent]{}
+	serviceIns := &fakeEnqueuer[notificationMethodEvent]{}
+	handler := newContactNotificationMethodHandler(hub, QueueContactNotificationMethod, hostIns, serviceIns, true)
+
+	// What Naemon brokers when mod_gearman distributes notifications: the
+	// START event, without an end time, and no END event after it.
+	start := []byte(`{
+		"type": 604,
+		"timestamp": 1785517089,
+		"timestamp_usec": 927284,
+		"contactnotificationmethod": {
+			"host_name": "localhost",
+			"service_description": "Swap Usage",
+			"contact_name": "someone",
+			"start_time": 1785517089,
+			"end_time": 0
+		}
+	}`)
+	if err := handler(ctx, start); err != nil {
+		t.Fatalf("handler: %v", err)
+	}
+	got := serviceIns.snapshot()
+	if len(got) != 1 {
+		t.Fatalf("serviceIns got %d items, want 1", len(got))
+	}
+	if got[0].StartTime != 1785517089 || got[0].EndTime != got[0].StartTime {
+		t.Fatalf("start_time/end_time = %d/%d, want 1785517089 for both", got[0].StartTime, got[0].EndTime)
+	}
+	if got[0].ContactName != "someone" {
+		t.Fatalf("contact_name = %q, want the one from the START event", got[0].ContactName)
+	}
+
+	// The END event is not stored as well: where it does arrive, keeping both
+	// would record every notification twice.
+	end := []byte(`{
+		"type": 605,
+		"timestamp": 1785517090,
+		"timestamp_usec": 11,
+		"contactnotificationmethod": {
+			"host_name": "localhost",
+			"service_description": "Swap Usage",
+			"contact_name": "someone",
+			"start_time": 1785517089,
+			"end_time": 1785517090
+		}
+	}`)
+	if err := handler(ctx, end); err != nil {
+		t.Fatalf("handler: %v", err)
+	}
+	if got := len(serviceIns.snapshot()); got != 1 {
+		t.Fatalf("serviceIns got %d items after the END event, want still 1", got)
+	}
+	if got := len(hostIns.snapshot()); got != 0 {
+		t.Fatalf("hostIns got %d items, want 0", got)
 	}
 }

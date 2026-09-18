@@ -213,7 +213,7 @@ func TestNewRouterEmitsUpsertForCheckTables(t *testing.T) {
 
 	hub := websocket.NewHub()
 	router, runners := NewRouter(mockDB, hub, graphite.NewClient("127.0.0.1:2003"),
-		PerfdataRouteMySQL, "statusengine-test", "statusengine-test", false, noAgeFilter, testBatchSize)
+		PerfdataRouteMySQL, "statusengine-test", "statusengine-test", false, noAgeFilter, testBatchSize, false)
 
 	ctx, cancel := context.WithCancel(context.Background())
 	defer cancel()
@@ -312,7 +312,7 @@ func TestUpsertTablesHaveNoSecondaryUniqueIndex(t *testing.T) {
 
 	hub := websocket.NewHub()
 	_, runners := NewRouter(mockDB, hub, graphite.NewClient("127.0.0.1:2003"),
-		PerfdataRouteMySQL, "statusengine-test", "statusengine-test", false, noAgeFilter, testBatchSize)
+		PerfdataRouteMySQL, "statusengine-test", "statusengine-test", false, noAgeFilter, testBatchSize, false)
 
 	tables := make([]string, 0, 16)
 	for _, r := range runners {

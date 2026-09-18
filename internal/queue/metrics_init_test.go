@@ -88,7 +88,7 @@ func TestNewRouterPreCreatesMetricSeries(t *testing.T) {
 	hub := websocket.NewHub()
 
 	router, _ := NewRouter(sqlDB, hub, graphite.NewClient("127.0.0.1:2003"),
-		PerfdataRouteMySQL, "statusengine-test", "statusengine-test", false, noAgeFilter, testBatchSize)
+		PerfdataRouteMySQL, "statusengine-test", "statusengine-test", false, noAgeFilter, testBatchSize, false)
 
 	// Every queue in the router, on all four per-queue metrics.
 	//
