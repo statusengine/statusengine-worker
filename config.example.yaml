@@ -164,6 +164,17 @@ command_listen_addr: 127.0.0.1:8081
 #         exist survives the restart instead of needing to be rebuilt.
 enable_openitcockpit_tweaks: false
 
+# Which notification method event to store in statusengine_host_notifications
+# and statusengine_service_notifications?
+#   false (default): the END event, as the core brokers it once a notification
+#                    command has run.
+#   true: the START event. For a core whose notifications a broker module such
+#         as mod_gearman distributes: it answers the START event with
+#         NEBERROR_CALLBACKOVERRIDE, the core then never runs the command itself
+#         and never brokers the END event, so with the default nothing is ever
+#         stored. end_time is set to start_time, since the end is not known.
+store_notification_start: false
+
 # Discard statusngin_hoststatus and statusngin_servicestatus events older
 # than this, instead of writing them to MySQL and broadcasting them.
 #
