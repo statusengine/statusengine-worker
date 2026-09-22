@@ -370,21 +370,6 @@ CREATE TABLE `statusengine_logentries` (
 /*!40101 SET character_set_client = @saved_cs_client */;
 
 --
--- Table structure for table `statusengine_nodes`
---
-
-DROP TABLE IF EXISTS `statusengine_nodes`;
-/*!40101 SET @saved_cs_client     = @@character_set_client */;
-/*!40101 SET character_set_client = utf8mb4 */;
-CREATE TABLE `statusengine_nodes` (
-  `node_name` varchar(255) NOT NULL,
-  `node_version` varchar(255) DEFAULT NULL,
-  `node_start_time` bigint(20) NOT NULL,
-  PRIMARY KEY (`node_name`)
-) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_0900_ai_ci;
-/*!40101 SET character_set_client = @saved_cs_client */;
-
---
 -- Table structure for table `statusengine_perfdata`
 --
 
@@ -727,38 +712,6 @@ CREATE TABLE `statusengine_servicestatus` (
   KEY `service_description` (`service_description`),
   KEY `current_state_node` (`current_state`,`node_name`),
   KEY `issues` (`problem_has_been_acknowledged`,`scheduled_downtime_depth`,`current_state`)
-) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_0900_ai_ci;
-/*!40101 SET character_set_client = @saved_cs_client */;
-
---
--- Table structure for table `statusengine_tasks`
---
-
-DROP TABLE IF EXISTS `statusengine_tasks`;
-/*!40101 SET @saved_cs_client     = @@character_set_client */;
-/*!40101 SET character_set_client = utf8mb4 */;
-CREATE TABLE `statusengine_tasks` (
-  `uuid` varchar(255) DEFAULT NULL,
-  `node_name` varchar(255) DEFAULT NULL,
-  `entry_time` bigint(20) NOT NULL,
-  `type` varchar(255) DEFAULT NULL,
-  `payload` varchar(8192) DEFAULT NULL,
-  KEY `uuid` (`uuid`),
-  KEY `node_name` (`node_name`)
-) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_0900_ai_ci;
-/*!40101 SET character_set_client = @saved_cs_client */;
-
---
--- Table structure for table `statusengine_users`
---
-
-DROP TABLE IF EXISTS `statusengine_users`;
-/*!40101 SET @saved_cs_client     = @@character_set_client */;
-/*!40101 SET character_set_client = utf8mb4 */;
-CREATE TABLE `statusengine_users` (
-  `username` varchar(255) DEFAULT NULL,
-  `password` varchar(255) DEFAULT NULL,
-  KEY `username` (`username`,`password`)
 ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_0900_ai_ci;
 /*!40101 SET character_set_client = @saved_cs_client */;
 

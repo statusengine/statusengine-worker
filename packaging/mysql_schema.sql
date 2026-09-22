@@ -307,17 +307,6 @@ CREATE TABLE IF NOT EXISTS `statusengine_logentries` (
 ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4;
 
 --
--- statusengine_nodes
---
-
-CREATE TABLE IF NOT EXISTS `statusengine_nodes` (
-  `node_name` VARCHAR(255) NOT NULL,
-  `node_version` VARCHAR(255) DEFAULT NULL,
-  `node_start_time` BIGINT NOT NULL,
-  PRIMARY KEY (`node_name`)
-) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4;
-
---
 -- statusengine_perfdata
 --
 
@@ -555,28 +544,5 @@ CREATE TABLE IF NOT EXISTS `statusengine_servicestatus` (
   KEY `issues` (`problem_has_been_acknowledged`,`scheduled_downtime_depth`,`current_state`)
 ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4;
 
---
--- statusengine_tasks
---
-
-CREATE TABLE IF NOT EXISTS `statusengine_tasks` (
-  `uuid` VARCHAR(255) DEFAULT NULL,
-  `node_name` VARCHAR(255) DEFAULT NULL,
-  `entry_time` BIGINT NOT NULL,
-  `type` VARCHAR(255) DEFAULT NULL,
-  `payload` VARCHAR(8192) DEFAULT NULL,
-  KEY `uuid` (`uuid`),
-  KEY `node_name` (`node_name`)
-) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4;
-
---
--- statusengine_users
---
-
-CREATE TABLE IF NOT EXISTS `statusengine_users` (
-  `username` VARCHAR(255) DEFAULT NULL,
-  `password` VARCHAR(255) DEFAULT NULL,
-  KEY `username` (`username`,`password`)
-) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4;
 
 SET FOREIGN_KEY_CHECKS = 1;

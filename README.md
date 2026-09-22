@@ -830,7 +830,6 @@ TRUNCATE TABLE statusengine_host_statehistory;
 TRUNCATE TABLE statusengine_hostchecks;
 TRUNCATE TABLE statusengine_hoststatus;
 TRUNCATE TABLE statusengine_logentries;
-TRUNCATE TABLE statusengine_nodes;
 TRUNCATE TABLE statusengine_perfdata;
 TRUNCATE TABLE statusengine_service_acknowledgements;
 TRUNCATE TABLE statusengine_service_downtimehistory;
@@ -840,8 +839,6 @@ TRUNCATE TABLE statusengine_service_scheduleddowntimes;
 TRUNCATE TABLE statusengine_service_statehistory;
 TRUNCATE TABLE statusengine_servicechecks;
 TRUNCATE TABLE statusengine_servicestatus;
-TRUNCATE TABLE statusengine_tasks;
-TRUNCATE TABLE statusengine_users;
 
 SET FOREIGN_KEY_CHECKS = 1;
 ```

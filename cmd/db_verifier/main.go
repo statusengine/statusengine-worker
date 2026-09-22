@@ -55,8 +55,8 @@ type tableSpec struct {
 }
 
 // tableSpecs covers every table in .claude/specs/mysql_schema.sql, including
-// the four (statusengine_dbversion, statusengine_nodes, statusengine_tasks,
-// statusengine_users) this worker's pipeline never writes to itself - a
+// statusengine_dbversion
+// this worker's pipeline never writes to itself - a
 // shadow-test run showing those as identical (or flagging a real gap) is
 // still useful signal, so they're included rather than assumed irrelevant.
 // None of those four - nor statusengine_perfdata - have a real PRIMARY KEY
@@ -135,27 +135,15 @@ var tableSpecs = map[string]tableSpec{
 		pkColumns: []string{"id"},
 		orderBy:   []string{"id"},
 	},
-	"statusengine_nodes": {
-		pkColumns: []string{"node_name"},
-		orderBy:   []string{"node_name"},
-	},
 	"statusengine_perfdata": {
 		pkColumns: []string{"hostname", "service_description", "label", "timestamp", "timestamp_unix"},
 		orderBy:   []string{"timestamp_unix"},
 	},
-	"statusengine_tasks": {
-		pkColumns: []string{"uuid", "entry_time"},
-		orderBy:   []string{"entry_time"},
-	},
-	"statusengine_users": {
-		pkColumns: []string{"username"},
-		orderBy:   []string{"username"},
-	},
 }
 
 // defaultTables intentionally excludes statusengine_dbversion,
-// statusengine_nodes, statusengine_perfdata, statusengine_tasks,
-// statusengine_users and statusengine_logentries from the default run;
+// statusengine_perfdata,
+// and statusengine_logentries from the default run;
 // -tables can still name any of those six explicitly (they stay in
 // tableSpecs).
 var defaultTables = []string{

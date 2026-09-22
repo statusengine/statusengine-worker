@@ -129,8 +129,8 @@ func (rt retentionTable) envKey() string {
 // statusengine_service_scheduleddowntimes hold currently active downtimes
 // rather than history, so deleting old rows there would cancel running
 // downtimes; statusengine_hoststatus/statusengine_servicestatus hold one
-// row per object, not a growing log; and statusengine_tasks/_users/_nodes/
-// _dbversion are not written by this worker at all.
+// row per object, not a growing log; and statusengine_dbversion are not written
+// by this worker at all.
 func retentionTables() []retentionTable {
 	return []retentionTable{
 		{
