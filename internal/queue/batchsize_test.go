@@ -47,7 +47,7 @@ func TestBatchSizeStaysUnderPlaceholderLimit(t *testing.T) {
 	// the default of 100 and would sail past a table that has grown too wide.
 	hub := websocket.NewHub()
 	_, runners := NewRouter(mockDB, hub, graphite.NewClient("127.0.0.1:2003"), PerfdataRouteMySQL,
-		"statusengine-test", "statusengine-test", false, noAgeFilter, db.MaxConfigurableBatchSize)
+		"statusengine-test", "statusengine-test", false, noAgeFilter, db.MaxConfigurableBatchSize, false)
 
 	var checked, widest int
 	for _, r := range runners {

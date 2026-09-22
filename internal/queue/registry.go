@@ -245,12 +245,21 @@ func serviceAcknowledgementRow(ev acknowledgementEvent, dst []any) []any {
 }
 
 // notificationTypeContactNotificationMethodEnd is the Nagios/Icinga/Naemon
-// NEBTYPE_CONTACTNOTIFICATIONMETHOD_END event type: the only
+// NEBTYPE_CONTACTNOTIFICATIONMETHOD_END event type: the
 // contactnotificationmethod event that represents a completed notification
-// method delivery, and therefore the only one persisted to
+// method delivery, and by default the only one persisted to
 // statusengine_host_notifications/statusengine_service_notifications. Every
 // other type value on this queue is discarded immediately.
 const notificationTypeContactNotificationMethodEnd = 605
+
+// notificationTypeContactNotificationMethodStart is
+// NEBTYPE_CONTACTNOTIFICATIONMETHOD_START, persisted instead of the END event
+// when storeNotificationStart is set. A broker module that distributes
+// notifications, such as mod_gearman, answers this event with
+// NEBERROR_CALLBACKOVERRIDE. Naemon then continues with the next notification
+// command without running this one, so it never brokers the END event, and
+// the START is all there is to store. It carries everything but the end time.
+const notificationTypeContactNotificationMethodStart = 604
 
 func hostNotificationRow(ev notificationMethodEvent, dst []any) []any {
 	return append(dst,
@@ -267,23 +276,42 @@ func serviceNotificationRow(ev notificationMethodEvent, dst []any) []any {
 }
 
 // newContactNotificationMethodHandler filters out every event whose type
-// isn't notificationTypeContactNotificationMethodEnd, then routes the rest
-// to hostIns or serviceIns depending on whether service_description is set
-// - mirroring newStateChangeHandler/newAcknowledgementHandler's host-vs-
-// service split.
-func newContactNotificationMethodHandler(hub *websocket.Hub, topic string, hostIns, serviceIns enqueuer[notificationMethodEvent]) Handler {
+// isn't the one this worker stores - notificationTypeContactNotificationMethodEnd,
+// or notificationTypeContactNotificationMethodStart with storeNotificationStart
+// - then routes the rest to hostIns or serviceIns depending on whether
+// service_description is set, mirroring newStateChangeHandler/
+// newAcknowledgementHandler's host-vs-service split.
+func newContactNotificationMethodHandler(hub *websocket.Hub, topic string, hostIns, serviceIns enqueuer[notificationMethodEvent], storeNotificationStart bool) Handler {
+	stored := notificationTypeContactNotificationMethodEnd
+	if storeNotificationStart {
+		stored = notificationTypeContactNotificationMethodStart
+	}
+
 	return func(ctx context.Context, payload []byte) error {
 		events, err := decodeContactNotificationMethod(payload)
 		if err != nil {
 			return decodeError(topic, err)
 		}
 
+		if storeNotificationStart {
+			// A START event has no end: the module that took the notification
+			// over does the sending and never reports back. end_time is NOT
+			// NULL with no sub-second part, so a zero would read as 1970. The
+			// start time makes the duration exactly zero, which reads as the
+			// placeholder it is rather than as a measurement.
+			for i := range events {
+				if events[i].Type == notificationTypeContactNotificationMethodStart {
+					events[i].EndTime = events[i].StartTime
+				}
+			}
+		}
+
 		publishFiltered(hub, topic, events, func(ev notificationMethodEvent) bool {
-			return ev.Type == notificationTypeContactNotificationMethodEnd
+			return ev.Type == stored
 		})
 
 		for _, ev := range events {
-			if ev.Type != notificationTypeContactNotificationMethodEnd {
+			if ev.Type != stored {
 				continue
 			}
 
@@ -900,7 +928,7 @@ var redeliverySafePKColumn = map[string]string{
 	"statusengine_service_notifications_log": "hostname",
 }
 
-func NewRouter(sqlDB *sql.DB, hub *websocket.Hub, gc *graphite.Client, perfdataRoute PerfdataRoute, graphitePrefix, nodeName string, enableOpenITCockpitTweaks bool, statusMaxAge time.Duration, mysqlBatchSize int) (Router, []Runner) {
+func NewRouter(sqlDB *sql.DB, hub *websocket.Hub, gc *graphite.Client, perfdataRoute PerfdataRoute, graphitePrefix, nodeName string, enableOpenITCockpitTweaks bool, statusMaxAge time.Duration, mysqlBatchSize int, storeNotificationStart bool) (Router, []Runner) {
 	// Every table shares one batch size, built once here and spread into
 	// each constructor below, so a table added later cannot quietly keep
 	// the default. db.WithMaxBatchSize clamps; cmd/app is what rejects an
@@ -994,7 +1022,7 @@ func NewRouter(sqlDB *sql.DB, hub *websocket.Hub, gc *graphite.Client, perfdataR
 		// NewStaleDroppingHandler for why that is safe here and nowhere else.
 		QueueHostStatus:                NewStaleDroppingHandler(hub, QueueHostStatus, hostStatus, decodeHostStatus, statusMaxAge),
 		QueueServiceStatus:             NewStaleDroppingHandler(hub, QueueServiceStatus, serviceStatus, decodeServiceStatus, statusMaxAge),
-		QueueContactNotificationMethod: newContactNotificationMethodHandler(hub, QueueContactNotificationMethod, hostNotifications, serviceNotifications),
+		QueueContactNotificationMethod: newContactNotificationMethodHandler(hub, QueueContactNotificationMethod, hostNotifications, serviceNotifications, storeNotificationStart),
 		QueueNotifications:             newNotificationHandler(hub, QueueNotifications, hostNotificationsLog, serviceNotificationsLog),
 
 		QueueDowntimes:   newDowntimeHandler(hub, QueueDowntimes, sqlDB, nodeName),

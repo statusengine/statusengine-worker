@@ -39,7 +39,7 @@ gearman_addr: 127.0.0.1:4730
 # which was a single budget shared by all queues. The worker refuses to
 # start if that key is still present rather than reinterpreting its value,
 # because carrying a 64 over would mean 768 concurrent handlers here.
-gearman_max_concurrent_jobs_per_queue: 8
+gearman_max_concurrent_jobs_per_queue: 1
 
 # RabbitMQ broker URL (amqp://user:pass@host:port/vhost). Only used when
 # consumer: rabbitmq.
@@ -81,7 +81,7 @@ mysql_max_open_conns: 25
 # table - 100 caps at ~400 rows/s per table, 700 at ~2800. Note also that a
 # failed flush drops its batch, so this is equally the number of events one
 # bad row can take down with it.
-mysql_batch_size: 100
+mysql_batch_size: 500
 
 # Metrics buffered before a Graphite Carbon write is flushed ahead of the
 # 250ms ticker. Default 100, maximum 1000, which is also the documented
@@ -163,6 +163,17 @@ command_listen_addr: 127.0.0.1:8081
 #         tables no longer know about, so status for objects that still
 #         exist survives the restart instead of needing to be rebuilt.
 enable_openitcockpit_tweaks: false
+
+# Which notification method event to store in statusengine_host_notifications
+# and statusengine_service_notifications?
+#   false (default): the END event, as the core brokers it once a notification
+#                    command has run.
+#   true: the START event. For a core whose notifications a broker module such
+#         as mod_gearman distributes: it answers the START event with
+#         NEBERROR_CALLBACKOVERRIDE, the core then never runs the command itself
+#         and never brokers the END event, so with the default nothing is ever
+#         stored. end_time is set to start_time, since the end is not known.
+store_notification_start: false
 
 # Discard statusngin_hoststatus and statusngin_servicestatus events older
 # than this, instead of writing them to MySQL and broadcasting them.

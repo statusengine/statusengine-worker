@@ -61,6 +61,7 @@ type config struct {
 	commandAPIKeys                   string // comma-separated; empty leaves the command endpoint unregistered
 	commandListenAddr                string
 	enableOpenITCockpitTweaks        bool   // selects the core-restart hoststatus/servicestatus cleanup query
+	storeNotificationStart           bool   // store NEBTYPE_CONTACTNOTIFICATIONMETHOD_START instead of END, for distributed notifications
 	statusMaxAge                     string // max age of a hoststatus/servicestatus event before it is discarded; "0" disables
 	logLevel                         string // "debug", "info", "warn" or "error"
 	logFormat                        string // "text" or "json"
@@ -69,10 +70,10 @@ type config struct {
 // fileConfig mirrors config's fields for -config's optional YAML file (see
 // config.example.yaml for every key, its default and a description). Every
 // key is optional: a zero value (empty string, nil for APIKeys/
-// EnableOpenITCockpitTweaks) means "not set in the file", so it never
-// overrides an environment variable or hardcoded default - see resolveString/
-// resolveBool. EnableOpenITCockpitTweaks is a *bool (rather than bool) for
-// exactly this reason: unlike a missing string, Go can't otherwise tell
+// EnableOpenITCockpitTweaks/StoreNotificationStart) means "not set in the
+// file", so it never overrides an environment variable or hardcoded default -
+// see resolveString/resolveBool. The two bool keys are *bool (rather than
+// bool) for exactly this reason: unlike a missing string, Go can't otherwise tell
 // "the file didn't mention this key" apart from "the file explicitly set
 // it to false".
 type fileConfig struct {
@@ -103,6 +104,7 @@ type fileConfig struct {
 	CommandAPIKeys            []string `yaml:"command_api_keys"`
 	CommandListenAddr         string   `yaml:"command_listen_addr"`
 	EnableOpenITCockpitTweaks *bool    `yaml:"enable_openitcockpit_tweaks"`
+	StoreNotificationStart    *bool    `yaml:"store_notification_start"`
 	StatusMaxAge              string   `yaml:"status_max_age"`
 	LogLevel                  string   `yaml:"log_level"`
 	LogFormat                 string   `yaml:"log_format"`
@@ -282,6 +284,9 @@ func loadConfig() config {
 	flag.BoolVar(&cfg.enableOpenITCockpitTweaks, "enable-openitcockpit-tweaks", false,
 		"on a core restart, delete only hoststatus/servicestatus rows for objects openITCockpit no longer "+
 			"knows about instead of truncating both tables outright")
+	flag.BoolVar(&cfg.storeNotificationStart, "store-notification-start", false,
+		"store the START event of a notification method instead of its END; for a core whose notifications "+
+			"a broker module such as mod_gearman distributes, which never brokers the END event")
 	flag.StringVar(&cfg.statusMaxAge, "status-max-age", "5m",
 		"discard statusngin_hoststatus/statusngin_servicestatus events older than this Go duration (e.g. \"5m\", \"90s\"); "+
 			"they are superseded snapshots, so a backlog of them is not worth draining after downtime. \"0\" processes every event regardless of age")
@@ -331,6 +336,7 @@ func loadConfig() config {
 	cfg.commandAPIKeys = resolveString(explicit, "command-api-keys", cfg.commandAPIKeys, "STATUSENGINE_API_COMMAND_KEYS", strings.Join(fc.CommandAPIKeys, ","))
 	cfg.commandListenAddr = resolveString(explicit, "command-listen-addr", cfg.commandListenAddr, "STATUSENGINE_COMMAND_LISTEN_ADDR", fc.CommandListenAddr)
 	cfg.enableOpenITCockpitTweaks = resolveBool(explicit, "enable-openitcockpit-tweaks", cfg.enableOpenITCockpitTweaks, "ENABLE_OPENITCOCKPIT_TWEAKS", fc.EnableOpenITCockpitTweaks)
+	cfg.storeNotificationStart = resolveBool(explicit, "store-notification-start", cfg.storeNotificationStart, "STATUSENGINE_STORE_NOTIFICATION_START", fc.StoreNotificationStart)
 	cfg.statusMaxAge = resolveString(explicit, "status-max-age", cfg.statusMaxAge, "STATUSENGINE_STATUS_MAX_AGE", fc.StatusMaxAge)
 	cfg.logLevel = resolveString(explicit, "log-level", cfg.logLevel, "STATUSENGINE_LOG_LEVEL", fc.LogLevel)
 	cfg.logFormat = resolveString(explicit, "log-format", cfg.logFormat, "STATUSENGINE_LOG_FORMAT", fc.LogFormat)
@@ -790,7 +796,7 @@ func main() {
 	// connection is ever dialed (CLAUDE.md rule 5).
 	gc := graphite.NewClient(cfg.graphiteAddr, graphite.WithMaxBatchSize(cfg.graphiteBatchSize))
 
-	router, runners := queue.NewRouter(sqlDB, hub, gc, perfdataRoute, cfg.graphitePrefix, cfg.nodeName, cfg.enableOpenITCockpitTweaks, statusMaxAge, cfg.mysqlBatchSize)
+	router, runners := queue.NewRouter(sqlDB, hub, gc, perfdataRoute, cfg.graphitePrefix, cfg.nodeName, cfg.enableOpenITCockpitTweaks, statusMaxAge, cfg.mysqlBatchSize, cfg.storeNotificationStart)
 	for _, r := range runners {
 		wg.Add(1)
 		go func(r queue.Runner) {
