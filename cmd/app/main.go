@@ -55,6 +55,7 @@ type config struct {
 	metricsListenAddr                string
 	graphiteAddr                     string
 	graphitePrefix                   string // prepended to every Graphite path, e.g. "statusengine.<host>.<service>.<metric>"
+	graphiteConnMaxLifetime          string // how long one Carbon connection is used before it is replaced; "0" disables
 	perfdataRoute                    string // "mysql", "graphite" or "both"
 	nodeName                         string // written into hoststatus/servicestatus rows' node_name column
 	apiKeys                          string // comma-separated; empty disables /ws authentication entirely
@@ -98,6 +99,7 @@ type fileConfig struct {
 	MetricsListenAddr         string   `yaml:"metrics_listen_addr"`
 	GraphiteAddr              string   `yaml:"graphite_addr"`
 	GraphitePrefix            string   `yaml:"graphite_prefix"`
+	GraphiteConnMaxLifetime   string   `yaml:"graphite_conn_max_lifetime"`
 	PerfdataRoute             string   `yaml:"perfdata_route"`
 	NodeName                  string   `yaml:"nodename"`
 	APIKeys                   []string `yaml:"api_keys"`
@@ -267,6 +269,9 @@ func loadConfig() config {
 			graphite.FlushInterval, graphite.MaxConfigurableBatchSize))
 	flag.StringVar(&cfg.graphitePrefix, "graphite-prefix", "statusengine",
 		"prefix prepended to every Graphite metric path (prefix.hostname.service_description.label)")
+	flag.StringVar(&cfg.graphiteConnMaxLifetime, "graphite-conn-max-lifetime", graphite.DefaultConnMaxLifetime.String(),
+		"replace the Carbon connection after this Go duration (e.g. \"15m\", \"1h\"); a precaution against a peer "+
+			"that accepts writes without delivering them, which the client cannot detect. \"0\" keeps a connection until a write fails")
 	flag.StringVar(&cfg.perfdataRoute, "perfdata-route", "mysql",
 		`where statusngin_service_perfdata metrics are written: "mysql", "graphite" or "both" (CLAUDE.md rule 5)`)
 	flag.StringVar(&cfg.nodeName, "nodename", "statusengine",
@@ -330,6 +335,7 @@ func loadConfig() config {
 	cfg.metricsListenAddr = resolveString(explicit, "metrics-listen-addr", cfg.metricsListenAddr, "STATUSENGINE_METRICS_LISTEN_ADDR", fc.MetricsListenAddr)
 	cfg.graphiteAddr = resolveString(explicit, "graphite-addr", cfg.graphiteAddr, "STATUSENGINE_GRAPHITE_ADDR", fc.GraphiteAddr)
 	cfg.graphitePrefix = resolveString(explicit, "graphite-prefix", cfg.graphitePrefix, "STATUSENGINE_GRAPHITE_PREFIX", fc.GraphitePrefix)
+	cfg.graphiteConnMaxLifetime = resolveString(explicit, "graphite-conn-max-lifetime", cfg.graphiteConnMaxLifetime, "STATUSENGINE_GRAPHITE_CONN_MAX_LIFETIME", fc.GraphiteConnMaxLifetime)
 	cfg.perfdataRoute = resolveString(explicit, "perfdata-route", cfg.perfdataRoute, "STATUSENGINE_PERFDATA_ROUTE", fc.PerfdataRoute)
 	cfg.nodeName = resolveString(explicit, "nodename", cfg.nodeName, "STATUSENGINE_NODENAME", fc.NodeName)
 	cfg.apiKeys = resolveString(explicit, "api-keys", cfg.apiKeys, "STATUSENGINE_API_KEYS", strings.Join(fc.APIKeys, ","))
@@ -699,6 +705,14 @@ func main() {
 			"max_age", statusMaxAge, "queues", []string{queue.QueueHostStatus, queue.QueueServiceStatus})
 	}
 
+	graphiteConnMaxLifetime, err := time.ParseDuration(cfg.graphiteConnMaxLifetime)
+	if err != nil {
+		fatal("invalid -graphite-conn-max-lifetime", "value", cfg.graphiteConnMaxLifetime, "error", err)
+	}
+	if graphiteConnMaxLifetime < 0 {
+		fatal("invalid -graphite-conn-max-lifetime: must not be negative", "value", cfg.graphiteConnMaxLifetime)
+	}
+
 	// pipelineCtx governs every long-running loop (BulkInserters, the Hub,
 	// the consumer's internal ctx.Done() watcher). It is only cancelled
 	// once the ordered shutdown sequence below has already stopped the
@@ -794,7 +808,9 @@ func main() {
 	// BulkInserter below regardless of perfdataRoute; if perfdataRoute
 	// excludes Graphite, NewRouter simply never calls Enqueue on it, so no
 	// connection is ever dialed (CLAUDE.md rule 5).
-	gc := graphite.NewClient(cfg.graphiteAddr, graphite.WithMaxBatchSize(cfg.graphiteBatchSize))
+	gc := graphite.NewClient(cfg.graphiteAddr,
+		graphite.WithMaxBatchSize(cfg.graphiteBatchSize),
+		graphite.WithConnMaxLifetime(graphiteConnMaxLifetime))
 
 	router, runners := queue.NewRouter(sqlDB, hub, gc, perfdataRoute, cfg.graphitePrefix, cfg.nodeName, cfg.enableOpenITCockpitTweaks, statusMaxAge, cfg.mysqlBatchSize, cfg.storeNotificationStart)
 	for _, r := range runners {

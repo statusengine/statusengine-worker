@@ -112,6 +112,19 @@ graphite_addr: 127.0.0.1:2003
 # <graphite_prefix>.<hostname>.<service_description>.<metric_label>
 graphite_prefix: statusengine
 
+# How long one connection to Carbon is used before it is replaced with a
+# fresh one - the Graphite counterpart of MySQL's conn_max_lifetime.
+#
+# A precaution: Carbon's plaintext protocol acknowledges nothing, so a
+# successful write only means the bytes left this process. A peer that
+# accepts them without delivering them to Carbon (e.g. a Graphite container
+# still starting up when the worker connected after a reboot) looks
+# perfectly healthy - no error, no dropped metrics - and was observed to
+# swallow everything until the worker was restarted. This bounds that to one
+# lifetime. Any Go duration ("15m", "1h"); "0" keeps a connection until a
+# write fails.
+graphite_conn_max_lifetime: 15m
+
 # Where statusngin_service_perfdata metrics are written: "mysql",
 # "graphite" or "both".
 perfdata_route: mysql

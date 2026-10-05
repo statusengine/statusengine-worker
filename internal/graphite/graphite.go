@@ -48,6 +48,28 @@ const (
 	// has one rhythm rather than several.
 	StatsLogInterval = 30 * time.Second
 
+	// DefaultConnMaxLifetime is how long one Carbon connection is used
+	// before ensureConn replaces it with a fresh one. Override with
+	// WithConnMaxLifetime; 0 keeps a connection until a write fails.
+	//
+	// A precaution, not a performance setting. The client never reads from
+	// the socket and Carbon never acknowledges anything, so a successful
+	// Write only means the bytes reached the local kernel. A peer that
+	// keeps the connection open and ACKs without passing the data on to
+	// Carbon - a socket that is listening but not yet serving while the
+	// Graphite container starts - is indistinguishable from a healthy one:
+	// no error, no drop, graphite_available stays 1. Observed once after a
+	// host reboot as 3.5 hours of metrics written "successfully" that never
+	// arrived, until the worker was restarted by hand; ~2 MB, too little to
+	// ever fill the socket buffers and trip writeTimeout. This bounds such a
+	// black hole to one lifetime instead of "until someone notices".
+	// TCP keepalive cannot do it: the peer is alive and answers the probes.
+	//
+	// One re-dial per lifetime rather than one per flush (which is what the
+	// legacy PHP worker effectively did): a handshake every 250ms buys
+	// nothing on a healthy connection.
+	DefaultConnMaxLifetime = 15 * time.Minute
+
 	dialTimeout  = 5 * time.Second
 	writeTimeout = 5 * time.Second
 )
@@ -56,7 +78,8 @@ const (
 type Option func(*clientOptions)
 
 type clientOptions struct {
-	maxBatchSize int
+	maxBatchSize    int
+	connMaxLifetime time.Duration
 }
 
 // WithMaxBatchSize sets how many buffered metrics trigger an immediate
@@ -77,6 +100,19 @@ func WithMaxBatchSize(n int) Option {
 	}
 }
 
+// WithConnMaxLifetime sets how long one connection is used before it is
+// replaced, instead of DefaultConnMaxLifetime. 0 disables the limit, so a
+// connection is kept until a write fails; a negative value is treated as
+// 0 - cmd/app rejects it up front, like the batch size.
+func WithConnMaxLifetime(d time.Duration) Option {
+	return func(o *clientOptions) {
+		if d < 0 {
+			d = 0
+		}
+		o.connMaxLifetime = d
+	}
+}
+
 // Metric is one Graphite plaintext-protocol data point.
 type Metric struct {
 	Path      string
@@ -92,9 +128,10 @@ type flushRequest struct {
 // Client batches Metrics received via Enqueue and writes them to a
 // Graphite Carbon receiver as newline-delimited plaintext lines over a
 // persistent TCP connection. The connection is dialed lazily on first
-// flush and automatically re-dialed after a write error (CLAUDE.md rule
-// 6), so a Client can be constructed and its Run loop started even when
-// perfdata routing doesn't currently send it anything.
+// flush, automatically re-dialed after a write error (CLAUDE.md rule 6),
+// and replaced once it is older than its max lifetime (see
+// DefaultConnMaxLifetime), so a Client can be constructed and its Run loop
+// started even when perfdata routing doesn't currently send it anything.
 type Client struct {
 	addr string
 
@@ -108,6 +145,12 @@ type Client struct {
 
 	buffer []Metric
 	conn   net.Conn
+
+	// connMaxLifetime is how long conn is used before ensureConn replaces
+	// it; 0 means never. connSince is when conn was dialed. Both owned by
+	// Run's goroutine, like conn itself.
+	connMaxLifetime time.Duration
+	connSince       time.Time
 
 	// writeBuf holds the rendered plaintext lines of the batch currently
 	// being flushed. Kept on the Client and reset with [:0] rather than
@@ -137,16 +180,17 @@ type Client struct {
 // enqueued metrics are actually flushed. Pass WithMaxBatchSize to flush at
 // something other than DefaultMaxBatchSize metrics.
 func NewClient(addr string, opts ...Option) *Client {
-	o := clientOptions{maxBatchSize: DefaultMaxBatchSize}
+	o := clientOptions{maxBatchSize: DefaultMaxBatchSize, connMaxLifetime: DefaultConnMaxLifetime}
 	for _, opt := range opts {
 		opt(&o)
 	}
 
 	return &Client{
-		addr:         addr,
-		maxBatchSize: o.maxBatchSize,
-		in:           make(chan Metric, o.maxBatchSize),
-		flushReq:     make(chan flushRequest),
+		addr:            addr,
+		maxBatchSize:    o.maxBatchSize,
+		connMaxLifetime: o.connMaxLifetime,
+		in:              make(chan Metric, o.maxBatchSize),
+		flushReq:        make(chan flushRequest),
 		// 2*maxBatchSize, not maxBatchSize: drainPending can top up an
 		// almost-full buffer with everything sitting in c.in, which holds
 		// maxBatchSize itself. Sizing for the real maximum keeps the flush
@@ -388,8 +432,15 @@ func (c *Client) recordDrop(metrics int) {
 	metricsPkg.GraphiteAvailable.Set(0)
 }
 
-// ensureConn dials addr if there is no live connection yet.
+// ensureConn dials addr if there is no live connection yet, or if the
+// current one has outlived connMaxLifetime.
 func (c *Client) ensureConn(ctx context.Context) error {
+	if c.conn != nil && c.connMaxLifetime > 0 && time.Since(c.connSince) >= c.connMaxLifetime {
+		// Debug: on a healthy connection this is routine, once per lifetime.
+		slog.Debug("graphite: connection reached max lifetime, re-dialing",
+			"addr", c.addr, "max_lifetime", c.connMaxLifetime)
+		c.closeConn()
+	}
 	if c.conn != nil {
 		return nil
 	}
@@ -399,6 +450,7 @@ func (c *Client) ensureConn(ctx context.Context) error {
 		return err
 	}
 	c.conn = conn
+	c.connSince = time.Now()
 	return nil
 }
 
