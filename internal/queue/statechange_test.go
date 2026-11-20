@@ -79,6 +79,13 @@ func TestHostStateHistoryRowAndServiceStateHistoryRowColumns(t *testing.T) {
 	}
 	ev := items[0]
 
+	// The fixture's long_output differs from output on purpose: the broker
+	// sends the real long output now, and the row assertions below have to
+	// catch a dropped field rather than a value that merely mirrors output.
+	if ev.LongOutput == "" || ev.LongOutput == ev.Output {
+		t.Fatalf("fixture long_output = %q, want a distinct non-empty long output", ev.LongOutput)
+	}
+
 	hostRow := hostStateHistoryRow(ev, nil)
 	if len(hostRow) != 12 {
 		t.Fatalf("hostStateHistoryRow has %d values, want 12", len(hostRow))
@@ -86,6 +93,9 @@ func TestHostStateHistoryRowAndServiceStateHistoryRowColumns(t *testing.T) {
 	if hostRow[0] != ev.HostName || hostRow[1] != ev.Timestamp || hostRow[2] != ev.TimestampUsec || hostRow[3] != ev.StateChangeType {
 		t.Fatalf("hostStateHistoryRow[0:4] = %v, want [%v %v %v %v]",
 			hostRow[0:4], ev.HostName, ev.Timestamp, ev.TimestampUsec, ev.StateChangeType)
+	}
+	if hostRow[11] != ev.LongOutput {
+		t.Fatalf("hostStateHistoryRow[11] = %v, want LongOutput %q", hostRow[11], ev.LongOutput)
 	}
 
 	serviceRow := serviceStateHistoryRow(ev, nil)
@@ -97,5 +107,8 @@ func TestHostStateHistoryRowAndServiceStateHistoryRowColumns(t *testing.T) {
 	}
 	if serviceRow[3] != ev.HostName || serviceRow[4] != ev.StateChangeType {
 		t.Fatalf("serviceStateHistoryRow[3:5] = %v, want [%v %v]", serviceRow[3:5], ev.HostName, ev.StateChangeType)
+	}
+	if serviceRow[12] != ev.LongOutput {
+		t.Fatalf("serviceStateHistoryRow[12] = %v, want LongOutput %q", serviceRow[12], ev.LongOutput)
 	}
 }

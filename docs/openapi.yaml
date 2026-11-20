@@ -662,7 +662,11 @@ components:
           type: string
           description: Empty for a host state change (see statechange_type).
         output: { type: string }
-        long_output: { type: string }
+        long_output:
+          type: string
+          description: >
+            The object's long plugin output, not a copy of `output`. Empty
+            when the object has none, matching the host/service check queues.
         statechange_type:
           type: integer
           description: "0 = host state change, 1 = service state change."
@@ -679,7 +683,7 @@ components:
         host_name: localhost
         last_hard_state: 1
         last_state: 1
-        long_output: "Your random value is: 158"
+        long_output: "Your random value is: 158\nThis line only appears in the long output."
         max_attempts: 4
         output: "Your random value is: 158"
         service_description: Flapping

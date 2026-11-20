@@ -74,6 +74,12 @@ func TestDecodeBulkQueues(t *testing.T) {
 		if len(events) != 2 || events[0].Timestamp != 1785470683 || events[0].ServiceDescription != "Flapping" {
 			t.Fatalf("unexpected events: %+v", events)
 		}
+		// The broker sends the real long output for state changes, not a copy
+		// of output. The fixture's value is deliberately different from its
+		// output, so a decoder that dropped the field would fail here.
+		if want := "Your random value is: 158\nThis line only appears in the long output."; events[0].LongOutput != want {
+			t.Fatalf("events[0].LongOutput = %q, want %q", events[0].LongOutput, want)
+		}
 	})
 
 	t.Run("LogEntry", func(t *testing.T) {
